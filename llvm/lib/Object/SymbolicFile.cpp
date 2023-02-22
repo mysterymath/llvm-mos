@@ -67,6 +67,7 @@ SymbolicFile::createSymbolicFile(MemoryBufferRef Object, file_magic Type,
   case file_magic::pecoff_executable:
   case file_magic::xcoff_object_32:
   case file_magic::xcoff_object_64:
+  case file_magic::xo65_object:
   case file_magic::wasm_object:
     return ObjectFile::createObjectFile(Object, Type, InitContent);
   case file_magic::coff_import_library:
@@ -122,6 +123,7 @@ bool SymbolicFile::isSymbolicFile(file_magic Type, const LLVMContext *Context) {
   case file_magic::coff_import_library:
   case file_magic::elf_relocatable:
   case file_magic::macho_object:
+  case file_magic::xo65_object:
   case file_magic::coff_object:
     return true;
   default:

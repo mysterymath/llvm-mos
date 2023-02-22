@@ -184,6 +184,8 @@ ObjectFile::createObjectFile(MemoryBufferRef Object, file_magic Type,
     return createXCOFFObjectFile(Object, Binary::ID_XCOFF32);
   case file_magic::xcoff_object_64:
     return createXCOFFObjectFile(Object, Binary::ID_XCOFF64);
+  case file_magic::xo65_object:
+    llvm_unreachable("TODO");
   case file_magic::wasm_object:
     return createWasmObjectFile(Object);
   }

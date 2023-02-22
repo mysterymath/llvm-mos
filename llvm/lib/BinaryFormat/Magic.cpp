@@ -232,10 +232,15 @@ file_magic llvm::identify_magic(StringRef Magic) {
     if (startswith(Magic, "--- !tapi") || startswith(Magic, "---\narchs:"))
       return file_magic::tapi_file;
     break;
-  
+
   case 'D': // DirectX container file - DXBC
     if (startswith(Magic, "DXBC"))
       return file_magic::dxcontainer_object;
+    break;
+
+  case 'U': // cc65 object file.
+    if (startswith(Magic.drop_front(), "zna"))
+      return file_magic::xo65_object;
     break;
 
   case 0x41: // ARM64EC windows
