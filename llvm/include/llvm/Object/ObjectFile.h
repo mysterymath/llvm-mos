@@ -38,6 +38,7 @@ namespace object {
 
 class COFFObjectFile;
 class MachOObjectFile;
+class XO65ObjectFile;
 class ObjectFile;
 class SectionRef;
 class SymbolRef;
@@ -391,6 +392,9 @@ public:
   createMachOObjectFile(MemoryBufferRef Object,
                         uint32_t UniversalCputype = 0,
                         uint32_t UniversalIndex = 0);
+
+  static Expected<std::unique_ptr<XO65ObjectFile>>
+  createXO65ObjectFile(MemoryBufferRef Object);
 
   static Expected<std::unique_ptr<WasmObjectFile>>
   createWasmObjectFile(MemoryBufferRef Object);

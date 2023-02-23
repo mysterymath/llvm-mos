@@ -18,6 +18,7 @@
 #include "llvm/Object/Error.h"
 #include "llvm/Object/MachO.h"
 #include "llvm/Object/Wasm.h"
+#include "llvm/Object/XO65.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/ErrorOr.h"
@@ -185,7 +186,7 @@ ObjectFile::createObjectFile(MemoryBufferRef Object, file_magic Type,
   case file_magic::xcoff_object_64:
     return createXCOFFObjectFile(Object, Binary::ID_XCOFF64);
   case file_magic::xo65_object:
-    llvm_unreachable("TODO");
+    return createXO65ObjectFile(Object);
   case file_magic::wasm_object:
     return createWasmObjectFile(Object);
   }

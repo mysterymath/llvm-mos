@@ -32,6 +32,7 @@ add_llvm_component_library(LLVMObject
   WindowsMachineFlag.cpp
   WindowsResource.cpp
   XCOFFObjectFile.cpp
+  XO65ObjectFile.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Object
