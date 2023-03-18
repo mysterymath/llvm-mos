@@ -73,7 +73,7 @@ bool XO65ObjectFile::isRelocatableObject() const {
 XO65ObjectFile::XO65ObjectFile(MemoryBufferRef Object)
     : ObjectFile(Binary::ID_XO65, Object) {}
 
-Error XO65ObjectFile::initialize() { llvm_unreachable("Not yet implemented."); }
+Error XO65ObjectFile::initialize() { return Error::success(); }
 
 Expected<StringRef> XO65ObjectFile::getSymbolName(DataRefImpl Symb) const {
   llvm_unreachable("Not yet implemented.");
