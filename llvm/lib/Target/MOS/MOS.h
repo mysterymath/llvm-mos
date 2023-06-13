@@ -23,11 +23,12 @@ void initializeMOSCombinerPass(PassRegistry &);
 void initializeMOSCopyOptPass(PassRegistry &);
 void initializeMOSIncDecPhiPass(PassRegistry &);
 void initializeMOSIndexIVPass(PassRegistry &);
-void initializeMOSInsertCopiesPass(PassRegistry &);
 void initializeMOSLateOptimizationPass(PassRegistry &);
 void initializeMOSLowerSelectPass(PassRegistry &);
+void initializeMOSMachineSSAPass(PassRegistry &);
 void initializeMOSNonReentrantPass(PassRegistry &);
 void initializeMOSPostRAScavengingPass(PassRegistry &);
+void initializeMOSRegAllocPass(PassRegistry &);
 void initializeMOSStaticStackAllocPass(PassRegistry &);
 void initializeMOSZeroPageAllocPass(PassRegistry &);
 

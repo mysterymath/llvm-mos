@@ -173,8 +173,8 @@ let isPressureFineGrained = true in {
 
 // "General purpose" register classes.
 let isPressureFineGrained = true in {
-  def GPR : MOSReg8Class<(add X, Y, A)>;
-  def GPR_LSB : MOSReg1Class<(add XLSB, YLSB, ALSB)>;
+  def GPR : MOSReg8Class<(add A, X, Y)>;
+  def GPR_LSB : MOSReg1Class<(add ALSB, XLSB, YLSB)>;
   def CV_GPR_LSB : MOSReg1Class<(add Cc, GPR_LSB, Vc)>;
 }
 def Imag8 : MOSReg8Class<(sequence "RC%u", 0, !add(MaxImag8Regs, -1))>;
@@ -201,8 +201,8 @@ def MOSAsmParamRegClass : MOSReg8Class<(add X, Y, S)>;
 
 // Sum types of all available storage locations for a size.
 
-def Anyi1 : MOSReg1Class<(add (sequence "RC%uLSB", 0, !add(MaxImag8Regs, -1)), CV_GPR_LSB)>;
-def Anyi8 : MOSReg8Class<(add Imag8, GPR)>;
+def Anyi1 : MOSReg1Class<(add GPR_LSB, (sequence "RC%uLSB", 0, !add(MaxImag8Regs, -1)), Cc, Vc)>;
+def Anyi8 : MOSReg8Class<(add GPR, Imag8)>;
 
 def Fake : MOSReg<13, "Fake">;
 let isAllocatable = false in {

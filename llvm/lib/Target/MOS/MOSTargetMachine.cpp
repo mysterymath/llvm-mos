@@ -16,7 +16,6 @@
 #include "llvm/CodeGen/GlobalISel/IRTranslator.h"
 #include "llvm/CodeGen/GlobalISel/InstructionSelect.h"
 #include "llvm/CodeGen/GlobalISel/Legalizer.h"
-#include "llvm/CodeGen/GlobalISel/Localizer.h"
 #include "llvm/CodeGen/GlobalISel/RegBankSelect.h"
 #include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/Passes.h"
@@ -37,13 +36,14 @@
 #include "MOSCopyOpt.h"
 #include "MOSIncDecPhi.h"
 #include "MOSIndexIV.h"
-#include "MOSInsertCopies.h"
 #include "MOSLateOptimization.h"
 #include "MOSLowerSelect.h"
 #include "MOSMachineFunctionInfo.h"
+#include "MOSMachineSSA.h"
 #include "MOSMachineScheduler.h"
 #include "MOSNonReentrant.h"
 #include "MOSPostRAScavenging.h"
+#include "MOSRegAlloc.h"
 #include "MOSStaticStackAlloc.h"
 #include "MOSTargetObjectFile.h"
 #include "MOSTargetTransformInfo.h"
@@ -60,11 +60,12 @@ extern "C" void LLVM_EXTERNAL_VISIBILITY LLVMInitializeMOSTarget() {
   initializeMOSCombinerPass(PR);
   initializeMOSCopyOptPass(PR);
   initializeMOSIncDecPhiPass(PR);
-  initializeMOSInsertCopiesPass(PR);
   initializeMOSLateOptimizationPass(PR);
   initializeMOSLowerSelectPass(PR);
+  initializeMOSMachineSSAPass(PR);
   initializeMOSNonReentrantPass(PR);
   initializeMOSPostRAScavengingPass(PR);
+  initializeMOSRegAllocPass(PR);
   initializeMOSStaticStackAllocPass(PR);
   initializeMOSZeroPageAllocPass(PR);
 }
@@ -191,18 +192,16 @@ public:
   bool addLegalizeMachineIR() override;
   void addPreRegBankSelect() override;
   bool addRegBankSelect() override;
-  void addPreGlobalInstructionSelect() override;
   bool addGlobalInstructionSelect() override;
 
   // Register pressure is too high around calls to work without detailed
   // scheduling.
   bool alwaysRequiresMachineScheduler() const override { return true; }
 
-  void addMachineSSAOptimization() override;
-
   // Register pressure is too high to work without optimized register
   // allocation.
   void addFastRegAlloc() override { addOptimizedRegAlloc(); }
+
   void addOptimizedRegAlloc() override;
 
   void addMachineLateOptimization() override;
@@ -260,35 +259,61 @@ bool MOSPassConfig::addRegBankSelect() {
   return false;
 }
 
-void MOSPassConfig::addPreGlobalInstructionSelect() {
-  // This pass helps reduce the live ranges of constants to within a basic
-  // block, which can greatly improve machine scheduling, as they can now be
-  // moved around to keep register pressure low.
-  addPass(new Localizer());
-}
-
 bool MOSPassConfig::addGlobalInstructionSelect() {
   addPass(new InstructionSelect());
   return false;
 }
 
-void MOSPassConfig::addMachineSSAOptimization() {
-  TargetPassConfig::addMachineSSAOptimization();
-  if (getOptLevel() != CodeGenOpt::None)
-    addPass(createMOSInsertCopiesPass());
-}
-
 void MOSPassConfig::addOptimizedRegAlloc() {
-  if (getOptLevel() != CodeGenOpt::None) {
-    // Run the coalescer twice to coalesce RMW patterns revealed by the first
-    // coalesce.
-    insertPass(&llvm::TwoAddressInstructionPassID, &llvm::RegisterCoalescerID);
+  addPass(&DetectDeadLanesID);
 
-    // Re-run Live Intervals after coalescing to renumber the contained values.
-    // This can allow constant rematerialization after aggressive coalescing.
-    insertPass(&llvm::MachineSchedulerID, &llvm::LiveIntervalsID);
-  }
-  TargetPassConfig::addOptimizedRegAlloc();
+  addPass(&ProcessImplicitDefsID);
+
+  // LiveVariables currently requires pure SSA form.
+  //
+  // FIXME: Once TwoAddressInstruction pass no longer uses kill flags,
+  // LiveVariables can be removed completely, and LiveIntervals can be directly
+  // computed. (We still either need to regenerate kill flags after regalloc, or
+  // preferably fix the scavenger to not depend on them).
+  // FIXME: UnreachableMachineBlockElim is a dependant pass of LiveVariables.
+  // When LiveVariables is removed this has to be removed/moved either.
+  // Explicit addition of UnreachableMachineBlockElim allows stopping before or
+  // after it with -stop-before/-stop-after.
+  addPass(&UnreachableMachineBlockElimID);
+  addPass(&LiveVariablesID);
+
+  // Edge splitting is smarter with machine loop info.
+  addPass(&MachineLoopInfoID);
+  addPass(&PHIEliminationID);
+
+  addPass(&TwoAddressInstructionPassID);
+
+  // The machine scheduler may accidentally create disconnected components
+  // when moving subregister definitions around, avoid this by splitting them to
+  // separate vregs before. Splitting can also improve reg. allocation quality.
+  addPass(&RenameIndependentSubregsID);
+
+  // PreRA instruction scheduling.
+  addPass(&MachineSchedulerID);
+
+  addPass(createMOSMachineSSAPass());
+  addPass(createMOSRegAllocPass());
+
+  // Perform stack slot coloring and post-ra machine LICM.
+  addPass(&StackSlotColoringID);
+
+  // Allow targets to expand pseudo instructions depending on the choice of
+  // registers before MachineCopyPropagation.
+  addPostRewrite();
+
+  // Copy propagate to forward register uses and try to eliminate COPYs that
+  // were not coalesced.
+  addPass(&MachineCopyPropagationID);
+
+  // Run post-ra machine LICM to hoist reloads / remats.
+  //
+  // FIXME: can this move into MachineLateOptimization?
+  addPass(&MachineLICMID);
 }
 
 void MOSPassConfig::addMachineLateOptimization() {

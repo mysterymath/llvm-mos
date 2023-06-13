@@ -30,7 +30,6 @@ add_llvm_target(MOSCodeGen
   MOSIndexIV.cpp
   MOSInlineAsmLowering.cpp
   MOSIncDecPhi.cpp
-  MOSInsertCopies.cpp
   MOSInstrInfo.cpp
   MOSInstructionSelector.cpp
   MOSLateOptimization.cpp
@@ -39,8 +38,10 @@ add_llvm_target(MOSCodeGen
   MOSMCInstLower.cpp
   MOSMachineFunctionInfo.cpp
   MOSMachineScheduler.cpp
+  MOSMachineSSA.cpp
   MOSNonReentrant.cpp
   MOSPostRAScavenging.cpp
+  MOSRegAlloc.cpp
   MOSRegisterBankInfo.cpp
   MOSRegisterInfo.cpp
   MOSStaticStackAlloc.cpp

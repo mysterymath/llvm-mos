@@ -1,4 +1,4 @@
-//===-- MOSLateOptimization.h - MOS Copy Insertion --------------*- C++ -*-===//
+//===-- MOSRegAlloc.h - MOS Register Allocator ------------------*- C++ -*-===//
 //
 // Part of LLVM-MOS, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,19 +6,16 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file declares the MOS copy insertion pass.
+// This file declares the MOS register allocator pass.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef LLVM_LIB_TARGET_MOS_MOSINSERTCOPIES_H
-#define LLVM_LIB_TARGET_MOS_MOSINSERTCOPIES_H
-
-#include "llvm/CodeGen/MachineFunctionPass.h"
+#ifndef LLVM_LIB_TARGET_MOS_MOSREGALLOC_H
+#define LLVM_LIB_TARGET_MOS_MOSREGALLOC_H
 
 namespace llvm {
-
-MachineFunctionPass *createMOSInsertCopiesPass();
-
+class MachineFunctionPass;
+MachineFunctionPass *createMOSRegAllocPass();
 } // namespace llvm
 
-#endif // not LLVM_LIB_TARGET_MOS_MOSINSERTCOPIES_H
+#endif // not LLVM_LIB_TARGET_MOS_MOSREGALLOC_H

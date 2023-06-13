@@ -573,47 +573,6 @@ bool isRmwPattern(Register Reg, const MachineRegisterInfo &MRI) {
   return true;
 }
 
-bool MOSRegisterInfo::shouldCoalesce(
-    MachineInstr *MI, const TargetRegisterClass *SrcRC, unsigned SubReg,
-    const TargetRegisterClass *DstRC, unsigned DstSubReg,
-    const TargetRegisterClass *NewRC, LiveIntervals &LIS) const {
-  const auto &MRI = MI->getMF()->getRegInfo();
-
-  // Don't coalesce Imag8 and AImag8 registers together when used by shifts or
-  // rotates.  This may cause expensive ASL zp's to be used when ASL A would
-  // have sufficed. It's better to do arithmetic in A and then copy it out.
-  // Same concerns apply to INC and DEC.
-  if (NewRC == &MOS::Imag8RegClass || NewRC == &MOS::Imag16RegClass) {
-    if (DstRC == &MOS::AImag8RegClass &&
-        referencedByShiftRotate(MI->getOperand(0).getReg(), MRI) &&
-        !isRmwPattern(MI->getOperand(0).getReg(), MRI))
-      return false;
-    if (SrcRC == &MOS::AImag8RegClass &&
-        referencedByShiftRotate(MI->getOperand(1).getReg(), MRI) &&
-        !isRmwPattern(MI->getOperand(1).getReg(), MRI))
-      return false;
-    if (DstRC == &MOS::Anyi8RegClass &&
-        referencedByIncDec(MI->getOperand(0).getReg(), MRI) &&
-        !isRmwPattern(MI->getOperand(0).getReg(), MRI))
-      return false;
-    if (SrcRC == &MOS::Anyi8RegClass &&
-        referencedByIncDec(MI->getOperand(1).getReg(), MRI) &&
-        !isRmwPattern(MI->getOperand(1).getReg(), MRI))
-      return false;
-  }
-  // Don't coalesce GPR and Anyi8 registers together when used by IncMB and
-  // DecMB; this can make them impossible to allocate.
-  if (NewRC == &MOS::GPRRegClass) {
-    if (DstRC == &MOS::Anyi8RegClass &&
-        referencedByIncDecMB(MI->getOperand(0).getReg(), MRI))
-      return false;
-    if (SrcRC == &MOS::Anyi8RegClass &&
-        referencedByIncDecMB(MI->getOperand(1).getReg(), MRI))
-      return false;
-  }
-  return true;
-}
-
 bool MOSRegisterInfo::getRegAllocationHints(Register VirtReg,
                                             ArrayRef<MCPhysReg> Order,
                                             SmallVectorImpl<MCPhysReg> &Hints,
