@@ -104,7 +104,7 @@ private:
   MachineFunction *MF;
   RegisterClassInfo RCI;
 
-  void assignImagRegs();
+  void assignImagRegs(const MachineBasicBlock &MBB, SmallSet<Register, 8> DomLiveOutVals);
 
   const TargetRegisterClass *getOperandRegClass(const MachineOperand &MO) const;
   bool isDeadMI(const MachineInstr &MI) const;
@@ -210,8 +210,11 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   return false;
 }
 
-void MOSRegAlloc::assignImagRegs() {
-  // TODO
+void MOSRegAlloc::assignImagRegs(const MachineBasicBlock &MBB, SmallSet<Register, 8> DomLiveOutVals) {
+  SmallSet<Register, 8> LiveInVals;
+  for (Register R : DomLiveOutVals)
+    if (LV->isLiveIn(R, MBB))
+      LiveInVals.insert(R);
 }
 
 const TargetRegisterClass *
