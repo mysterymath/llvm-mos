@@ -104,7 +104,10 @@ private:
   MachineFunction *MF;
   RegisterClassInfo RCI;
 
-  void assignImagRegs(const MachineBasicBlock &MBB, SmallSet<Register, 8> DomLiveOutVals);
+  // Map from value to imaginary register
+  DenseMap<Register, Register> ImagAlloc;
+
+  void assignImagRegs(const MachineDomTreeNode &MDTN, SmallSet<Register, 8> DomLiveOutVals = {});
 
   const TargetRegisterClass *getOperandRegClass(const MachineOperand &MO) const;
   bool isDeadMI(const MachineInstr &MI) const;
@@ -183,6 +186,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   ReversePostOrderTraversal<MachineFunction *> RPOT(&MF);
 
   // TODO!
+  ImagAlloc.clear();
+  assignImagRegs(*MDT->getRootNode());
 
   // Recompute liveness and kill dead instructions.
   for (MachineBasicBlock *MBB : post_order(&MF)) {
@@ -210,10 +215,10 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   return false;
 }
 
-void MOSRegAlloc::assignImagRegs(const MachineBasicBlock &MBB, SmallSet<Register, 8> DomLiveOutVals) {
+void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN, SmallSet<Register, 8> DomLiveOutVals) {
   SmallSet<Register, 8> LiveInVals;
   for (Register R : DomLiveOutVals)
-    if (LV->isLiveIn(R, MBB))
+    if (LV->isLiveIn(R, *MDTN.getBlock()))
       LiveInVals.insert(R);
 }
 
