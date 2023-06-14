@@ -81,8 +81,6 @@ using namespace llvm;
 
 namespace {
 
-struct InstrAlloc { /* TODO */ };
-
 class MOSRegAlloc : public MachineFunctionPass {
 public:
   static char ID;
@@ -106,8 +104,7 @@ private:
   MachineFunction *MF;
   RegisterClassInfo RCI;
 
-  void spill();
-  SmallVector<InstrAlloc> instrAllocs(MachineInstr &MI);
+  void assignImagRegs();
 
   const TargetRegisterClass *getOperandRegClass(const MachineOperand &MO) const;
   bool isDeadMI(const MachineInstr &MI) const;
@@ -186,7 +183,6 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   ReversePostOrderTraversal<MachineFunction *> RPOT(&MF);
 
   // TODO!
-  spill();
 
   // Recompute liveness and kill dead instructions.
   for (MachineBasicBlock *MBB : post_order(&MF)) {
@@ -214,27 +210,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   return false;
 }
 
-void MOSRegAlloc::spill() {
-  SmallSet<Register, 14> LiveRegs;
-  for (MachineBasicBlock &MBB : *MF) {
-    LiveRegs.clear();
-    for (const auto &[PhysReg, LaneMask] : MBB.liveins()) {
-      assert(LaneMask.all() && "Lane bitmasks not used on 6502");
-      LiveRegs.insert(PhysReg);
-    }
-    for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
-      Register R = Register::index2VirtReg(I);
-      if (LV->isLiveIn(R, MBB))
-        LiveRegs.insert(R);
-    }
-    assert(LiveRegs.size() <= 12 &&
-           "TODO: Cannot fit all live regs in MBB in callee saved regs.");
-    for (MachineInstr &MI : MBB) {
-      for (InstrAlloc &IA : instrAllocs(MI)) {
-        
-      }
-    }
-  }
+void MOSRegAlloc::assignImagRegs() {
+  // TODO
 }
 
 const TargetRegisterClass *
