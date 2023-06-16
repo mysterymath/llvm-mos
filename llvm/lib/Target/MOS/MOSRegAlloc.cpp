@@ -137,7 +137,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   // TODO: Subregister liveness.
   this->MF = &MF;
 
-  dbgs() << "\n# MOS Register Allocator: " << MF.getName() << "\n\n";
+  LLVM_DEBUG(dbgs() << "\n# MOS Register Allocator: " << MF.getName() << "\n\n");
 
   MRI = &MF.getRegInfo();
   TII = MF.getSubtarget().getInstrInfo();
@@ -149,7 +149,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
   MF.dump();
 
-  dbgs() << "## Coalesce away copies.\n";
+  LLVM_DEBUG(dbgs() << "## Coalesce away copies.\n");
 
   // Temporarily coalesce away all copies. This makes the register classes
   // invalid, but true copies will be inserted as allocation proceeds to
@@ -164,10 +164,10 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
     MachineOperand &Src = MI->getOperand(1);
     if (!Src.getReg().isVirtual())
       continue;
-    dbgs() << "Coalescing: " << *MI;
+    LLVM_DEBUG(dbgs() << "Coalescing: " << *MI);
     for (MachineOperand &Use :
          make_early_inc_range(MRI->use_nodbg_operands(R))) {
-      dbgs() << "Use MI: " << *Use.getParent();
+      LLVM_DEBUG(dbgs() << "Use MI: " << *Use.getParent());
       unsigned SubRegIdx = 0;
       if (Src.getSubReg()) {
         SubRegIdx = Src.getSubReg();
@@ -201,7 +201,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
       for (MachineInstr &MI : make_early_inc_range(*MBB)) {
         if (!isDeadMI(MI))
           continue;
-        dbgs() << "Remove dead MI: " << MI;
+        LLVM_DEBUG(dbgs() << "Remove dead MI: " << MI);
         MI.eraseFromParent();
         RemovedAny = true;
       }
@@ -256,7 +256,7 @@ void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN,
       if (MO.isEarlyClobber() && MO.getReg().isVirtual())
         Assign(MO.getReg());
     for (const MachineOperand &MO : MI.uses())
-      if (MO.isKill())
+      if (MO.isReg() && MO.isKill())
         LiveVals.erase(MO.getReg());
     for (const MachineOperand &MO : MI.defs())
       if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
