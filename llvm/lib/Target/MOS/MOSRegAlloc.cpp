@@ -109,7 +109,7 @@ private:
   DenseMap<Register, Register> ImagAlloc;
 
   void assignImagRegs(const MachineDomTreeNode &MDTN,
-                      SmallSet<Register, 8> DomLiveOutVals = {});
+                      const SmallSet<Register, 8> &DomLiveOutVals = {});
 
   const TargetRegisterClass *getOperandRegClass(const MachineOperand &MO) const;
   bool isDeadMI(const MachineInstr &MI) const;
@@ -218,7 +218,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 }
 
 void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN,
-                                 SmallSet<Register, 8> DomLiveOutVals) {
+                                 const SmallSet<Register, 8> &DomLiveOutVals) {
   const MachineBasicBlock &MBB = *MDTN.getBlock();
 
   SmallSet<Register, 8> LiveVals;
@@ -262,6 +262,9 @@ void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN,
       if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
         Assign(MO.getReg());
   }
+
+  for (const MachineDomTreeNode *Child : MDTN.children())
+    assignImagRegs(*Child, LiveVals);
 }
 
 const TargetRegisterClass *
