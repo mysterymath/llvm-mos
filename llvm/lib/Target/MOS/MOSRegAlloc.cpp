@@ -261,6 +261,9 @@ void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN,
     for (const MachineOperand &MO : MI.defs())
       if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
         Assign(MO.getReg());
+    for (const MachineOperand &MO : MI.defs())
+      if (MO.isDead())
+        LiveVals.erase(MO.getReg());
   }
 
   for (const MachineDomTreeNode *Child : MDTN.children())
