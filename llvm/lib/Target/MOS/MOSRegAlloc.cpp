@@ -230,18 +230,18 @@ void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN,
     const TargetRegisterClass *RC = MRI->getRegClass(R);
     Register I, E;
     if (RC == &MOS::Imag16RegClass) {
-      I = MOS::RC20;
-      E = MOS::RC31 + 1;
-    } else {
       I = MOS::RS10;
       E = MOS::RS15 + 1;
+    } else {
+      I = MOS::RC20;
+      E = MOS::RC31 + 1;
     }
 
     for (; I != E; I = I + 1) {
       if (llvm::none_of(LiveVals, [&](Register V) {
             return TRI->regsOverlap(I, ImagAlloc[V]);
           })) {
-        LLVM_DEBUG(dbgs() << "%" << printReg(R) << " -> " << printReg(I, TRI)
+        LLVM_DEBUG(dbgs() << printReg(R) << " -> " << printReg(I, TRI)
                           << '\n');
         ImagAlloc[R] = I;
         LiveVals.insert(R);
