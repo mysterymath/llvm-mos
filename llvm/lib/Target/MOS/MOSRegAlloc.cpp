@@ -51,6 +51,7 @@
 
 #include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
+#include "MOSRegisterInfo.h"
 
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/STLExtras.h"
@@ -107,8 +108,8 @@ private:
   // Map from value to imaginary register
   DenseMap<Register, Register> ImagAlloc;
 
-  void spill();
-  void assignImagRegs(const MachineDomTreeNode &MDTN, SmallSet<Register, 8> DomLiveOutVals = {});
+  void assignImagRegs(const MachineDomTreeNode &MDTN,
+                      SmallSet<Register, 8> DomLiveOutVals = {});
 
   const TargetRegisterClass *getOperandRegClass(const MachineOperand &MO) const;
   bool isDeadMI(const MachineInstr &MI) const;
@@ -188,7 +189,6 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
   // TODO!
   ImagAlloc.clear();
-  spill();
   assignImagRegs(*MDT->getRootNode());
 
   // Recompute liveness and kill dead instructions.
@@ -217,19 +217,51 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   return false;
 }
 
-// Spill to ensure that the static register pressure at each program point is
-// under the static limit. Each value can live in at most one architectural
-// register and one imaginary register. Due to SSA chordality, this ensures a
-// PEO for imaginary registers, but only establishes an upper bound set of
-// possibly live values for architectural registers.
-void MOSRegAlloc::spill() {
-}
+void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN,
+                                 SmallSet<Register, 8> DomLiveOutVals) {
+  const MachineBasicBlock &MBB = *MDTN.getBlock();
 
-void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN, SmallSet<Register, 8> DomLiveOutVals) {
-  SmallSet<Register, 8> LiveInVals;
+  SmallSet<Register, 8> LiveVals;
   for (Register R : DomLiveOutVals)
     if (LV->isLiveIn(R, *MDTN.getBlock()))
-      LiveInVals.insert(R);
+      LiveVals.insert(R);
+
+  const auto Assign = [&](Register R) {
+    const TargetRegisterClass *RC = MRI->getRegClass(R);
+    Register I, E;
+    if (RC == &MOS::Imag16RegClass) {
+      I = MOS::RC20;
+      E = MOS::RC31 + 1;
+    } else {
+      I = MOS::RS10;
+      E = MOS::RS15 + 1;
+    }
+
+    for (; I != E; I = I + 1) {
+      if (llvm::none_of(LiveVals, [&](Register V) {
+            return TRI->regsOverlap(I, ImagAlloc[V]);
+          })) {
+        LLVM_DEBUG(dbgs() << "%" << printReg(R) << " -> " << printReg(I, TRI)
+                          << '\n');
+        ImagAlloc[R] = I;
+        LiveVals.insert(R);
+        return;
+      }
+    }
+    report_fatal_error("ran out of callee-saved registers");
+  };
+
+  for (const MachineInstr &MI : MBB) {
+    for (const MachineOperand &MO : MI.defs())
+      if (MO.isEarlyClobber() && MO.getReg().isVirtual())
+        Assign(MO.getReg());
+    for (const MachineOperand &MO : MI.uses())
+      if (MO.isKill())
+        LiveVals.erase(MO.getReg());
+    for (const MachineOperand &MO : MI.defs())
+      if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
+        Assign(MO.getReg());
+  }
 }
 
 const TargetRegisterClass *
