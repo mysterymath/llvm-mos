@@ -107,6 +107,7 @@ private:
   // Map from value to imaginary register
   DenseMap<Register, Register> ImagAlloc;
 
+  void spill();
   void assignImagRegs(const MachineDomTreeNode &MDTN, SmallSet<Register, 8> DomLiveOutVals = {});
 
   const TargetRegisterClass *getOperandRegClass(const MachineOperand &MO) const;
@@ -187,6 +188,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
   // TODO!
   ImagAlloc.clear();
+  spill();
   assignImagRegs(*MDT->getRootNode());
 
   // Recompute liveness and kill dead instructions.
@@ -213,6 +215,14 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   MRI->clearVirtRegs();
 
   return false;
+}
+
+// Spill to ensure that the static register pressure at each program point is
+// under the static limit. Each value can live in at most one architectural
+// register and one imaginary register. Due to SSA chordality, this ensures a
+// PEO for imaginary registers, but only establishes an upper bound set of
+// possibly live values for architectural registers.
+void MOSRegAlloc::spill() {
 }
 
 void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN, SmallSet<Register, 8> DomLiveOutVals) {
