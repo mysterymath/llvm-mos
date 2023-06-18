@@ -193,13 +193,20 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   RCI.runOnMachineFunction(MF);
 
   findCSRVals(*MDT->getRootNode());
+  LLVM_DEBUG({
+    dbgs() << "Values live across calls:\n";
+    for (Register R : CSRVals)
+      dbgs() << '\t' << printReg(R) << '\n';
+  });
+
   spill();
   ImagAlloc.clear();
+
+  LLVM_DEBUG(dbgs() << "Assigning imaginary registers to each value:\n");
   assignImagRegs(*MDT->getRootNode());
 
   // Recompute liveness and kill dead instructions.
   for (MachineBasicBlock *MBB : post_order(&MF)) {
-
     bool RemovedAny;
     do {
       recomputeLivenessFlags(*MBB);
