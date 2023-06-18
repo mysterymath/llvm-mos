@@ -264,9 +264,31 @@ void MOSRegAlloc::findCSRVals(const MachineDomTreeNode &MDTN,
   for (const MachineDomTreeNode *Child : MDTN.children())
     findCSRVals(*Child, LiveVals);
 }
+
 void MOSRegAlloc::spill() {
   DenseMap<MachineBasicBlock *, SmallSet<Register, 8>> LiveOutVals;
   ReversePostOrderTraversal<MachineBasicBlock *> RPOT(&*MF->begin());
+
+  int NumImag8 = 0;
+  int NumImag8CSR = 0;
+  for (Register I = MOS::RC0, E = MOS::RC31 + 1; I != E; I = I + 1) {
+    if (MRI->isReserved(I))
+      continue;
+    NumImag8++;
+    if (I >= MOS::RC20)
+      NumImag8CSR++;
+  }
+  int NumImag16 = 0;
+  int NumImag16CSR = 0;
+  for (Register I = MOS::RS0, E = MOS::RS15 + 1; I != E; I = I + 1) {
+    if (MRI->isReserved(I))
+      continue;
+    NumImag16++;
+    if (I >= MOS::RS10)
+      NumImag16CSR++;
+  }
+
+
   for (MachineBasicBlock *MBB : RPOT) {
     SmallSet<Register, 8> &LV = LiveOutVals[MBB];
 
