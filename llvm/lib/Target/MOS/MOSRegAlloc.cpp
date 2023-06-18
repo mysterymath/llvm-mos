@@ -105,9 +105,15 @@ private:
   MachineFunction *MF;
   RegisterClassInfo RCI;
 
+  // Values live across calls that clobber imaginary registers.
+  DenseSet<Register> CSRVals;
+
   // Map from value to imaginary register
   DenseMap<Register, Register> ImagAlloc;
 
+  void findCSRVals(const MachineDomTreeNode &MDTN,
+                   const SmallSet<Register, 8> &DomLiveOutVals = {});
+  void spill();
   void assignImagRegs(const MachineDomTreeNode &MDTN,
                       const SmallSet<Register, 8> &DomLiveOutVals = {});
 
@@ -137,7 +143,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   // TODO: Subregister liveness.
   this->MF = &MF;
 
-  LLVM_DEBUG(dbgs() << "\n# MOS Register Allocator: " << MF.getName() << "\n\n");
+  LLVM_DEBUG(dbgs() << "\n# MOS Register Allocator: " << MF.getName()
+                    << "\n\n");
 
   MRI = &MF.getRegInfo();
   TII = MF.getSubtarget().getInstrInfo();
@@ -185,9 +192,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   MRI->freezeReservedRegs(MF);
   RCI.runOnMachineFunction(MF);
 
-  ReversePostOrderTraversal<MachineFunction *> RPOT(&MF);
-
-  // TODO!
+  findCSRVals(*MDT->getRootNode());
+  spill();
   ImagAlloc.clear();
   assignImagRegs(*MDT->getRootNode());
 
@@ -217,6 +223,70 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   return false;
 }
 
+void MOSRegAlloc::findCSRVals(const MachineDomTreeNode &MDTN,
+                              const SmallSet<Register, 8> &DomLiveOutVals) {
+
+  const MachineBasicBlock &MBB = *MDTN.getBlock();
+
+  SmallSet<Register, 8> LiveVals;
+  for (Register R : DomLiveOutVals)
+    if (LV->isLiveIn(R, *MDTN.getBlock()))
+      LiveVals.insert(R);
+
+  for (const MachineInstr &MI : MBB) {
+    for (const MachineOperand &MO : MI.defs())
+      if (MO.isEarlyClobber() && MO.getReg().isVirtual())
+        LiveVals.insert(MO.getReg());
+    for (const MachineOperand &MO : MI.uses())
+      if (MO.isReg() && MO.isKill())
+        LiveVals.erase(MO.getReg());
+
+    for (const MachineOperand &MO : MI.operands())
+      if (MO.isRegMask() && MO.clobbersPhysReg(MOS::RC2))
+        for (Register R : LiveVals)
+          CSRVals.insert(R);
+
+    for (const MachineOperand &MO : MI.defs())
+      if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
+        LiveVals.insert(MO.getReg());
+    for (const MachineOperand &MO : MI.defs())
+      if (MO.isDead())
+        LiveVals.erase(MO.getReg());
+  }
+
+  for (const MachineDomTreeNode *Child : MDTN.children())
+    findCSRVals(*Child, LiveVals);
+}
+void MOSRegAlloc::spill() {
+  DenseMap<MachineBasicBlock *, SmallSet<Register, 8>> LiveOutVals;
+  ReversePostOrderTraversal<MachineBasicBlock *> RPOT(&*MF->begin());
+  for (MachineBasicBlock *MBB : RPOT) {
+    SmallSet<Register, 8> &LV = LiveOutVals[MBB];
+
+    SmallSet<Register, 8> AllPredsLOV;
+    SmallSet<Register, 8> SomePredLOV;
+    bool IsFirst = true;
+    for (MachineBasicBlock *Pred : MBB->predecessors()) {
+      const auto &PredLOV = LiveOutVals[Pred];
+      if (IsFirst) {
+        AllPredsLOV = SomePredLOV = PredLOV;
+        IsFirst = false;
+        continue;
+      }
+
+      SmallSet<Register, 8> ToRemove;
+      for (Register R : LV)
+        if (!PredLOV.contains(R))
+          ToRemove.insert(R);
+      for (Register R : ToRemove)
+        AllPredsLOV.erase(R);
+
+      for (Register R : PredLOV)
+        SomePredLOV.insert(R);
+    }
+  }
+}
+
 void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN,
                                  const SmallSet<Register, 8> &DomLiveOutVals) {
   const MachineBasicBlock &MBB = *MDTN.getBlock();
@@ -241,8 +311,7 @@ void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN,
       if (llvm::none_of(LiveVals, [&](Register V) {
             return TRI->regsOverlap(I, ImagAlloc[V]);
           })) {
-        LLVM_DEBUG(dbgs() << printReg(R) << " -> " << printReg(I, TRI)
-                          << '\n');
+        LLVM_DEBUG(dbgs() << printReg(R) << " -> " << printReg(I, TRI) << '\n');
         ImagAlloc[R] = I;
         LiveVals.insert(R);
         return;
