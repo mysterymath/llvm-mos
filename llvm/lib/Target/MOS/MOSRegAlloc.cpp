@@ -82,6 +82,20 @@ using namespace llvm;
 
 namespace {
 
+struct NextUseDist {
+  unsigned LoopDepth;
+  unsigned NumInstrs;
+
+  bool operator<(const NextUseDist &Other) const {
+    // Uses along loop backedges are overwhelmingly "nearer".
+    if (LoopDepth < Other.LoopDepth)
+      return true;
+    if (LoopDepth > Other.LoopDepth)
+      return false;
+    return NumInstrs < Other.NumInstrs;
+  }
+};
+
 class MOSRegAlloc : public MachineFunctionPass {
 public:
   static char ID;
@@ -111,6 +125,7 @@ private:
   // Map from value to imaginary register
   DenseMap<Register, Register> ImagAlloc;
 
+  void computeNextUseDists();
   void findCSRVals(const MachineDomTreeNode &MDTN,
                    const SmallSet<Register, 8> &DomLiveOutVals = {});
   void spill();
@@ -192,6 +207,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   MRI->freezeReservedRegs(MF);
   RCI.runOnMachineFunction(MF);
 
+  computeNextUseDists();
+
   findCSRVals(*MDT->getRootNode());
   LLVM_DEBUG({
     dbgs() << "Values live across calls:\n";
@@ -229,6 +246,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
   return false;
 }
+
+void MOSRegAlloc::computeNextUseDists() {}
 
 void MOSRegAlloc::findCSRVals(const MachineDomTreeNode &MDTN,
                               const SmallSet<Register, 8> &DomLiveOutVals) {
@@ -287,7 +306,6 @@ void MOSRegAlloc::spill() {
     if (I >= MOS::RS10)
       NumImag16CSR++;
   }
-
 
   for (MachineBasicBlock *MBB : RPOT) {
     SmallSet<Register, 8> &LV = LiveOutVals[MBB];
