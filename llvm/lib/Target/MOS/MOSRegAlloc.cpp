@@ -320,6 +320,9 @@ void MOSRegAlloc::spill() {
   }
 
   for (MachineBasicBlock *MBB : RPOT) {
+    LLVM_DEBUG(dbgs() << "Choosing allocated live in vals for MBB "
+                      << MBB->getName() << '\n');
+
     SmallSet<Register, 8> &LV = LiveOutVals[MBB];
 
     SmallSet<Register, 8> AllPredsLOV;
@@ -343,6 +346,16 @@ void MOSRegAlloc::spill() {
       for (Register R : PredLOV)
         SomePredLOV.insert(R);
     }
+
+    LLVM_DEBUG({
+      dbgs() << "Candidates live out of all predecessors:\n";
+      for (Register R : AllPredsLOV)
+        dbgs() << printReg(R) << ' ';
+      dbgs() << "\nCandidates live out of some predecessors:\n";
+      for (Register R : AllPredsLOV)
+        dbgs() << printReg(R) << ' ';
+      dbgs() << '\n';
+    });
   }
 }
 
