@@ -109,12 +109,12 @@ class ImagPressure {
   unsigned NumImag16CSR = 0;
 
 public:
-  bool numImag16Needed() const {
+  unsigned numImag16Needed() const {
     return NumImag16 + NumImag16CSR + NumImag8Pairs + NumImag8PairsCSR +
            NumImag8Unpaired + NumImag8UnpairedCSR;
   }
 
-  bool numImag16CSRNeeded() const {
+  unsigned numImag16CSRNeeded() const {
     return NumImag16CSR + NumImag8PairsCSR + NumImag8UnpairedCSR;
   }
 
@@ -505,15 +505,18 @@ void MOSRegAlloc::allocateImagRegs() {
       for (const MachineOperand &MO : MI.defs())
         if (MO.isEarlyClobber() && MO.getReg().isVirtual())
           Allocate(MO.getReg(), MI);
+      LLVM_DEBUG(IP.dump());
       for (const MachineOperand &MO : MI.uses()) {
         if (MO.isReg() && MO.isKill() && MO.getReg().isVirtual()) {
           LV.erase(MO.getReg());
           removeKillPressure(MO.getReg(), &IP);
         }
       }
+      LLVM_DEBUG(IP.dump());
       for (const MachineOperand &MO : MI.defs())
         if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
           Allocate(MO.getReg(), MI);
+      LLVM_DEBUG(IP.dump());
       for (const MachineOperand &MO : MI.defs()) {
         if (MO.isDead() && MO.getReg().isVirtual()) {
           LV.erase(MO.getReg());
