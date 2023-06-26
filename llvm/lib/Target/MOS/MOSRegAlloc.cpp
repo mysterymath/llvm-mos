@@ -218,7 +218,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
   for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; I = I + 1) {
     Register R = Register::index2VirtReg(I);
-    if (MRI->reg_nodbg_empty(R))
+    if (MRI->use_nodbg_empty(R))
       continue;
     recomputeNextUseDists(R);
   }
@@ -260,8 +260,6 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
   return false;
 }
-
-void MOSRegAlloc::computeNextUseDists() {}
 
 void MOSRegAlloc::findCSRVals(const MachineDomTreeNode &MDTN,
                               const SmallSet<Register, 8> &DomLiveOutVals) {
