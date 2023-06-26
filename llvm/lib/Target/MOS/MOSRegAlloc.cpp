@@ -310,6 +310,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
       dbgs() << '\t' << printReg(R) << '\n';
   });
 
+  countAvailImag16Regs();
   allocateImagRegs();
   ImagAlloc.clear();
 
@@ -342,6 +343,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 }
 
 void MOSRegAlloc::countAvailImag16Regs() {
+  NumImag16Avail = 0;
+  NumImag16CSRAvail = 0;
   for (Register I = MOS::RS0, E = MOS::RS15 + 1; I != E; I = I + 1) {
     if (MRI->isReserved(I))
       continue;
