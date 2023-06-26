@@ -469,7 +469,8 @@ void MOSRegAlloc::allocateImagRegs() {
     for (Register R : Candidates)
       LiveOutVals[MBB].insert(R);
 
-    const auto Assign = [&](Register R, MachineBasicBlock::const_iterator Pos) {
+    const auto Allocate = [&](Register R,
+                              MachineBasicBlock::const_iterator Pos) {
       LLVM_DEBUG(dbgs() << "Allocating " << printReg(R) << '\n');
       LV.insert(R);
       ImagPressure NewIP = IP;
@@ -497,7 +498,7 @@ void MOSRegAlloc::allocateImagRegs() {
       LLVM_DEBUG(dbgs() << "Allocating " << MI);
       for (const MachineOperand &MO : MI.defs())
         if (MO.isEarlyClobber() && MO.getReg().isVirtual())
-          Assign(MO.getReg(), MI);
+          Allocate(MO.getReg(), MI);
       for (const MachineOperand &MO : MI.uses()) {
         if (MO.isReg() && MO.isKill() && MO.getReg().isVirtual()) {
           LV.erase(MO.getReg());
@@ -506,7 +507,7 @@ void MOSRegAlloc::allocateImagRegs() {
       }
       for (const MachineOperand &MO : MI.defs())
         if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
-          Assign(MO.getReg(), MI);
+          Allocate(MO.getReg(), MI);
       for (const MachineOperand &MO : MI.defs()) {
         if (MO.isDead() && MO.getReg().isVirtual()) {
           LV.erase(MO.getReg());
@@ -528,16 +529,17 @@ void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN,
 
   const auto Assign = [&](Register R) {
     const TargetRegisterClass *RC = MRI->getRegClass(R);
+    bool IsCSR = CSRVals.contains(R);
     Register I, E;
-    if (RC == &MOS::Imag16RegClass) {
-      I = MOS::RS10;
-      E = MOS::RS15 + 1;
-    } else {
-      I = MOS::RC20;
-      E = MOS::RC31 + 1;
-    }
+    if (IsCSR)
+      I = (RC == &MOS::Imag16RegClass) ? MOS::RS10 : MOS::RC20;
+    else
+      I = (RC == &MOS::Imag16RegClass) ? MOS::RS1 : MOS::RC2;
+    E = (RC == &MOS::Imag16RegClass) ? MOS::RS15 + 1 : MOS::RC31 + 1;
 
     for (; I != E; I = I + 1) {
+      if (MRI->isReserved(I))
+        continue;
       if (llvm::none_of(LiveVals, [&](Register V) {
             return TRI->regsOverlap(I, ImagAlloc[V]);
           })) {
