@@ -162,6 +162,11 @@ public:
   void removeImag16() { NumImag16--; }
 
   void removeImag16CSR() { NumImag16CSR--; }
+
+  void dump() const {
+    dbgs() << "Imag16 Pressure: CSR: " << numImag16CSRNeeded()
+           << " All: " << numImag16Needed() << '\n';
+  }
 };
 
 class MOSRegAlloc : public MachineFunctionPass {
@@ -494,8 +499,10 @@ void MOSRegAlloc::allocateImagRegs() {
       IP = NewIP;
     };
 
+    LLVM_DEBUG(IP.dump());
     for (const MachineInstr &MI : *MBB) {
       LLVM_DEBUG(dbgs() << "Allocating " << MI);
+      LLVM_DEBUG(IP.dump());
       for (const MachineOperand &MO : MI.defs())
         if (MO.isEarlyClobber() && MO.getReg().isVirtual())
           Allocate(MO.getReg(), MI);
