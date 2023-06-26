@@ -83,16 +83,15 @@ using namespace llvm;
 namespace {
 
 struct NextUseDist {
-  unsigned LoopDepth;
+  unsigned NumLoopExits;
   unsigned NumInstrs;
 
-  bool operator<(const NextUseDist &Other) const {
-    // Uses along loop backedges are overwhelmingly "nearer".
-    if (LoopDepth < Other.LoopDepth)
+  bool operator<(const NextUseDist &R) const {
+    if (NumLoopExits < R.NumLoopExits)
       return true;
-    if (LoopDepth > Other.LoopDepth)
+    if (NumLoopExits > R.NumLoopExits)
       return false;
-    return NumInstrs < Other.NumInstrs;
+    return NumInstrs < R.NumInstrs;
   }
 };
 
@@ -125,12 +124,22 @@ private:
   // Map from value to imaginary register
   DenseMap<Register, Register> ImagAlloc;
 
-  void computeNextUseDists();
+  DenseMap<std::pair<Register, const MachineBasicBlock *>, NextUseDist>
+      NextUseDists;
+
   void findCSRVals(const MachineDomTreeNode &MDTN,
                    const SmallSet<Register, 8> &DomLiveOutVals = {});
   void spill();
   void assignImagRegs(const MachineDomTreeNode &MDTN,
                       const SmallSet<Register, 8> &DomLiveOutVals = {});
+
+  bool nearerNextUse(Register Left, Register Right,
+                     const MachineBasicBlock &MBB,
+                     MachineBasicBlock::const_iterator Pos) const;
+  std::optional<NextUseDist>
+  succNextUseDist(Register R, const MachineBasicBlock &MBB,
+                  const MachineBasicBlock &Succ) const;
+  void recomputeNextUseDists(Register R);
 
   const TargetRegisterClass *getOperandRegClass(const MachineOperand &MO) const;
   bool isDeadMI(const MachineInstr &MI) const;
@@ -207,7 +216,12 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   MRI->freezeReservedRegs(MF);
   RCI.runOnMachineFunction(MF);
 
-  computeNextUseDists();
+  for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; I = I + 1) {
+    Register R = Register::index2VirtReg(I);
+    if (MRI->reg_nodbg_empty(R))
+      continue;
+    recomputeNextUseDists(R);
+  }
 
   findCSRVals(*MDT->getRootNode());
   LLVM_DEBUG({
@@ -384,6 +398,122 @@ void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN,
 
   for (const MachineDomTreeNode *Child : MDTN.children())
     assignImagRegs(*Child, LiveVals);
+}
+
+bool MOSRegAlloc::nearerNextUse(Register Left, Register Right,
+                                const MachineBasicBlock &MBB,
+                                MachineBasicBlock::const_iterator Pos) const {
+  for (MachineBasicBlock::const_iterator I = Pos, E = MBB.end(); I != E; ++I) {
+    bool ReadsLeft = I->readsVirtualRegister(Left);
+    bool ReadsRight = I->readsVirtualRegister(Right);
+    if (ReadsLeft || ReadsRight)
+      return ReadsLeft && !ReadsRight;
+  }
+
+  std::optional<NextUseDist> BestLeft;
+  std::optional<NextUseDist> BestRight;
+  for (MachineBasicBlock *Succ : MBB.successors()) {
+    std::optional<NextUseDist> LeftDist = succNextUseDist(Left, MBB, *Succ);
+    if (LeftDist && (!BestLeft || LeftDist < *BestLeft))
+      BestLeft = LeftDist;
+    std::optional<NextUseDist> RightDist = succNextUseDist(Right, MBB, *Succ);
+    if (RightDist && (!BestRight || RightDist < *BestRight))
+      BestRight = RightDist;
+  }
+  assert((BestLeft || BestRight) && "Must be live out.");
+  if (!BestRight)
+    return true;
+  return BestLeft && *BestLeft < *BestRight;
+}
+
+std::optional<NextUseDist>
+MOSRegAlloc::succNextUseDist(Register R, const MachineBasicBlock &MBB,
+                             const MachineBasicBlock &Succ) const {
+  unsigned NumLoopExits = 0;
+  if (MLI->getLoopFor(&Succ) != MLI->getLoopFor(&MBB) &&
+      MLI->getLoopDepth(&Succ) <= MLI->getLoopDepth(&MBB))
+    NumLoopExits = 1;
+  for (const MachineInstr &MI : Succ.phis())
+    for (unsigned I = 1, E = MI.getNumOperands(); I != E; I += 2)
+      if (MI.getOperand(I).getReg() == R &&
+          MI.getOperand(I + 1).getMBB() == &MBB)
+        return NextUseDist{NumLoopExits, 0};
+  auto It = NextUseDists.find({R, &Succ});
+  if (It == NextUseDists.end())
+    return std::nullopt;
+  return NextUseDist{It->second.NumLoopExits + NumLoopExits,
+                     It->second.NumInstrs};
+}
+
+void MOSRegAlloc::recomputeNextUseDists(Register R) {
+  dbgs() << "Compute next uses: " << printReg(R) << '\n';
+
+  for (const MachineBasicBlock &MBB : *MF)
+    NextUseDists.erase({R, &MBB});
+
+  DenseSet<const MachineBasicBlock *> UseBlocks;
+  for (const MachineInstr &MI : MRI->use_nodbg_instructions(R))
+    if (!MI.isPHI() && LV->isLiveIn(R, *MI.getParent()))
+      UseBlocks.insert(MI.getParent());
+
+  std::deque<const MachineBasicBlock *> Worklist;
+  DenseSet<const MachineBasicBlock *> Active;
+  for (const MachineBasicBlock *MBB : UseBlocks) {
+    for (const auto &[I, MI] : llvm::enumerate(*MBB)) {
+      if (MI.isPHI())
+        continue;
+      if (MI.readsVirtualRegister(R)) {
+        auto Res = NextUseDists.try_emplace(
+            {R, MBB},
+            NextUseDist{/*NumLoopExits=*/0, /*NumInstrs=*/(unsigned)I});
+        (void)Res;
+        assert(Res.second && "Should have inserted.");
+
+        for (const MachineBasicBlock *Pred : MBB->predecessors())
+          if (LV->isLiveIn(R, *Pred) && Active.insert(Pred).second)
+            Worklist.push_back(Pred);
+        break;
+      }
+    }
+  }
+
+  while (!Worklist.empty()) {
+    const MachineBasicBlock &MBB = *Worklist.front();
+    Worklist.pop_front();
+    Active.erase(&MBB);
+
+    std::optional<NextUseDist> BestDist;
+    auto It = NextUseDists.find({R, &MBB});
+    if (It != NextUseDists.end())
+      BestDist = It->second;
+
+    bool Improved = false;
+    for (const MachineBasicBlock *Succ : MBB.successors()) {
+      std::optional<NextUseDist> SuccDist = succNextUseDist(R, MBB, *Succ);
+      if (!SuccDist)
+        continue;
+      SuccDist->NumInstrs += MBB.size();
+      if (!BestDist || *SuccDist < *BestDist) {
+        Improved = true;
+        BestDist = SuccDist;
+      }
+    }
+
+    if (Improved) {
+      NextUseDists[{R, &MBB}] = *BestDist;
+      for (const MachineBasicBlock *Pred : MBB.predecessors())
+        if (LV->isLiveIn(R, *Pred) && Active.insert(Pred).second)
+          Worklist.push_back(Pred);
+    }
+  }
+
+  for (const MachineBasicBlock &MBB : *MF) {
+    auto It = NextUseDists.find({R, &MBB});
+    if (It == NextUseDists.end())
+      continue;
+    dbgs() << "  MBB %bb." << MBB.getNumber() << ": {"
+           << It->second.NumLoopExits << ',' << It->second.NumInstrs << "}\n";
+  }
 }
 
 const TargetRegisterClass *
