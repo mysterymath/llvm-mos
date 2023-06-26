@@ -217,6 +217,7 @@ private:
   const TargetRegisterClass *getOperandRegClass(const MachineOperand &MO) const;
   bool isDeadMI(const MachineInstr &MI) const;
   void addDefPressure(Register R, ImagPressure *IP) const;
+  void removeKillPressure(Register R, ImagPressure *IP) const;
   bool isImagPressureOver(const ImagPressure &IP) const;
 };
 
@@ -419,7 +420,7 @@ void MOSRegAlloc::spill() {
     });
 
     SmallVector<Register> Candidates(SomePredLOV.begin(), SomePredLOV.end());
-    llvm::stable_sort(Candidates, [&](Register A, Register B) {
+    llvm::sort(Candidates, [&](Register A, Register B) {
       // To avoid reloads, prefer to keep values allocated in all predecessors,
       // not just some.
       if (AllPredsLOV.contains(A) && !AllPredsLOV.contains(B))
@@ -457,10 +458,54 @@ void MOSRegAlloc::spill() {
       dbgs() << '\n';
     });
 
-    // TODO: Allocate down the line
-
+    auto &LV = LiveOutVals[MBB];
     for (Register R : Candidates)
       LiveOutVals[MBB].insert(R);
+
+    const auto Assign = [&](Register R, MachineBasicBlock::const_iterator Pos) {
+      LLVM_DEBUG(dbgs() << "Allocating " << printReg(R) << '\n');
+      LV.insert(R);
+      ImagPressure NewIP = IP;
+      addDefPressure(R, &NewIP);
+      if (isImagPressureOver(NewIP)) {
+        SmallVector<Register> Candidates(LV.begin(), LV.end());
+        llvm::sort(Candidates, [&](Register A, Register B) {
+          return nearerNextUse(A, B, *MBB, Pos);
+        });
+        do {
+          Register Evicted = Candidates.back();
+          Candidates.pop_back();
+          LLVM_DEBUG(dbgs() << "Evicting " << printReg(Evicted) << '\n');
+          LV.erase(Evicted);
+          removeKillPressure(Evicted, &IP);
+          NewIP = IP;
+          addDefPressure(R, &NewIP);
+        } while (isImagPressureOver(NewIP));
+      }
+      IP = NewIP;
+    };
+
+    for (const MachineInstr &MI : *MBB) {
+      LLVM_DEBUG(dbgs() << "Allocating " << MI);
+      for (const MachineOperand &MO : MI.defs())
+        if (MO.isEarlyClobber() && MO.getReg().isVirtual())
+          Assign(MO.getReg(), MI);
+      for (const MachineOperand &MO : MI.uses()) {
+        if (MO.isReg() && MO.isKill()) {
+          LV.erase(MO.getReg());
+          removeKillPressure(MO.getReg(), &IP);
+        }
+      }
+      for (const MachineOperand &MO : MI.defs())
+        if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
+          Assign(MO.getReg(), MI);
+      for (const MachineOperand &MO : MI.defs()) {
+        if (MO.isDead()) {
+          LV.erase(MO.getReg());
+          removeKillPressure(MO.getReg(), &IP);
+        }
+      }
+    }
   }
 }
 
@@ -668,6 +713,21 @@ void MOSRegAlloc::addDefPressure(Register R, ImagPressure *IP) const {
       IP->addImag16CSR();
     else
       IP->addImag16();
+  }
+}
+
+void MOSRegAlloc::removeKillPressure(Register R, ImagPressure *IP) const {
+  bool IsCSR = CSRVals.contains(R);
+  if (MRI->getRegClass(R) == &MOS::Imag16RegClass) {
+    if (IsCSR)
+      IP->removeImag16CSR();
+    else
+      IP->removeImag16();
+  } else {
+    if (IsCSR)
+      IP->removeImag16CSR();
+    else
+      IP->removeImag16();
   }
 }
 
