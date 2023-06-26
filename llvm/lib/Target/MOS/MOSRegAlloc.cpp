@@ -95,6 +95,75 @@ struct NextUseDist {
   }
 };
 
+// Tracks the worst-case imaginary register pressure as values are added and
+// removed from the allocated set. This accounts for the potential internal
+// fragmentation of the imaginary register file due to allocation and
+// deallocation patterns.
+class ImagPressure {
+  unsigned NumImag8Pairs = 0;
+  unsigned NumImag8Unpaired = 0;
+  unsigned NumImag16 = 0;
+
+  unsigned NumImag8PairsCSR = 0;
+  unsigned NumImag8UnpairedCSR = 0;
+  unsigned NumImag16CSR = 0;
+
+public:
+  bool numImag16Needed() const {
+    return NumImag16 + NumImag16CSR + NumImag8Pairs + NumImag8PairsCSR +
+           NumImag8Unpaired + NumImag8UnpairedCSR;
+  }
+
+  bool numImag16CSRNeeded() const {
+    return NumImag16CSR + NumImag8PairsCSR + NumImag8UnpairedCSR;
+  }
+
+  void addImag8() {
+    if (NumImag8Unpaired) {
+      NumImag8Unpaired--;
+      NumImag8Pairs++;
+    } else {
+      NumImag8Unpaired++;
+    }
+  }
+
+  void addImag8CSR() {
+    if (NumImag8UnpairedCSR) {
+      NumImag8UnpairedCSR--;
+      NumImag8PairsCSR++;
+    } else {
+      NumImag8UnpairedCSR++;
+    }
+  }
+
+  void addImag16() { NumImag16++; }
+
+  void addImag16CSR() { NumImag16CSR++; }
+
+  void removeImag8() {
+    // In the worst case, a paired register is the one removed.
+    if (NumImag8Pairs) {
+      NumImag8Pairs--;
+      NumImag8Unpaired++;
+    } else {
+      NumImag8Unpaired--;
+    }
+  }
+
+  void removeImag8CSR() {
+    if (NumImag8PairsCSR) {
+      NumImag8PairsCSR--;
+      NumImag8UnpairedCSR++;
+    } else {
+      NumImag8UnpairedCSR--;
+    }
+  }
+
+  void removeImag16() { NumImag16--; }
+
+  void removeImag16CSR() { NumImag16CSR--; }
+};
+
 class MOSRegAlloc : public MachineFunctionPass {
 public:
   static char ID;
@@ -147,6 +216,8 @@ private:
 
   const TargetRegisterClass *getOperandRegClass(const MachineOperand &MO) const;
   bool isDeadMI(const MachineInstr &MI) const;
+  void addDefPressure(Register R, ImagPressure *IP) const;
+  bool isImagPressureOver(const ImagPressure &IP) const;
 };
 
 } // namespace
@@ -310,90 +381,13 @@ void MOSRegAlloc::findCSRVals(const MachineDomTreeNode &MDTN,
     findCSRVals(*Child, LiveVals);
 }
 
-namespace {
-
-// Tracks the worst-case imaginary register pressure as values are added and
-// removed from the allocated set. This accounts for the potential internal
-// fragmentation of the imaginary register file due to allocation and
-// deallocation patterns.
-class ImagPressure {
-  unsigned NumImag8Pairs;
-  unsigned NumImag8Unpaired;
-  unsigned NumImag16;
-
-  unsigned NumImag8PairsCSR;
-  unsigned NumImag8UnpairedCSR;
-  unsigned NumImag16CSR;
-
-  bool numImag16Needed() const {
-    return NumImag16 + NumImag16CSR + NumImag8Pairs + NumImag8PairsCSR +
-           NumImag8Unpaired + NumImag8UnpairedCSR;
-  }
-
-  bool numImag16CSRNeeded() const {
-    return NumImag16CSR + NumImag8PairsCSR + NumImag8UnpairedCSR;
-  }
-
-  void addImag8() {
-    if (NumImag8Unpaired) {
-      NumImag8Unpaired--;
-      NumImag8Pairs++;
-    } else {
-      NumImag8Unpaired++;
-    }
-  }
-
-  void addImag8CSR() {
-    if (NumImag8UnpairedCSR) {
-      NumImag8UnpairedCSR--;
-      NumImag8PairsCSR++;
-    } else {
-      NumImag8UnpairedCSR++;
-    }
-  }
-
-  void addImag16() { NumImag16++; }
-
-  void addImag16CSR() { NumImag16CSR++; }
-
-  void removeImag8() {
-    // In the worst case, a paired register is the one removed.
-    if (NumImag8Pairs) {
-      NumImag8Pairs--;
-      NumImag8Unpaired++;
-    } else {
-      NumImag8Unpaired--;
-    }
-  }
-
-  void removeImag8CSR() {
-    if (NumImag8PairsCSR) {
-      NumImag8PairsCSR--;
-      NumImag8UnpairedCSR++;
-    } else {
-      NumImag8UnpairedCSR--;
-    }
-  }
-
-  void removeImag16() { NumImag16--; }
-
-  void removeImag16CSR() { NumImag16CSR--; }
-};
-} // namespace
-
-void MOSRegAlloc::countAvailImag16Regs() {}
-
 void MOSRegAlloc::spill() {
   DenseMap<MachineBasicBlock *, SmallSet<Register, 8>> LiveOutVals;
   ReversePostOrderTraversal<MachineBasicBlock *> RPOT(&*MF->begin());
 
-  ImagPressure IP;
-
   for (MachineBasicBlock *MBB : RPOT) {
     LLVM_DEBUG(dbgs() << "Choosing allocated live in vals for MBB %bb."
-                      << MBB->getNumber());
-
-    SmallSet<Register, 8> &LV = LiveOutVals[MBB];
+                      << MBB->getNumber() << '\n');
 
     SmallSet<Register, 8> AllPredsLOV;
     SmallSet<Register, 8> SomePredLOV;
@@ -407,7 +401,7 @@ void MOSRegAlloc::spill() {
       }
 
       SmallSet<Register, 8> ToRemove;
-      for (Register R : LV)
+      for (Register R : AllPredsLOV)
         if (!PredLOV.contains(R))
           ToRemove.insert(R);
       for (Register R : ToRemove)
@@ -443,6 +437,30 @@ void MOSRegAlloc::spill() {
         dbgs() << printReg(R) << ' ';
       dbgs() << '\n';
     });
+
+    ImagPressure IP;
+    Register *I = Candidates.begin();
+    for (Register *E = Candidates.end(); I != E; ++I) {
+      Register R = *I;
+      ImagPressure NewIP = IP;
+      addDefPressure(R, &NewIP);
+      if (isImagPressureOver(NewIP))
+        break;
+      IP = NewIP;
+    }
+
+    Candidates.erase(I, Candidates.end());
+    LLVM_DEBUG({
+      dbgs() << "Chosen candidates:\n";
+      for (Register R : Candidates)
+        dbgs() << printReg(R) << ' ';
+      dbgs() << '\n';
+    });
+
+    // TODO: Allocate down the line
+
+    for (Register R : Candidates)
+      LiveOutVals[MBB].insert(R);
   }
 }
 
@@ -636,6 +654,26 @@ bool MOSRegAlloc::isDeadMI(const MachineInstr &MI) const {
   }
 
   return true;
+}
+
+void MOSRegAlloc::addDefPressure(Register R, ImagPressure *IP) const {
+  bool IsCSR = CSRVals.contains(R);
+  if (MRI->getRegClass(R) == &MOS::Imag16RegClass) {
+    if (IsCSR)
+      IP->addImag16CSR();
+    else
+      IP->addImag16();
+  } else {
+    if (IsCSR)
+      IP->addImag16CSR();
+    else
+      IP->addImag16();
+  }
+}
+
+bool MOSRegAlloc::isImagPressureOver(const ImagPressure &IP) const {
+  return IP.numImag16Needed() > NumImag16Avail ||
+         IP.numImag16CSRNeeded() > NumImag16CSRAvail;
 }
 
 char MOSRegAlloc::ID = 0;
