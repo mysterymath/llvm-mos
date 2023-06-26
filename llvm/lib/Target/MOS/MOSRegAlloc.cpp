@@ -502,7 +502,6 @@ void MOSRegAlloc::allocateImagRegs() {
     LLVM_DEBUG(IP.dump());
     for (const MachineInstr &MI : *MBB) {
       LLVM_DEBUG(dbgs() << "Allocating " << MI);
-      LLVM_DEBUG(IP.dump());
       for (const MachineOperand &MO : MI.defs())
         if (MO.isEarlyClobber() && MO.getReg().isVirtual())
           Allocate(MO.getReg(), MI);
@@ -521,6 +520,7 @@ void MOSRegAlloc::allocateImagRegs() {
           removeKillPressure(MO.getReg(), &IP);
         }
       }
+      LLVM_DEBUG(IP.dump());
     }
   }
 }
@@ -727,9 +727,9 @@ void MOSRegAlloc::addDefPressure(Register R, ImagPressure *IP) const {
       IP->addImag16();
   } else {
     if (IsCSR)
-      IP->addImag16CSR();
+      IP->addImag8CSR();
     else
-      IP->addImag16();
+      IP->addImag8();
   }
 }
 
@@ -742,9 +742,9 @@ void MOSRegAlloc::removeKillPressure(Register R, ImagPressure *IP) const {
       IP->removeImag16();
   } else {
     if (IsCSR)
-      IP->removeImag16CSR();
+      IP->removeImag8CSR();
     else
-      IP->removeImag16();
+      IP->removeImag8();
   }
 }
 
