@@ -421,8 +421,25 @@ void MOSRegAlloc::spill() {
       dbgs() << "Candidates live out of all predecessors:\n";
       for (Register R : AllPredsLOV)
         dbgs() << printReg(R) << ' ';
-      dbgs() << "\nCandidates live out of some predecessors:\n";
-      for (Register R : AllPredsLOV)
+      dbgs() << '\n';
+    });
+
+    SmallVector<Register> Candidates(SomePredLOV.begin(), SomePredLOV.end());
+    llvm::stable_sort(Candidates, [&](Register A, Register B) {
+      // To avoid reloads, prefer to keep values allocated in all predecessors,
+      // not just some.
+      if (AllPredsLOV.contains(A) && !AllPredsLOV.contains(B))
+        return true;
+      if (!AllPredsLOV.contains(A) && AllPredsLOV.contains(B))
+        return false;
+
+      // Prefer values with nearer next uses.
+      return nearerNextUse(A, B, *MBB, MBB->begin());
+    });
+
+    LLVM_DEBUG({
+      dbgs() << "Ordered candidates:\n";
+      for (Register R : Candidates)
         dbgs() << printReg(R) << ' ';
       dbgs() << '\n';
     });
