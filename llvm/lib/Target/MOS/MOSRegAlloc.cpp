@@ -110,8 +110,7 @@ class ImagPressure {
 
 public:
   unsigned numImag16Needed() const {
-    return NumImag16 + NumImag16CSR + NumImag8Pairs + NumImag8PairsCSR +
-           NumImag8Unpaired + NumImag8UnpairedCSR;
+    return NumImag16 + NumImag8Pairs + NumImag8Unpaired;
   }
 
   unsigned numImag16CSRNeeded() const {
@@ -165,7 +164,7 @@ public:
 
   void dump() const {
     dbgs() << "Imag16 Pressure: CSR: " << numImag16CSRNeeded()
-           << " All: " << numImag16Needed() << '\n';
+           << " Non-CSR: " << numImag16Needed() << '\n';
   }
 };
 
@@ -346,10 +345,15 @@ void MOSRegAlloc::countAvailImag16Regs() {
   for (Register I = MOS::RS0, E = MOS::RS15 + 1; I != E; I = I + 1) {
     if (MRI->isReserved(I))
       continue;
-    NumImag16Avail++;
     if (I >= MOS::RS10)
       NumImag16CSRAvail++;
+    else
+      NumImag16Avail++;
   }
+  LLVM_DEBUG(dbgs() << "Number of non-CSR Imag16 avail: " << NumImag16Avail
+                    << '\n');
+  LLVM_DEBUG(dbgs() << "Number of CSR Imag16 avail: " << NumImag16CSRAvail
+                    << '\n');
 }
 
 void MOSRegAlloc::findCSRVals(const MachineDomTreeNode &MDTN,
