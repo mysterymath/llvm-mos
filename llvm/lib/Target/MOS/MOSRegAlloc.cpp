@@ -202,7 +202,7 @@ private:
   void countAvailImag16Regs();
   void findCSRVals(const MachineDomTreeNode &MDTN,
                    const SmallSet<Register, 8> &DomLiveOutVals = {});
-  void spill();
+  void allocateImagRegs();
   void assignImagRegs(const MachineDomTreeNode &MDTN,
                       const SmallSet<Register, 8> &DomLiveOutVals = {});
 
@@ -306,7 +306,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
       dbgs() << '\t' << printReg(R) << '\n';
   });
 
-  spill();
+  allocateImagRegs();
   ImagAlloc.clear();
 
   LLVM_DEBUG(dbgs() << "Assigning imaginary registers to each value:\n");
@@ -382,7 +382,7 @@ void MOSRegAlloc::findCSRVals(const MachineDomTreeNode &MDTN,
     findCSRVals(*Child, LiveVals);
 }
 
-void MOSRegAlloc::spill() {
+void MOSRegAlloc::allocateImagRegs() {
   DenseMap<MachineBasicBlock *, SmallSet<Register, 8>> LiveOutVals;
   ReversePostOrderTraversal<MachineBasicBlock *> RPOT(&*MF->begin());
 
@@ -395,8 +395,14 @@ void MOSRegAlloc::spill() {
     bool IsFirst = true;
     for (MachineBasicBlock *Pred : MBB->predecessors()) {
       const auto &PredLOV = LiveOutVals[Pred];
+
       if (IsFirst) {
-        AllPredsLOV = SomePredLOV = PredLOV;
+        for (Register R : PredLOV) {
+          if (!LV->isLiveIn(R, *MBB))
+            continue;
+          AllPredsLOV.insert(R);
+          SomePredLOV.insert(R);
+        }
         IsFirst = false;
         continue;
       }
@@ -409,7 +415,8 @@ void MOSRegAlloc::spill() {
         AllPredsLOV.erase(R);
 
       for (Register R : PredLOV)
-        SomePredLOV.insert(R);
+        if (LV->isLiveIn(R, *MBB))
+          SomePredLOV.insert(R);
     }
 
     LLVM_DEBUG({
@@ -476,6 +483,7 @@ void MOSRegAlloc::spill() {
           Register Evicted = Candidates.back();
           Candidates.pop_back();
           LLVM_DEBUG(dbgs() << "Evicting " << printReg(Evicted) << '\n');
+          report_fatal_error("Spill/reload not yet implemented");
           LV.erase(Evicted);
           removeKillPressure(Evicted, &IP);
           NewIP = IP;
@@ -491,7 +499,7 @@ void MOSRegAlloc::spill() {
         if (MO.isEarlyClobber() && MO.getReg().isVirtual())
           Assign(MO.getReg(), MI);
       for (const MachineOperand &MO : MI.uses()) {
-        if (MO.isReg() && MO.isKill()) {
+        if (MO.isReg() && MO.isKill() && MO.getReg().isVirtual()) {
           LV.erase(MO.getReg());
           removeKillPressure(MO.getReg(), &IP);
         }
@@ -500,7 +508,7 @@ void MOSRegAlloc::spill() {
         if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
           Assign(MO.getReg(), MI);
       for (const MachineOperand &MO : MI.defs()) {
-        if (MO.isDead()) {
+        if (MO.isDead() && MO.getReg().isVirtual()) {
           LV.erase(MO.getReg());
           removeKillPressure(MO.getReg(), &IP);
         }
