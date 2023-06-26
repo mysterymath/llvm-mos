@@ -124,9 +124,13 @@ private:
   // Map from value to imaginary register
   DenseMap<Register, Register> ImagAlloc;
 
+  unsigned NumImag16Avail;
+  unsigned NumImag16CSRAvail;
+
   DenseMap<std::pair<Register, const MachineBasicBlock *>, NextUseDist>
       NextUseDists;
 
+  void countAvailImag16Regs();
   void findCSRVals(const MachineDomTreeNode &MDTN,
                    const SmallSet<Register, 8> &DomLiveOutVals = {});
   void spill();
@@ -261,6 +265,16 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   return false;
 }
 
+void MOSRegAlloc::countAvailImag16Regs() {
+  for (Register I = MOS::RS0, E = MOS::RS15 + 1; I != E; I = I + 1) {
+    if (MRI->isReserved(I))
+      continue;
+    NumImag16Avail++;
+    if (I >= MOS::RS10)
+      NumImag16CSRAvail++;
+  }
+}
+
 void MOSRegAlloc::findCSRVals(const MachineDomTreeNode &MDTN,
                               const SmallSet<Register, 8> &DomLiveOutVals) {
 
@@ -296,32 +310,88 @@ void MOSRegAlloc::findCSRVals(const MachineDomTreeNode &MDTN,
     findCSRVals(*Child, LiveVals);
 }
 
+namespace {
+
+// Tracks the worst-case imaginary register pressure as values are added and
+// removed from the allocated set. This accounts for the potential internal
+// fragmentation of the imaginary register file due to allocation and
+// deallocation patterns.
+class ImagPressure {
+  unsigned NumImag8Pairs;
+  unsigned NumImag8Unpaired;
+  unsigned NumImag16;
+
+  unsigned NumImag8PairsCSR;
+  unsigned NumImag8UnpairedCSR;
+  unsigned NumImag16CSR;
+
+  bool numImag16Needed() const {
+    return NumImag16 + NumImag16CSR + NumImag8Pairs + NumImag8PairsCSR +
+           NumImag8Unpaired + NumImag8UnpairedCSR;
+  }
+
+  bool numImag16CSRNeeded() const {
+    return NumImag16CSR + NumImag8PairsCSR + NumImag8UnpairedCSR;
+  }
+
+  void addImag8() {
+    if (NumImag8Unpaired) {
+      NumImag8Unpaired--;
+      NumImag8Pairs++;
+    } else {
+      NumImag8Unpaired++;
+    }
+  }
+
+  void addImag8CSR() {
+    if (NumImag8UnpairedCSR) {
+      NumImag8UnpairedCSR--;
+      NumImag8PairsCSR++;
+    } else {
+      NumImag8UnpairedCSR++;
+    }
+  }
+
+  void addImag16() { NumImag16++; }
+
+  void addImag16CSR() { NumImag16CSR++; }
+
+  void removeImag8() {
+    // In the worst case, a paired register is the one removed.
+    if (NumImag8Pairs) {
+      NumImag8Pairs--;
+      NumImag8Unpaired++;
+    } else {
+      NumImag8Unpaired--;
+    }
+  }
+
+  void removeImag8CSR() {
+    if (NumImag8PairsCSR) {
+      NumImag8PairsCSR--;
+      NumImag8UnpairedCSR++;
+    } else {
+      NumImag8UnpairedCSR--;
+    }
+  }
+
+  void removeImag16() { NumImag16--; }
+
+  void removeImag16CSR() { NumImag16CSR--; }
+};
+} // namespace
+
+void MOSRegAlloc::countAvailImag16Regs() {}
+
 void MOSRegAlloc::spill() {
   DenseMap<MachineBasicBlock *, SmallSet<Register, 8>> LiveOutVals;
   ReversePostOrderTraversal<MachineBasicBlock *> RPOT(&*MF->begin());
 
-  int NumImag8 = 0;
-  int NumImag8CSR = 0;
-  for (Register I = MOS::RC0, E = MOS::RC31 + 1; I != E; I = I + 1) {
-    if (MRI->isReserved(I))
-      continue;
-    NumImag8++;
-    if (I >= MOS::RC20)
-      NumImag8CSR++;
-  }
-  int NumImag16 = 0;
-  int NumImag16CSR = 0;
-  for (Register I = MOS::RS0, E = MOS::RS15 + 1; I != E; I = I + 1) {
-    if (MRI->isReserved(I))
-      continue;
-    NumImag16++;
-    if (I >= MOS::RS10)
-      NumImag16CSR++;
-  }
+  ImagPressure IP;
 
   for (MachineBasicBlock *MBB : RPOT) {
-    LLVM_DEBUG(dbgs() << "Choosing allocated live in vals for MBB "
-                      << MBB->getName() << '\n');
+    LLVM_DEBUG(dbgs() << "Choosing allocated live in vals for MBB %bb."
+                      << MBB->getNumber());
 
     SmallSet<Register, 8> &LV = LiveOutVals[MBB];
 
