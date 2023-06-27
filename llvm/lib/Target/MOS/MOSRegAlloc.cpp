@@ -496,7 +496,6 @@ void MOSRegAlloc::allocateImagRegs() {
           Register Evicted = Candidates.back();
           Candidates.pop_back();
           LLVM_DEBUG(dbgs() << "Evicting " << printReg(Evicted) << '\n');
-          report_fatal_error("Spill/reload not yet implemented");
           LV.erase(Evicted);
           removeKillPressure(Evicted, &IP);
           NewIP = IP;
@@ -512,18 +511,15 @@ void MOSRegAlloc::allocateImagRegs() {
       for (const MachineOperand &MO : MI.defs())
         if (MO.isEarlyClobber() && MO.getReg().isVirtual())
           Allocate(MO.getReg(), MI);
-      LLVM_DEBUG(IP.dump());
       for (const MachineOperand &MO : MI.uses()) {
         if (MO.isReg() && MO.isKill() && MO.getReg().isVirtual()) {
           LV.erase(MO.getReg());
           removeKillPressure(MO.getReg(), &IP);
         }
       }
-      LLVM_DEBUG(IP.dump());
       for (const MachineOperand &MO : MI.defs())
         if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
           Allocate(MO.getReg(), MI);
-      LLVM_DEBUG(IP.dump());
       for (const MachineOperand &MO : MI.defs()) {
         if (MO.isDead() && MO.getReg().isVirtual()) {
           LV.erase(MO.getReg());
