@@ -532,6 +532,13 @@ let Predicates = [Has65C02] in {
   }
 }
 
+// Pseudo-instructions to represent a stack spill/reload of an arbitrary value
+// inside the register allocator. This is kept very abstract, since the fastest
+// way to spill or reload a value depends very much on where the value will be
+// placed.
+def SPILL : MOSLogicalInstr { let InOperandList = (ins unknown:$val) }
+def RELOAD : MOSLogicalInstr { let OutOperandList = (outs unknown:$val) }
+
 //===---------------------------------------------------------------------===//
 // Addition/Subtraction Patterns
 //===---------------------------------------------------------------------===//
