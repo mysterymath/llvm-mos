@@ -481,6 +481,8 @@ void MOSRegAlloc::allocateImagRegs() {
     for (Register R : Candidates)
       LiveOutVals[MBB].insert(R);
 
+    DenseSet<Register> Spilled;
+
     const auto Allocate = [&](Register R, MachineBasicBlock::iterator Pos) {
       LLVM_DEBUG(dbgs() << "Allocating " << printReg(R) << '\n');
       LV.insert(R);
@@ -495,12 +497,15 @@ void MOSRegAlloc::allocateImagRegs() {
           Register Evicted = Candidates.back();
           Candidates.pop_back();
           LLVM_DEBUG(dbgs() << "Evicting " << printReg(Evicted) << '\n');
-          if (!TII->isTriviallyReMaterializable(*MRI->getUniqueVRegDef(R))) {
-            MachineIRBuilder Builder(*MBB, Pos);
-            auto Spill =
-                Builder.buildInstr(MOS::SPILL).addUse(R, RegState::Kill);
-            (void)Spill;
-            LLVM_DEBUG(dbgs() << *Spill);
+          if (!Spilled.contains(R)) {
+            if (!TII->isTriviallyReMaterializable(*MRI->getUniqueVRegDef(R))) {
+              MachineIRBuilder Builder(*MBB, Pos);
+              auto Spill =
+                  Builder.buildInstr(MOS::SPILL).addUse(R, RegState::Kill);
+              (void)Spill;
+              LLVM_DEBUG(dbgs() << *Spill);
+            }
+            Spilled.insert(R);
           }
           LV.erase(Evicted);
           removeKillPressure(Evicted, &IP);
