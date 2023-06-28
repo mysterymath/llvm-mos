@@ -536,8 +536,8 @@ let Predicates = [Has65C02] in {
 // inside the register allocator. This is kept very abstract, since the fastest
 // way to spill or reload a value depends very much on where the value will be
 // placed.
-def SPILL : MOSLogicalInstr { let InOperandList = (ins unknown:$val) }
-def RELOAD : MOSLogicalInstr { let OutOperandList = (outs unknown:$val) }
+def SPILL : MOSLogicalInstr { let InOperandList = (ins unknown:$val); }
+def RELOAD : MOSLogicalInstr { let OutOperandList = (outs unknown:$val); }
 
 //===---------------------------------------------------------------------===//
 // Addition/Subtraction Patterns
