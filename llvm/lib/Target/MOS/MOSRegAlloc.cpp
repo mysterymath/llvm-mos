@@ -493,6 +493,12 @@ void MOSRegAlloc::allocateImagRegs() {
         llvm::sort(Candidates, [&](Register A, Register B) {
           return nearerNextUse(A, B, *MBB, Pos);
         });
+        LLVM_DEBUG({
+          dbgs() << "Eviction candidates:\n";
+          for (Register R : Candidates)
+            dbgs() << printReg(R) << ' ';
+          dbgs() << '\n';
+        });
         do {
           Register Evicted = Candidates.back();
           Candidates.pop_back();
@@ -520,9 +526,12 @@ void MOSRegAlloc::allocateImagRegs() {
     LLVM_DEBUG(IP.dump());
     for (MachineInstr &MI : *MBB) {
       LLVM_DEBUG(dbgs() << "Allocating " << MI);
+      MachineBasicBlock::iterator NextIter = MI;
+      ++NextIter;
+
       for (const MachineOperand &MO : MI.defs())
         if (MO.isEarlyClobber() && MO.getReg().isVirtual())
-          Allocate(MO.getReg(), MI);
+          Allocate(MO.getReg(), NextIter);
       for (const MachineOperand &MO : MI.uses()) {
         if (MO.isReg() && MO.isKill() && MO.getReg().isVirtual()) {
           LV.erase(MO.getReg());
@@ -531,7 +540,7 @@ void MOSRegAlloc::allocateImagRegs() {
       }
       for (const MachineOperand &MO : MI.defs())
         if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
-          Allocate(MO.getReg(), MI);
+          Allocate(MO.getReg(), NextIter);
       for (const MachineOperand &MO : MI.defs()) {
         if (MO.isDead() && MO.getReg().isVirtual()) {
           LV.erase(MO.getReg());
