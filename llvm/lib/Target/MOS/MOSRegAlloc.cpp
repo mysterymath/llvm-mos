@@ -417,6 +417,8 @@ void MOSRegAlloc::findCSRVals(const MachineDomTreeNode &MDTN,
 // only included if they have a chance of surviving the loop.
 void MOSRegAlloc::scanLoops() {
   for (const MachineBasicBlock &MBB : *MF) {
+    // TODO: Rework this for transitive loop inclusion of blocks
+
     MachineLoop *ML = MLI->getLoopFor(&MBB);
     if (!ML)
       continue;
@@ -445,14 +447,23 @@ void MOSRegAlloc::scanLoops() {
       MaxImag16 = std::max(MaxImag16, IP.numImag16Needed());
       MaxImag16CSR = std::max(MaxImag16CSR, IP.numImag16CSRNeeded());
 
-      for (const MachineOperand &MO : MI.uses()) {
-        if (!MO.isReg() || !MO.getReg().isVirtual())
-          continue;
-        if (!MI.isPHI() && MO.isKill())
-          removeKillPressure(MO.getReg(), &IP);
-        // TODO: If this is a PHI, we need a more sophisticated anlysis to know
-        // whether the use is actually inside the loop
-        UsedVals.insert(MO.getReg());
+      if (MI.isPHI()) {
+        for (unsigned I = 1, E = MI.getNumOperands(); I != E; I += 2) {
+          const MachineOperand &ValMO = MI.getOperand(I);
+          const MachineOperand &MBBMO = MI.getOperand(I + 1);
+          if (!ValMO.isReg() || !ValMO.getReg().isVirtual() ||
+              MLI->getLoopFor(MBBMO.getMBB()) != ML)
+            continue;
+          UsedVals.insert(ValMO.getReg());
+        }
+      } else {
+        for (const MachineOperand &MO : MI.uses()) {
+          if (!MO.isReg() || !MO.getReg().isVirtual())
+            continue;
+          if (MO.isKill())
+            removeKillPressure(MO.getReg(), &IP);
+          UsedVals.insert(MO.getReg());
+        }
       }
 
       for (const MachineOperand &MO : MI.defs())
