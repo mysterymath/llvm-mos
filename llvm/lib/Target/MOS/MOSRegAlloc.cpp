@@ -203,9 +203,17 @@ private:
   DenseMap<std::pair<Register, const MachineBasicBlock *>, NextUseDist>
       NextUseDists;
 
+  // <MaxImag16, MaxImag16CSR> for each loop
+  DenseMap<const MachineLoop *, std::pair<unsigned, unsigned>>
+      MaxLoopImagPressure;
+
+  // Values used anywhere within each loop
+  DenseMap<const MachineLoop *, DenseSet<Register>> LoopUsedVals;
+
   void countAvailImag16Regs();
   void findCSRVals(const MachineDomTreeNode &MDTN,
                    const SmallSet<Register, 8> &DomLiveOutVals = {});
+  void scanLoops();
   void allocateImagRegs();
   void assignImagRegs(const MachineDomTreeNode &MDTN,
                       const SmallSet<Register, 8> &DomLiveOutVals = {});
@@ -311,6 +319,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   });
 
   countAvailImag16Regs();
+  scanLoops();
   allocateImagRegs();
   ImagAlloc.clear();
 
@@ -392,6 +401,76 @@ void MOSRegAlloc::findCSRVals(const MachineDomTreeNode &MDTN,
 
   for (const MachineDomTreeNode *Child : MDTN.children())
     findCSRVals(*Child, LiveVals);
+}
+
+// Find the maximum register pressure and used variables for each loop. This
+// information is necessary for evaluating the priorities of registers on loop
+// entry: those used within the loop have first pick, and other registers are
+// only included if they have a chance of surviving the loop.
+void MOSRegAlloc::scanLoops() {
+  for (const MachineBasicBlock &MBB : *MF) {
+    MachineLoop *ML = MLI->getLoopFor(&MBB);
+    if (!ML)
+      continue;
+
+    auto Res = MaxLoopImagPressure.try_emplace(ML, std::make_pair(0, 0));
+    auto &[MaxImag16, MaxImag16CSR] = Res.first->second;
+    DenseSet<Register> &UsedVals = LoopUsedVals[ML];
+
+    ImagPressure IP;
+
+    for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
+      Register R = Register::index2VirtReg(I);
+      if (MRI->use_nodbg_empty(R) || !LV->isLiveIn(R, MBB))
+        continue;
+      addDefPressure(R, &IP);
+    }
+
+    MaxImag16 = std::max(MaxImag16, IP.numImag16Needed());
+    MaxImag16CSR = std::max(MaxImag16CSR, IP.numImag16CSRNeeded());
+
+    for (const MachineInstr &MI : MBB) {
+      for (const MachineOperand &MO : MI.defs())
+        if (MO.isEarlyClobber() && MO.getReg().isVirtual())
+          addDefPressure(MO.getReg(), &IP);
+
+      MaxImag16 = std::max(MaxImag16, IP.numImag16Needed());
+      MaxImag16CSR = std::max(MaxImag16CSR, IP.numImag16CSRNeeded());
+
+      for (const MachineOperand &MO : MI.uses()) {
+        if (!MO.isReg() || !MO.getReg().isVirtual())
+          continue;
+        if (!MI.isPHI() && MO.isKill())
+          removeKillPressure(MO.getReg(), &IP);
+        // TODO: If this is a PHI, we need a more sophisticated anlysis to know
+        // whether the use is actually inside the loop
+        UsedVals.insert(MO.getReg());
+      }
+
+      for (const MachineOperand &MO : MI.defs())
+        if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
+          addDefPressure(MO.getReg(), &IP);
+
+      MaxImag16 = std::max(MaxImag16, IP.numImag16Needed());
+      MaxImag16CSR = std::max(MaxImag16CSR, IP.numImag16CSRNeeded());
+
+      for (const MachineOperand &MO : MI.defs())
+        if (MO.isDead() && MO.getReg().isVirtual())
+          removeKillPressure(MO.getReg(), &IP);
+    }
+  }
+
+  LLVM_DEBUG({
+    dbgs() << "Scanned loops:\n";
+    for (const auto &[ML, MLIP] : MaxLoopImagPressure) {
+      dbgs() << *ML;
+      dbgs() << "Used vals:\n";
+      for (Register R : LoopUsedVals[ML])
+        dbgs() << printReg(R) << ' ';
+      dbgs() << "\nMax pressure: Imag16: " << MLIP.first
+             << " Imag16CSR: " << MLIP.second << "\n\n";
+    }
+  });
 }
 
 void MOSRegAlloc::allocateImagRegs() {
@@ -532,10 +611,12 @@ void MOSRegAlloc::allocateImagRegs() {
       for (const MachineOperand &MO : MI.defs())
         if (MO.isEarlyClobber() && MO.getReg().isVirtual())
           Allocate(MO.getReg(), NextIter);
-      for (const MachineOperand &MO : MI.uses()) {
-        if (MO.isReg() && MO.isKill() && MO.getReg().isVirtual()) {
-          LV.erase(MO.getReg());
-          removeKillPressure(MO.getReg(), &IP);
+      if (!MI.isPHI()) {
+        for (const MachineOperand &MO : MI.uses()) {
+          if (MO.isReg() && MO.isKill() && MO.getReg().isVirtual()) {
+            LV.erase(MO.getReg());
+            removeKillPressure(MO.getReg(), &IP);
+          }
         }
       }
       for (const MachineOperand &MO : MI.defs())
@@ -590,9 +671,11 @@ void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN,
     for (const MachineOperand &MO : MI.defs())
       if (MO.isEarlyClobber() && MO.getReg().isVirtual())
         Assign(MO.getReg());
-    for (const MachineOperand &MO : MI.uses())
-      if (MO.isReg() && MO.isKill())
-        LiveVals.erase(MO.getReg());
+    if (!MI.isPHI()) {
+      for (const MachineOperand &MO : MI.uses())
+        if (MO.isReg() && MO.isKill())
+          LiveVals.erase(MO.getReg());
+    }
     for (const MachineOperand &MO : MI.defs())
       if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
         Assign(MO.getReg());
