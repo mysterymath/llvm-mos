@@ -323,7 +323,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   LLVM_DEBUG({
     dbgs() << "Values live across calls:\n";
     for (Register R : CSRVals)
-      dbgs() << '\t' << printReg(R) << '\n';
+      dbgs() << printReg(R) << ' ';
+    dbgs() << '\n';
   });
 
   countAvailImag16Regs();
