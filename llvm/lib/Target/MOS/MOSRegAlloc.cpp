@@ -299,6 +299,14 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
     MI->eraseFromParent();
   }
 
+  // Recompute liveness information
+  for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
+    Register R = Register::index2VirtReg(I);
+    if (MRI->reg_nodbg_empty(R))
+      continue;
+    LV->recomputeForSingleDefVirtReg(R);
+  }
+
   MF.dump();
 
   MRI->freezeReservedRegs(MF);
