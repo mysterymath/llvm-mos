@@ -506,94 +506,136 @@ void MOSRegAlloc::allocateImagRegs() {
     LLVM_DEBUG(dbgs() << "Choosing allocated live in vals for MBB %bb."
                       << MBB->getNumber() << '\n');
 
-    SmallSet<Register, 8> AllPredsLOV;
-    SmallSet<Register, 8> SomePredLOV;
-    bool IsFirst = true;
-    for (MachineBasicBlock *Pred : MBB->predecessors()) {
-      const auto &PredLOV = LiveOutVals[Pred];
+    ImagPressure IP;
+    auto &CLV = LiveOutVals[MBB];
+    if (MLI->isLoopHeader(MBB)) {
+      LLVM_DEBUG(dbgs() << "Loop header\n");
 
-      if (IsFirst) {
-        for (Register R : PredLOV) {
-          if (!LV->isLiveIn(R, *MBB))
-            continue;
-          AllPredsLOV.insert(R);
-          SomePredLOV.insert(R);
+      // Split live-in values into those used inside the loop and those only
+      // live through the loop.
+      SmallVector<Register> UsedCandidates;
+      SmallVector<Register> ThroughCandidates;
+      const DenseSet<Register> &LUV =
+          LoopUsedVals.find(MLI->getLoopFor(MBB))->second;
+      for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
+        Register R = Register::index2VirtReg(I);
+        if (MRI->use_nodbg_empty(R) || !LV->isLiveIn(R, *MBB))
+          continue;
+        if (LUV.contains(R))
+          UsedCandidates.push_back(R);
+        else
+          ThroughCandidates.push_back(R);
+      }
+      const auto Compare = [&](Register A, Register B) {
+        return nearerNextUse(A, B, *MBB, MBB->begin());
+      };
+      llvm::sort(UsedCandidates, Compare);
+      llvm::sort(ThroughCandidates, Compare);
+
+      LLVM_DEBUG({
+        dbgs() << "Used candidates:\n";
+        for (Register R : UsedCandidates)
+          dbgs() << printReg(R) << ' ';
+        dbgs() << '\n';
+        dbgs() << "Through candidates:\n";
+        for (Register R : ThroughCandidates)
+          dbgs() << printReg(R) << ' ';
+        dbgs() << '\n';
+      });
+
+      LLVM_DEBUG(dbgs() << "Chosen candidates:\n");
+      for (Register R : UsedCandidates) {
+        ImagPressure NewIP = IP;
+        addDefPressure(R, &NewIP);
+        if (isImagPressureOver(NewIP))
+          break;
+        CLV.insert(R);
+        IP = NewIP;
+        LLVM_DEBUG(dbgs() << printReg(R) << ' ');
+      }
+      LLVM_DEBUG(dbgs() << '\n');
+
+      // TODO: Through candidates.
+
+    } else {
+      SmallSet<Register, 8> AllPredsLOV;
+      SmallSet<Register, 8> SomePredLOV;
+      bool IsFirst = true;
+      for (MachineBasicBlock *Pred : MBB->predecessors()) {
+        const auto &PredLOV = LiveOutVals[Pred];
+
+        if (IsFirst) {
+          for (Register R : PredLOV) {
+            if (!LV->isLiveIn(R, *MBB))
+              continue;
+            AllPredsLOV.insert(R);
+            SomePredLOV.insert(R);
+          }
+          IsFirst = false;
+          continue;
         }
-        IsFirst = false;
-        continue;
+
+        SmallSet<Register, 8> ToRemove;
+        for (Register R : AllPredsLOV)
+          if (!PredLOV.contains(R))
+            ToRemove.insert(R);
+        for (Register R : ToRemove)
+          AllPredsLOV.erase(R);
+
+        for (Register R : PredLOV)
+          if (LV->isLiveIn(R, *MBB))
+            SomePredLOV.insert(R);
       }
 
-      SmallSet<Register, 8> ToRemove;
-      for (Register R : AllPredsLOV)
-        if (!PredLOV.contains(R))
-          ToRemove.insert(R);
-      for (Register R : ToRemove)
-        AllPredsLOV.erase(R);
+      LLVM_DEBUG({
+        dbgs() << "Candidates live out of all predecessors:\n";
+        for (Register R : AllPredsLOV)
+          dbgs() << printReg(R) << ' ';
+        dbgs() << '\n';
+      });
 
-      for (Register R : PredLOV)
-        if (LV->isLiveIn(R, *MBB))
-          SomePredLOV.insert(R);
+      SmallVector<Register> Candidates(SomePredLOV.begin(), SomePredLOV.end());
+      llvm::sort(Candidates, [&](Register A, Register B) {
+        // To avoid reloads, prefer to keep values allocated in all
+        // predecessors, not just some.
+        if (AllPredsLOV.contains(A) && !AllPredsLOV.contains(B))
+          return true;
+        if (!AllPredsLOV.contains(A) && AllPredsLOV.contains(B))
+          return false;
+
+        // Prefer values with nearer next uses.
+        return nearerNextUse(A, B, *MBB, MBB->begin());
+      });
+
+      LLVM_DEBUG({
+        dbgs() << "Ordered candidates:\n";
+        for (Register R : Candidates)
+          dbgs() << printReg(R) << ' ';
+        dbgs() << '\n';
+      });
+
+      LLVM_DEBUG(dbgs() << "Chosen candidates:\n");
+      for (Register R : Candidates) {
+        ImagPressure NewIP = IP;
+        addDefPressure(R, &NewIP);
+        if (isImagPressureOver(NewIP))
+          break;
+        CLV.insert(R);
+        IP = NewIP;
+        LLVM_DEBUG(dbgs() << printReg(R) << ' ');
+      }
+      LLVM_DEBUG(dbgs() << '\n');
     }
-
-    LLVM_DEBUG({
-      dbgs() << "Candidates live out of all predecessors:\n";
-      for (Register R : AllPredsLOV)
-        dbgs() << printReg(R) << ' ';
-      dbgs() << '\n';
-    });
-
-    SmallVector<Register> Candidates(SomePredLOV.begin(), SomePredLOV.end());
-    llvm::sort(Candidates, [&](Register A, Register B) {
-      // To avoid reloads, prefer to keep values allocated in all predecessors,
-      // not just some.
-      if (AllPredsLOV.contains(A) && !AllPredsLOV.contains(B))
-        return true;
-      if (!AllPredsLOV.contains(A) && AllPredsLOV.contains(B))
-        return false;
-
-      // Prefer values with nearer next uses.
-      return nearerNextUse(A, B, *MBB, MBB->begin());
-    });
-
-    LLVM_DEBUG({
-      dbgs() << "Ordered candidates:\n";
-      for (Register R : Candidates)
-        dbgs() << printReg(R) << ' ';
-      dbgs() << '\n';
-    });
-
-    ImagPressure IP;
-    Register *I = Candidates.begin();
-    for (Register *E = Candidates.end(); I != E; ++I) {
-      Register R = *I;
-      ImagPressure NewIP = IP;
-      addDefPressure(R, &NewIP);
-      if (isImagPressureOver(NewIP))
-        break;
-      IP = NewIP;
-    }
-
-    Candidates.erase(I, Candidates.end());
-    LLVM_DEBUG({
-      dbgs() << "Chosen candidates:\n";
-      for (Register R : Candidates)
-        dbgs() << printReg(R) << ' ';
-      dbgs() << '\n';
-    });
-
-    auto &LV = LiveOutVals[MBB];
-    for (Register R : Candidates)
-      LiveOutVals[MBB].insert(R);
 
     DenseSet<Register> Spilled;
 
     const auto Allocate = [&](Register R, MachineBasicBlock::iterator Pos) {
       LLVM_DEBUG(dbgs() << "Allocating " << printReg(R) << '\n');
-      LV.insert(R);
+      CLV.insert(R);
       ImagPressure NewIP = IP;
       addDefPressure(R, &NewIP);
       if (isImagPressureOver(NewIP)) {
-        SmallVector<Register> Candidates(LV.begin(), LV.end());
+        SmallVector<Register> Candidates(CLV.begin(), CLV.end());
         llvm::sort(Candidates, [&](Register A, Register B) {
           return nearerNextUse(A, B, *MBB, Pos);
         });
@@ -618,7 +660,7 @@ void MOSRegAlloc::allocateImagRegs() {
             }
             Spilled.insert(Evicted);
           }
-          LV.erase(Evicted);
+          CLV.erase(Evicted);
           removeKillPressure(Evicted, &IP);
           NewIP = IP;
           addDefPressure(R, &NewIP);
@@ -639,7 +681,7 @@ void MOSRegAlloc::allocateImagRegs() {
       if (!MI.isPHI()) {
         for (const MachineOperand &MO : MI.uses()) {
           if (MO.isReg() && MO.isKill() && MO.getReg().isVirtual()) {
-            LV.erase(MO.getReg());
+            CLV.erase(MO.getReg());
             removeKillPressure(MO.getReg(), &IP);
           }
         }
@@ -649,7 +691,7 @@ void MOSRegAlloc::allocateImagRegs() {
           Allocate(MO.getReg(), NextIter);
       for (const MachineOperand &MO : MI.defs()) {
         if (MO.isDead() && MO.getReg().isVirtual()) {
-          LV.erase(MO.getReg());
+          CLV.erase(MO.getReg());
           removeKillPressure(MO.getReg(), &IP);
         }
       }
