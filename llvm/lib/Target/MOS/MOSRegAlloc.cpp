@@ -550,44 +550,35 @@ void MOSRegAlloc::assignImagRegs() {
     if (MLI->isLoopHeader(MBB)) {
       LLVM_DEBUG(dbgs() << "Loop header\n");
 
-      // Split live-in values into those used inside the loop and those only
-      // live through the loop.
-      SmallVector<Register> UsedCandidates;
-      SmallVector<Register> ThroughCandidates;
+      SmallVector<Register> Candidates;
       const DenseSet<Register> &LUV =
           LoopUsedVals.find(MLI->getLoopFor(MBB))->second;
       for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
         Register R = Register::index2VirtReg(I);
-        if (MRI->use_nodbg_empty(R) || !LV->isLiveIn(R, *MBB))
-          continue;
-        if (LUV.contains(R))
-          UsedCandidates.push_back(R);
-        else
-          ThroughCandidates.push_back(R);
+        if (!MRI->use_nodbg_empty(R) && LV->isLiveIn(R, *MBB))
+          Candidates.push_back(R);
       }
-      const auto Compare = [&](Register A, Register B) {
+      llvm::sort(Candidates, [&](Register A, Register B) {
+        bool AUsed = LUV.contains(A);
+        bool BUsed = LUV.contains(B);
+        if (AUsed && !BUsed)
+          return true;
+        if (!AUsed && BUsed)
+          return false;
         return nearerNextUse(A, B, *MBB, MBB->begin());
-      };
-      llvm::sort(UsedCandidates, Compare);
-      llvm::sort(ThroughCandidates, Compare);
+      });
 
       LLVM_DEBUG({
-        dbgs() << "Used candidates:\n";
-        for (Register R : UsedCandidates)
-          dbgs() << printReg(R) << ' ';
-        dbgs() << '\n';
-        dbgs() << "Through candidates:\n";
-        for (Register R : ThroughCandidates)
+        dbgs() << "Candidates:\n";
+        for (Register R : Candidates)
           dbgs() << printReg(R) << ' ';
         dbgs() << '\n';
       });
 
       LLVM_DEBUG(dbgs() << "Chosen candidates:\n");
-      for (Register R : UsedCandidates)
+      for (Register R : Candidates)
         TryAssign(R);
       LLVM_DEBUG(dbgs() << '\n');
-
-      // TODO: Through candidates.
     } else {
       SmallSet<Register, 8> AllPredsORV;
       SmallSet<Register, 8> SomePredORV;
@@ -670,14 +661,6 @@ void MOSRegAlloc::assignImagRegs() {
         Register Evicted = EvictCandidates.back();
         EvictCandidates.pop_back();
         LLVM_DEBUG(dbgs() << "Evicting " << printReg(Evicted) << '\n');
-        if (!TII->isTriviallyReMaterializable(
-                *MRI->getUniqueVRegDef(Evicted))) {
-          MachineIRBuilder Builder(*MBB, Pos);
-          auto Spill =
-              Builder.buildInstr(MOS::SPILL).addUse(Evicted, RegState::Kill);
-          (void)Spill;
-          LLVM_DEBUG(dbgs() << *Spill);
-        }
         RegVals.erase(Evicted);
         if (TryAssign(R))
           return true;
