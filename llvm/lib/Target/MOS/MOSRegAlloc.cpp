@@ -197,6 +197,8 @@ private:
   // Map from value to imaginary register
   DenseMap<Register, Register> ImagAlloc;
 
+  DenseMap<const MachineBasicBlock *, DenseSet<Register>> MBBOutRegVals;
+
   unsigned NumImag16Avail;
   unsigned NumImag16CSRAvail;
 
@@ -214,9 +216,8 @@ private:
   void findCSRVals(const MachineDomTreeNode &MDTN,
                    const SmallSet<Register, 8> &DomLiveOutVals = {});
   void scanLoops();
-  void allocateImagRegs();
-  void assignImagRegs(const MachineDomTreeNode &MDTN,
-                      const SmallSet<Register, 8> &DomLiveOutVals = {});
+  // void allocateImagRegs();
+  void assignImagRegs();
 
   bool nearerNextUse(Register Left, Register Right,
                      const MachineBasicBlock &MBB,
@@ -329,11 +330,11 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
   countAvailImag16Regs();
   scanLoops();
-  allocateImagRegs();
+  // allocateImagRegs();
   ImagAlloc.clear();
 
   LLVM_DEBUG(dbgs() << "Assigning imaginary registers to each value:\n");
-  assignImagRegs(*MDT->getRootNode());
+  assignImagRegs();
 
   // Recompute liveness and kill dead instructions.
   for (MachineBasicBlock *MBB : post_order(&MF)) {
@@ -498,16 +499,54 @@ void MOSRegAlloc::scanLoops() {
   });
 }
 
-void MOSRegAlloc::allocateImagRegs() {
-  DenseMap<MachineBasicBlock *, SmallSet<Register, 8>> LiveOutVals;
+void MOSRegAlloc::assignImagRegs() {
   ReversePostOrderTraversal<MachineBasicBlock *> RPOT(&*MF->begin());
 
   for (MachineBasicBlock *MBB : RPOT) {
     LLVM_DEBUG(dbgs() << "Choosing allocated live in vals for MBB %bb."
                       << MBB->getNumber() << '\n');
 
-    ImagPressure IP;
-    auto &CLV = LiveOutVals[MBB];
+    // Values currently in imaginary registers
+    auto &RegVals = MBBOutRegVals[MBB];
+
+    const auto TryAssignFixed = [&](Register R, Register Phys) -> bool {
+      if (MRI->isReserved(Phys))
+        return false;
+      if (llvm::any_of(RegVals, [&](Register V) {
+            return TRI->regsOverlap(Phys, ImagAlloc[V]);
+          }))
+        return false;
+      if (!ImagAlloc.contains(R))
+        LLVM_DEBUG(dbgs() << printReg(R) << " -> " << printReg(Phys, TRI)
+                          << '\n');
+      LLVM_DEBUG(dbgs() << "Chose val: " << printReg(R) << '\n');
+      ImagAlloc[R] = Phys;
+      RegVals.insert(R);
+      return true;
+    };
+
+    const auto TryAssign = [&](Register R) -> bool {
+      // If the register is already assigned, just not currently in a register,
+      // then there's only one choice for the register.
+      auto It = ImagAlloc.find(R);
+      if (It != ImagAlloc.end())
+        return TryAssignFixed(R, It->second);
+
+      const TargetRegisterClass *RC = MRI->getRegClass(R);
+      bool IsCSR = CSRVals.contains(R);
+      Register I, E;
+      if (IsCSR)
+        I = (RC == &MOS::Imag16RegClass) ? MOS::RS10 : MOS::RC20;
+      else
+        I = (RC == &MOS::Imag16RegClass) ? MOS::RS1 : MOS::RC2;
+      E = (RC == &MOS::Imag16RegClass) ? MOS::RS15 + 1 : MOS::RC31 + 1;
+
+      for (; I != E; I = I + 1)
+        if (TryAssignFixed(R, I))
+          return true;
+      return false;
+    };
+
     if (MLI->isLoopHeader(MBB)) {
       LLVM_DEBUG(dbgs() << "Loop header\n");
 
@@ -544,63 +583,55 @@ void MOSRegAlloc::allocateImagRegs() {
       });
 
       LLVM_DEBUG(dbgs() << "Chosen candidates:\n");
-      for (Register R : UsedCandidates) {
-        ImagPressure NewIP = IP;
-        addDefPressure(R, &NewIP);
-        if (isImagPressureOver(NewIP))
-          break;
-        CLV.insert(R);
-        IP = NewIP;
-        LLVM_DEBUG(dbgs() << printReg(R) << ' ');
-      }
+      for (Register R : UsedCandidates)
+        TryAssign(R);
       LLVM_DEBUG(dbgs() << '\n');
 
       // TODO: Through candidates.
-
     } else {
-      SmallSet<Register, 8> AllPredsLOV;
-      SmallSet<Register, 8> SomePredLOV;
+      SmallSet<Register, 8> AllPredsORV;
+      SmallSet<Register, 8> SomePredORV;
       bool IsFirst = true;
       for (MachineBasicBlock *Pred : MBB->predecessors()) {
-        const auto &PredLOV = LiveOutVals[Pred];
+        const auto &PredORV = MBBOutRegVals[Pred];
 
         if (IsFirst) {
-          for (Register R : PredLOV) {
+          for (Register R : PredORV) {
             if (!LV->isLiveIn(R, *MBB))
               continue;
-            AllPredsLOV.insert(R);
-            SomePredLOV.insert(R);
+            AllPredsORV.insert(R);
+            SomePredORV.insert(R);
           }
           IsFirst = false;
           continue;
         }
 
         SmallSet<Register, 8> ToRemove;
-        for (Register R : AllPredsLOV)
-          if (!PredLOV.contains(R))
+        for (Register R : AllPredsORV)
+          if (!PredORV.contains(R))
             ToRemove.insert(R);
         for (Register R : ToRemove)
-          AllPredsLOV.erase(R);
+          AllPredsORV.erase(R);
 
-        for (Register R : PredLOV)
+        for (Register R : PredORV)
           if (LV->isLiveIn(R, *MBB))
-            SomePredLOV.insert(R);
+            SomePredORV.insert(R);
       }
 
       LLVM_DEBUG({
-        dbgs() << "Candidates live out of all predecessors:\n";
-        for (Register R : AllPredsLOV)
+        dbgs() << "Candidates in imag regs out of all predecessors:\n";
+        for (Register R : AllPredsORV)
           dbgs() << printReg(R) << ' ';
         dbgs() << '\n';
       });
 
-      SmallVector<Register> Candidates(SomePredLOV.begin(), SomePredLOV.end());
+      SmallVector<Register> Candidates(SomePredORV.begin(), SomePredORV.end());
       llvm::sort(Candidates, [&](Register A, Register B) {
         // To avoid reloads, prefer to keep values allocated in all
         // predecessors, not just some.
-        if (AllPredsLOV.contains(A) && !AllPredsLOV.contains(B))
+        if (AllPredsORV.contains(A) && !AllPredsORV.contains(B))
           return true;
-        if (!AllPredsLOV.contains(A) && AllPredsLOV.contains(B))
+        if (!AllPredsORV.contains(A) && AllPredsORV.contains(B))
           return false;
 
         // Prefer values with nearer next uses.
@@ -615,61 +646,46 @@ void MOSRegAlloc::allocateImagRegs() {
       });
 
       LLVM_DEBUG(dbgs() << "Chosen candidates:\n");
-      for (Register R : Candidates) {
-        ImagPressure NewIP = IP;
-        addDefPressure(R, &NewIP);
-        if (isImagPressureOver(NewIP))
-          break;
-        CLV.insert(R);
-        IP = NewIP;
-        LLVM_DEBUG(dbgs() << printReg(R) << ' ');
-      }
+      for (Register R : Candidates)
+        TryAssign(R);
       LLVM_DEBUG(dbgs() << '\n');
     }
 
-    DenseSet<Register> Spilled;
+    const auto Assign = [&](Register R, MachineBasicBlock::iterator Pos) {
+      if (TryAssign(R))
+        return true;
 
-    const auto Allocate = [&](Register R, MachineBasicBlock::iterator Pos) {
-      LLVM_DEBUG(dbgs() << "Allocating " << printReg(R) << '\n');
-      CLV.insert(R);
-      ImagPressure NewIP = IP;
-      addDefPressure(R, &NewIP);
-      if (isImagPressureOver(NewIP)) {
-        SmallVector<Register> Candidates(CLV.begin(), CLV.end());
-        llvm::sort(Candidates, [&](Register A, Register B) {
-          return nearerNextUse(A, B, *MBB, Pos);
-        });
-        LLVM_DEBUG({
-          dbgs() << "Eviction candidates:\n";
-          for (Register R : Candidates)
-            dbgs() << printReg(R) << ' ';
-          dbgs() << '\n';
-        });
-        do {
-          Register Evicted = Candidates.back();
-          Candidates.pop_back();
-          LLVM_DEBUG(dbgs() << "Evicting " << printReg(Evicted) << '\n');
-          if (!Spilled.contains(Evicted)) {
-            if (!TII->isTriviallyReMaterializable(
-                    *MRI->getUniqueVRegDef(Evicted))) {
-              MachineIRBuilder Builder(*MBB, Pos);
-              auto Spill = Builder.buildInstr(MOS::SPILL)
-                               .addUse(Evicted, RegState::Kill);
-              (void)Spill;
-              LLVM_DEBUG(dbgs() << *Spill);
-            }
-            Spilled.insert(Evicted);
-          }
-          CLV.erase(Evicted);
-          removeKillPressure(Evicted, &IP);
-          NewIP = IP;
-          addDefPressure(R, &NewIP);
-        } while (isImagPressureOver(NewIP));
+      SmallVector<Register> EvictCandidates(RegVals.begin(), RegVals.end());
+      llvm::sort(EvictCandidates, [&](Register A, Register B) {
+        return nearerNextUse(A, B, *MBB, Pos);
+      });
+      LLVM_DEBUG({
+        dbgs() << "Eviction candidates:\n";
+        for (Register R : EvictCandidates)
+          dbgs() << printReg(R) << ' ';
+        dbgs() << '\n';
+      });
+
+      while (!EvictCandidates.empty()) {
+        Register Evicted = EvictCandidates.back();
+        EvictCandidates.pop_back();
+        LLVM_DEBUG(dbgs() << "Evicting " << printReg(Evicted) << '\n');
+        if (!TII->isTriviallyReMaterializable(
+                *MRI->getUniqueVRegDef(Evicted))) {
+          MachineIRBuilder Builder(*MBB, Pos);
+          auto Spill =
+              Builder.buildInstr(MOS::SPILL).addUse(Evicted, RegState::Kill);
+          (void)Spill;
+          LLVM_DEBUG(dbgs() << *Spill);
+        }
+        RegVals.erase(Evicted);
+        if (TryAssign(R))
+          return true;
       }
-      IP = NewIP;
+
+      report_fatal_error("ran out of registers during register allocation");
     };
 
-    LLVM_DEBUG(IP.dump());
     for (MachineInstr &MI : *MBB) {
       LLVM_DEBUG(dbgs() << "Allocating " << MI);
       MachineBasicBlock::iterator NextIter = MI;
@@ -677,82 +693,28 @@ void MOSRegAlloc::allocateImagRegs() {
 
       for (const MachineOperand &MO : MI.defs())
         if (MO.isEarlyClobber() && MO.getReg().isVirtual())
-          Allocate(MO.getReg(), NextIter);
+          Assign(MO.getReg(), NextIter);
       if (!MI.isPHI()) {
-        for (const MachineOperand &MO : MI.uses()) {
-          if (MO.isReg() && MO.isKill() && MO.getReg().isVirtual()) {
-            CLV.erase(MO.getReg());
-            removeKillPressure(MO.getReg(), &IP);
-          }
-        }
+        for (const MachineOperand &MO : MI.uses())
+          if (MO.isReg() && MO.isKill())
+            RegVals.erase(MO.getReg());
       }
       for (const MachineOperand &MO : MI.defs())
         if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
-          Allocate(MO.getReg(), NextIter);
-      for (const MachineOperand &MO : MI.defs()) {
-        if (MO.isDead() && MO.getReg().isVirtual()) {
-          CLV.erase(MO.getReg());
-          removeKillPressure(MO.getReg(), &IP);
+          Assign(MO.getReg(), NextIter);
+      for (const MachineOperand &MO : MI.defs())
+        if (MO.isDead())
+          RegVals.erase(MO.getReg());
+
+      LLVM_DEBUG({
+        dbgs() << "Vals in regs:\n";
+        for (Register R : RegVals) {
+          dbgs() << printReg(R) << ' ';
         }
-      }
-      LLVM_DEBUG(IP.dump());
+        dbgs() << '\n';
+      });
     }
   }
-}
-
-void MOSRegAlloc::assignImagRegs(const MachineDomTreeNode &MDTN,
-                                 const SmallSet<Register, 8> &DomLiveOutVals) {
-  const MachineBasicBlock &MBB = *MDTN.getBlock();
-
-  SmallSet<Register, 8> LiveVals;
-  for (Register R : DomLiveOutVals)
-    if (LV->isLiveIn(R, *MDTN.getBlock()))
-      LiveVals.insert(R);
-
-  const auto Assign = [&](Register R) {
-    const TargetRegisterClass *RC = MRI->getRegClass(R);
-    bool IsCSR = CSRVals.contains(R);
-    Register I, E;
-    if (IsCSR)
-      I = (RC == &MOS::Imag16RegClass) ? MOS::RS10 : MOS::RC20;
-    else
-      I = (RC == &MOS::Imag16RegClass) ? MOS::RS1 : MOS::RC2;
-    E = (RC == &MOS::Imag16RegClass) ? MOS::RS15 + 1 : MOS::RC31 + 1;
-
-    for (; I != E; I = I + 1) {
-      if (MRI->isReserved(I))
-        continue;
-      if (llvm::none_of(LiveVals, [&](Register V) {
-            return TRI->regsOverlap(I, ImagAlloc[V]);
-          })) {
-        LLVM_DEBUG(dbgs() << printReg(R) << " -> " << printReg(I, TRI) << '\n');
-        ImagAlloc[R] = I;
-        LiveVals.insert(R);
-        return;
-      }
-    }
-    report_fatal_error("ran out of callee-saved registers");
-  };
-
-  for (const MachineInstr &MI : MBB) {
-    for (const MachineOperand &MO : MI.defs())
-      if (MO.isEarlyClobber() && MO.getReg().isVirtual())
-        Assign(MO.getReg());
-    if (!MI.isPHI()) {
-      for (const MachineOperand &MO : MI.uses())
-        if (MO.isReg() && MO.isKill())
-          LiveVals.erase(MO.getReg());
-    }
-    for (const MachineOperand &MO : MI.defs())
-      if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
-        Assign(MO.getReg());
-    for (const MachineOperand &MO : MI.defs())
-      if (MO.isDead())
-        LiveVals.erase(MO.getReg());
-  }
-
-  for (const MachineDomTreeNode *Child : MDTN.children())
-    assignImagRegs(*Child, LiveVals);
 }
 
 bool MOSRegAlloc::nearerNextUse(Register Left, Register Right,
