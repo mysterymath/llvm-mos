@@ -671,17 +671,25 @@ void MOSRegAlloc::assignImagRegs() {
 
     for (MachineInstr &MI : *MBB) {
       LLVM_DEBUG(dbgs() << "Allocating " << MI);
-      MachineBasicBlock::iterator NextIter = MI;
-      ++NextIter;
 
       for (const MachineOperand &MO : MI.defs())
         if (MO.isEarlyClobber() && MO.getReg().isVirtual())
-          Assign(MO.getReg(), NextIter);
+          Assign(MO.getReg(), MI);
       if (!MI.isPHI()) {
-        for (const MachineOperand &MO : MI.uses())
-          if (MO.isReg() && MO.isKill())
-            RegVals.erase(MO.getReg());
+        for (const MachineOperand &MO : MI.uses()) {
+          if (!MO.isReg() || !MO.getReg().isVirtual())
+            continue;
+          Register R = MO.getReg();
+          if (!RegVals.contains(R)) {
+            dbgs() << "Reloading " << printReg(R) << '\n';
+            Assign(R, MI);
+          }
+          if (MO.isKill())
+            RegVals.erase(R);
+        }
       }
+      MachineBasicBlock::iterator NextIter = MI;
+      ++NextIter;
       for (const MachineOperand &MO : MI.defs())
         if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
           Assign(MO.getReg(), NextIter);
