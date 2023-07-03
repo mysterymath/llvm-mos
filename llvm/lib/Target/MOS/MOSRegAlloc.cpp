@@ -218,12 +218,16 @@ private:
   void findCSRVals(const MachineDomTreeNode &MDTN,
                    const SmallSet<Register, 8> &DomLiveOutVals = {});
   void scanLoops();
-  // void allocateImagRegs();
   void assignImagRegs();
 
   bool nearerNextUse(Register Left, Register Right,
                      const MachineBasicBlock &MBB,
                      MachineBasicBlock::const_iterator Pos) const;
+
+  bool betterToAssign(Register Left, Register Right,
+                      const MachineBasicBlock &MBB,
+                      MachineBasicBlock::const_iterator Pos);
+
   std::optional<NextUseDist>
   succNextUseDist(Register R, const MachineBasicBlock &MBB,
                   const MachineBasicBlock &Succ) const;
@@ -257,7 +261,6 @@ void MOSRegAlloc::getAnalysisUsage(AnalysisUsage &AU) const {
 }
 
 bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
-  // TODO: Subregister liveness.
   this->MF = &MF;
 
   LLVM_DEBUG(dbgs() << "\n# MOS Register Allocator: " << MF.getName()
@@ -270,8 +273,6 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   MDT = &getAnalysis<MachineDominatorTree>();
   MLI = &getAnalysis<MachineLoopInfo>();
   LV = &getAnalysis<LiveVariables>();
-
-  MF.dump();
 
   LLVM_DEBUG(dbgs() << "## Coalesce away copies.\n");
 
@@ -334,7 +335,6 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
   countAvailImag16Regs();
   scanLoops();
-  // allocateImagRegs();
   ImagAlloc.clear();
 
   LLVM_DEBUG(dbgs() << "Assigning imaginary registers to each value:\n");
@@ -569,7 +569,7 @@ void MOSRegAlloc::assignImagRegs() {
           return true;
         if (!AUsed && BUsed)
           return false;
-        return nearerNextUse(A, B, *MBB, MBB->begin());
+        return betterToAssign(A, B, *MBB, MBB->begin());
       });
 
       LLVM_DEBUG({
@@ -629,8 +629,7 @@ void MOSRegAlloc::assignImagRegs() {
         if (!AllPredsORV.contains(A) && AllPredsORV.contains(B))
           return false;
 
-        // Prefer values with nearer next uses.
-        return nearerNextUse(A, B, *MBB, MBB->begin());
+        return betterToAssign(A, B, *MBB, MBB->begin());
       });
 
       LLVM_DEBUG({
@@ -652,7 +651,7 @@ void MOSRegAlloc::assignImagRegs() {
 
       SmallVector<Register> EvictCandidates(RegVals.begin(), RegVals.end());
       llvm::sort(EvictCandidates, [&](Register A, Register B) {
-        return nearerNextUse(A, B, *MBB, Pos);
+        return betterToAssign(A, B, *MBB, Pos);
       });
       LLVM_DEBUG({
         dbgs() << "Eviction candidates:\n";
@@ -747,6 +746,20 @@ bool MOSRegAlloc::nearerNextUse(Register Left, Register Right,
   if (!BestRight)
     return true;
   return BestLeft && *BestLeft < *BestRight;
+}
+
+bool MOSRegAlloc::betterToAssign(Register Left, Register Right,
+                                 const MachineBasicBlock &MBB,
+                                 MachineBasicBlock::const_iterator Pos) {
+  bool CanRematLeft =
+      TII->isTriviallyReMaterializable(*MRI->getUniqueVRegDef(Left));
+  bool CanRematRight =
+      TII->isTriviallyReMaterializable(*MRI->getUniqueVRegDef(Right));
+  if (!CanRematLeft && CanRematRight)
+    return true;
+  if (CanRematLeft && !CanRematRight)
+    return false;
+  return nearerNextUse(Left, Right, MBB, Pos);
 }
 
 std::optional<NextUseDist>
