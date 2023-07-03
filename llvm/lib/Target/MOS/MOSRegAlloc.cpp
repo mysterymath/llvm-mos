@@ -76,6 +76,7 @@
 #include "llvm/Support/FormatVariadic.h"
 #include <memory>
 #include <optional>
+#include <pthread.h>
 #include <vector>
 
 #define DEBUG_TYPE "mos-regalloc"
@@ -196,6 +197,9 @@ private:
   // Values live across calls that clobber imaginary registers.
   DenseSet<Register> CSRVals;
 
+  // Values where storing in an imaginary register is always slower than remat.
+  DenseSet<Register> AlwaysRematVals;
+
   // Map from value to imaginary register
   DenseMap<Register, Register> ImagAlloc;
 
@@ -217,6 +221,7 @@ private:
   void countAvailImag16Regs();
   void findCSRVals(const MachineDomTreeNode &MDTN,
                    const SmallSet<Register, 8> &DomLiveOutVals = {});
+  void findAlwaysRematVals();
   void scanLoops();
   void assignImagRegs();
 
@@ -333,6 +338,14 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
     dbgs() << '\n';
   });
 
+  findAlwaysRematVals();
+  LLVM_DEBUG({
+    dbgs() << "Values that should always be rematerialized:\n";
+    for (Register R : AlwaysRematVals)
+      dbgs() << printReg(R) << ' ';
+    dbgs() << '\n';
+  });
+
   countAvailImag16Regs();
   scanLoops();
   ImagAlloc.clear();
@@ -415,6 +428,38 @@ void MOSRegAlloc::findCSRVals(const MachineDomTreeNode &MDTN,
 
   for (const MachineDomTreeNode *Child : MDTN.children())
     findCSRVals(*Child, LiveVals);
+}
+
+void MOSRegAlloc::findAlwaysRematVals() {
+  for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
+    Register R = Register::index2VirtReg(I);
+    if (MRI->reg_nodbg_empty(R))
+      continue;
+
+    MachineInstr *MI = MRI->getUniqueVRegDef(R);
+    if (!TII->isTriviallyReMaterializable(*MI))
+      continue;
+
+    bool PotentialImagUse = false;
+    for (MachineOperand &MO : MRI->use_nodbg_operands(R)) {
+      if (MO.getParent()->isPHI()) {
+        PotentialImagUse = true;
+        break;
+      }
+
+      const TargetRegisterClass *RC =
+          MI->getRegClassConstraint(MO.getOperandNo(), TII, TRI);
+      if (!RC)
+        continue;
+      if (RC == &MOS::Imag16RegClass || RC == &MOS::Anyi1RegClass ||
+          RC->hasSubClassEq(&MOS::Imag8RegClass)) {
+        PotentialImagUse = true;
+        break;
+      }
+    }
+    if (!PotentialImagUse)
+      AlwaysRematVals.insert(R);
+  }
 }
 
 // Find the maximum register pressure and used variables for each loop. This
