@@ -198,7 +198,7 @@ private:
   DenseSet<Register> CSRVals;
 
   // Values where storing in an imaginary register is always slower than remat.
-  DenseSet<Register> AlwaysRematVals;
+  DenseSet<Register> NeverImagVals;
 
   // Map from value to imaginary register
   DenseMap<Register, Register> ImagAlloc;
@@ -221,7 +221,7 @@ private:
   void countAvailImag16Regs();
   void findCSRVals(const MachineDomTreeNode &MDTN,
                    const SmallSet<Register, 8> &DomLiveOutVals = {});
-  void findAlwaysRematVals();
+  void findNeverImagVals();
   void scanLoops();
   void assignImagRegs();
 
@@ -338,10 +338,10 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
     dbgs() << '\n';
   });
 
-  findAlwaysRematVals();
+  findNeverImagVals();
   LLVM_DEBUG({
     dbgs() << "Values that should always be rematerialized:\n";
-    for (Register R : AlwaysRematVals)
+    for (Register R : NeverImagVals)
       dbgs() << printReg(R) << ' ';
     dbgs() << '\n';
   });
@@ -430,7 +430,7 @@ void MOSRegAlloc::findCSRVals(const MachineDomTreeNode &MDTN,
     findCSRVals(*Child, LiveVals);
 }
 
-void MOSRegAlloc::findAlwaysRematVals() {
+void MOSRegAlloc::findNeverImagVals() {
   for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
     Register R = Register::index2VirtReg(I);
     if (MRI->reg_nodbg_empty(R))
@@ -458,7 +458,7 @@ void MOSRegAlloc::findAlwaysRematVals() {
       }
     }
     if (!PotentialImagUse)
-      AlwaysRematVals.insert(R);
+      NeverImagVals.insert(R);
   }
 }
 
@@ -604,7 +604,8 @@ void MOSRegAlloc::assignImagRegs() {
           LoopUsedVals.find(MLI->getLoopFor(MBB))->second;
       for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
         Register R = Register::index2VirtReg(I);
-        if (!MRI->use_nodbg_empty(R) && LV->isLiveIn(R, *MBB))
+        if (!MRI->use_nodbg_empty(R) && LV->isLiveIn(R, *MBB) &&
+            !NeverImagVals.contains(R))
           Candidates.push_back(R);
       }
       llvm::sort(Candidates, [&](Register A, Register B) {
@@ -637,7 +638,7 @@ void MOSRegAlloc::assignImagRegs() {
 
         if (IsFirst) {
           for (Register R : PredORV) {
-            if (!LV->isLiveIn(R, *MBB))
+            if (!LV->isLiveIn(R, *MBB) || NeverImagVals.contains(R))
               continue;
             AllPredsORV.insert(R);
             SomePredORV.insert(R);
@@ -654,7 +655,7 @@ void MOSRegAlloc::assignImagRegs() {
           AllPredsORV.erase(R);
 
         for (Register R : PredORV)
-          if (LV->isLiveIn(R, *MBB))
+          if (LV->isLiveIn(R, *MBB) && !NeverImagVals.contains(R))
             SomePredORV.insert(R);
       }
 
@@ -691,8 +692,10 @@ void MOSRegAlloc::assignImagRegs() {
     }
 
     const auto Assign = [&](Register R, MachineBasicBlock::iterator Pos) {
+      if (NeverImagVals.contains(R))
+        return;
       if (TryAssign(R))
-        return true;
+        return;
 
       SmallVector<Register> EvictCandidates(RegVals.begin(), RegVals.end());
       llvm::sort(EvictCandidates, [&](Register A, Register B) {
@@ -711,7 +714,7 @@ void MOSRegAlloc::assignImagRegs() {
         LLVM_DEBUG(dbgs() << "Evicting " << printReg(Evicted) << '\n');
         RegVals.erase(Evicted);
         if (TryAssign(R))
-          return true;
+          return;
       }
 
       report_fatal_error("ran out of registers during register allocation");
@@ -728,6 +731,8 @@ void MOSRegAlloc::assignImagRegs() {
           if (!MO.isReg() || !MO.getReg().isVirtual())
             continue;
           Register R = MO.getReg();
+          if (NeverImagVals.contains(R))
+            continue;
           if (!RegVals.contains(R)) {
             MachineInstr *Def = MRI->getUniqueVRegDef(R);
             if (TII->isTriviallyReMaterializable(*Def)) {
