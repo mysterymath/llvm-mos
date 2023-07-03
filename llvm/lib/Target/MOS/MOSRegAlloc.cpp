@@ -57,6 +57,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
+#include "llvm/CodeGen/ISDOpcodes.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
@@ -70,6 +71,7 @@
 #include "llvm/CodeGen/RegisterClassInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
+#include "llvm/ExecutionEngine/Orc/Core.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
 #include <memory>
@@ -232,6 +234,8 @@ private:
   void addDefPressure(Register R, ImagPressure *IP) const;
   void removeKillPressure(Register R, ImagPressure *IP) const;
   bool isImagPressureOver(const ImagPressure &IP) const;
+  void rewriteVReg(Register From, Register To, MachineBasicBlock &MBB,
+                   MachineBasicBlock::iterator Pos);
 };
 
 } // namespace
@@ -681,8 +685,19 @@ void MOSRegAlloc::assignImagRegs() {
             continue;
           Register R = MO.getReg();
           if (!RegVals.contains(R)) {
-            dbgs() << "Reloading " << printReg(R) << '\n';
-            Assign(R, MI);
+            MachineInstr *Def = MRI->getUniqueVRegDef(R);
+            if (TII->isTriviallyReMaterializable(*Def)) {
+              dbgs() << "Rematerializing " << printReg(R) << '\n';
+              TII->reMaterialize(*MBB, MI, R, /*SubRegIdx=*/0, *Def, *TRI);
+              MachineInstr &Remat = *MI.getPrevNode();
+              LLVM_DEBUG(dbgs() << Remat);
+              Register NewReg = MRI->cloneVirtualRegister(R);
+              rewriteVReg(R, NewReg, *MBB, MI);
+              Assign(NewReg, Remat);
+            } else {
+              dbgs() << "Reloading " << printReg(R) << '\n';
+              report_fatal_error("Not yet implemented");
+            }
           }
           if (MO.isKill())
             RegVals.erase(R);
@@ -881,6 +896,76 @@ void MOSRegAlloc::removeKillPressure(Register R, ImagPressure *IP) const {
 bool MOSRegAlloc::isImagPressureOver(const ImagPressure &IP) const {
   return IP.numImag16Needed() > NumImag16Avail ||
          IP.numImag16CSRNeeded() > NumImag16CSRAvail;
+}
+
+void MOSRegAlloc::rewriteVReg(Register From, Register To,
+                              MachineBasicBlock &MBB,
+                              MachineBasicBlock::iterator Pos) {
+  for (auto I = Pos, E = MBB.end(); I != E; ++I) {
+    if (I->readsVirtualRegister(From) || I->modifiesRegister(From)) {
+      LLVM_DEBUG(dbgs() << "Rewriting " << *I);
+      I->substituteRegister(From, To, /*SubIdx=*/0, *TRI);
+      LLVM_DEBUG(dbgs() << "To " << *I);
+    }
+  }
+
+  DenseMap<const MachineDomTreeNode *, Register> MDTNReg;
+  MDTNReg[MDT->getNode(&MBB)] = To;
+  const std::set<MachineBasicBlock *> &DFSet = MDF->find(&MBB)->second;
+
+  SmallVector<MachineOperand *> Uses;
+  for (MachineOperand &MO : MRI->use_nodbg_operands(From))
+    Uses.push_back(&MO);
+
+  SmallVector<Register> AffectedRegs = {From, To};
+
+  while (!Uses.empty()) {
+    MachineOperand *MO = Uses.back();
+    Uses.pop_back();
+    MachineInstr &MI = *MO->getParent();
+
+    const MachineDomTreeNode *MDTN;
+    for (MDTN = MDT->getNode(
+             MI.isPHI() ? MI.getOperand(MO->getOperandNo() + 1).getMBB()
+                        : MI.getParent());
+         MDTN; MDTN = MDTN->getIDom()) {
+
+      auto It = MDTNReg.find(MDTN);
+      if (It != MDTNReg.end()) {
+        LLVM_DEBUG(dbgs() << "Rewriting: " << MI);
+        MO->setReg(It->second);
+        LLVM_DEBUG(dbgs() << "To: " << MI);
+        break;
+      }
+
+      MachineBasicBlock *CurMBB = MDTN->getBlock();
+
+      if (!llvm::is_contained(DFSet, CurMBB))
+        continue;
+
+      MachineIRBuilder Builder(*CurMBB, CurMBB->begin());
+      Register NewReg = MRI->cloneVirtualRegister(To);
+      AffectedRegs.push_back(NewReg);
+      auto Phi = Builder.buildInstr(MOS::PHI, {NewReg}, {});
+      for (MachineBasicBlock *Pred : CurMBB->predecessors()) {
+        Phi.addUse(From);
+        Phi.addMBB(Pred);
+      }
+      for (unsigned I = 1, E = Phi->getNumOperands(); I != E; I += 2)
+        Uses.push_back(&Phi->getOperand(I));
+      LLVM_DEBUG(dbgs() << "Inserted PHI to MBB %bb." << CurMBB->getNumber()
+                        << '\n');
+      LLVM_DEBUG(dbgs() << *Phi);
+      MDTNReg[MDTN] = NewReg;
+      break;
+    }
+    assert(MDTN && "Could not find definition");
+  }
+
+  for (Register R : AffectedRegs)
+    LV->recomputeForSingleDefVirtReg(R);
+  for (Register R : AffectedRegs)
+    recomputeNextUseDists(R);
 }
 
 char MOSRegAlloc::ID = 0;
