@@ -225,6 +225,7 @@ private:
   void findNeverImagVals();
   void scanLoops();
   void assignImagRegs();
+  void decomposeToTree();
 
   bool nearerNextUse(Register Left, Register Right,
                      const MachineBasicBlock &MBB,
@@ -351,8 +352,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   scanLoops();
   ImagAlloc.clear();
 
-  LLVM_DEBUG(dbgs() << "Assigning imaginary registers to each value:\n");
   assignImagRegs();
+  decomposeToTree();
 
   // Recompute liveness and kill dead instructions.
   for (MachineBasicBlock *MBB : post_order(&MF)) {
@@ -550,6 +551,7 @@ void MOSRegAlloc::scanLoops() {
 }
 
 void MOSRegAlloc::assignImagRegs() {
+  LLVM_DEBUG(dbgs() << "Assigning imaginary registers to each value.\n");
   ReversePostOrderTraversal<MachineBasicBlock *> RPOT(&*MF->begin());
 
   for (MachineBasicBlock *MBB : RPOT) {
@@ -783,6 +785,194 @@ void MOSRegAlloc::assignImagRegs() {
       }
     }
   }
+}
+
+namespace {
+// Thorup Algorithm E.
+void findMaximalChains(DenseMap<unsigned, unsigned> &MaxChainsByEnd,
+                       DenseMap<unsigned, unsigned> &MaxJump, uint64_t Size) {
+  SmallVector<std::pair<unsigned, unsigned>> Stack = {{0, Size}};
+  for (unsigned I = 0; I < Size; ++I) {
+    const auto It = MaxJump.find(I);
+    if (It == MaxJump.end())
+      continue;
+    unsigned J = It->second;
+
+    while (Stack.back().second <= I) {
+      MaxChainsByEnd[Stack.back().second] = Stack.back().first;
+      Stack.pop_back();
+    }
+    unsigned K = I;
+    while (J >= Stack.back().second && Stack.back().second > K) {
+      K = Stack.back().first;
+      Stack.pop_back();
+    }
+    Stack.push_back({K, J});
+  }
+}
+
+struct Node {
+  DenseSet<unsigned> MBBs;
+  DenseSet<unsigned> Children;
+};
+
+static void dumpTree(const SmallVectorImpl<Node> &Tree, unsigned N = 0,
+                     unsigned Indent = 0) {
+  for (unsigned I = 0; I < Indent; ++I)
+    dbgs() << ' ';
+  dbgs() << N << ": ";
+  for (unsigned M : Tree[N].MBBs)
+    dbgs() << M << ' ';
+  dbgs() << '\n';
+  for (unsigned C : Tree[N].Children)
+    dumpTree(Tree, C, Indent + 2);
+}
+} // namespace
+
+void MOSRegAlloc::decomposeToTree() {
+  LLVM_DEBUG(dbgs() << "Producing tree decomposition of basic block graph.\n");
+
+  SmallVector<MachineBasicBlock *> MBBs(MF->size());
+  DenseMap<MachineBasicBlock *, unsigned> MBBIndices;
+  for (const auto &[I, MBB] : llvm::enumerate(*MF)) {
+    MBBs[I] = &MBB;
+    MBBIndices[&MBB] = I;
+  }
+
+  for (const auto &[I, MBB] : llvm::enumerate(MBBs)) {
+    dbgs() << "I: " << I << '\n';
+    MBB->dump();
+  }
+
+  DenseMap<unsigned, unsigned> MaxJJump;
+  DenseMap<unsigned, unsigned> MaxSJump;
+  for (const auto &[I, MBB] : llvm::enumerate(MBBs)) {
+    for (MachineBasicBlock *Succ : MBB->successors()) {
+      unsigned J = MBBIndices[Succ];
+      if (J <= I)
+        continue;
+      const auto Res = MaxJJump.try_emplace(I, J);
+      if (!Res.second && J > Res.first->second)
+        Res.first->second = J;
+      const auto Res2 = MaxSJump.try_emplace(I, J);
+      if (!Res2.second && J > Res2.first->second)
+        Res2.first->second = J;
+    }
+
+    for (MachineBasicBlock *Pred : MBB->predecessors()) {
+      unsigned J = MBBIndices[Pred];
+      if (J <= I)
+        continue;
+      const auto Res = MaxSJump.try_emplace(I, J);
+      if (!Res.second && J > Res.first->second)
+        Res.first->second = J;
+    }
+  }
+  dbgs() << "MaxJJump\n";
+  for (const auto &[I, J] : MaxJJump)
+    dbgs() << formatv("({0}, {1})\n", I, J);
+  dbgs() << "MaxSJump\n";
+  for (const auto &[I, J] : MaxSJump)
+    dbgs() << formatv("({0}, {1})\n", I, J);
+
+  DenseMap<unsigned, unsigned> MaximalJChainsByEnd;
+  findMaximalChains(MaximalJChainsByEnd, MaxJJump, MF->size());
+  dbgs() << "MaxJChains\n";
+  for (const auto &[I, J] : MaximalJChainsByEnd)
+    dbgs() << formatv("({0}, {1})\n", I, J);
+
+  DenseMap<unsigned, unsigned> MaximalSChainsByEnd;
+  findMaximalChains(MaximalSChainsByEnd, MaxSJump, MF->size());
+  dbgs() << "MaxSChains\n";
+  for (const auto &[I, J] : MaximalSChainsByEnd)
+    dbgs() << formatv("({0}, {1})\n", I, J);
+
+  // Algorithm D given by Thorup, for finding a good listing.
+  std::vector<int> Listing(MF->size(), -1);
+  unsigned I = 0;
+  for (int J = MF->size() - 1; J >= 0; --J) {
+    if (Listing[J] < 0)
+      Listing[J] = I++;
+
+    auto It = MaximalSChainsByEnd.find(J);
+    if (It != MaximalSChainsByEnd.end() && Listing[It->second] < 0)
+      Listing[It->second] = I++;
+
+    It = MaximalJChainsByEnd.find(J);
+    if (It != MaximalJChainsByEnd.end() && Listing[It->second] < 0)
+      Listing[It->second] = I++;
+  }
+
+  // Permute blocks into Thorup listing order.
+  {
+    SmallVector<MachineBasicBlock *> OrderedMBBs(MF->size());
+    for (const auto &[I, L] : llvm::enumerate(Listing))
+      OrderedMBBs[L] = MBBs[I];
+
+    MBBs.swap(OrderedMBBs);
+    for (const auto &[I, MBB] : llvm::enumerate(MBBs))
+      MBBIndices[MBB] = I;
+  }
+
+  for (const auto &[I, MBB] : llvm::enumerate(MBBs)) {
+    dbgs() << "I: " << I << '\n';
+    MBB->dump();
+  }
+
+  // Compute the minimum separators for each block. (Thorup Algorithm A).
+  SmallVector<DenseSet<unsigned>> Separators(MF->size());
+  SmallVector<DenseSet<unsigned>> InvSeparators(MF->size());
+  DenseSet<unsigned> DSet;
+  for (int I = MF->size() - 1; I >= 0; --I) {
+    MachineBasicBlock *MBB = MBBs[I];
+    for (MachineBasicBlock *Succ : MBB->successors()) {
+      unsigned H = MBBIndices[Succ];
+      if (H >= (unsigned)I)
+        continue;
+      Separators[I].insert(H);
+      InvSeparators[H].insert(I);
+    }
+    // Note that the graph is considered undirected here.
+    for (MachineBasicBlock *Pred : MBB->predecessors()) {
+      unsigned H = MBBIndices[Pred];
+      if (H >= (unsigned)I)
+        continue;
+      Separators[I].insert(H);
+      InvSeparators[H].insert(I);
+    }
+    for (unsigned W : InvSeparators[I]) {
+      if (!DSet.insert(W).second)
+        continue;
+      for (unsigned H : Separators[W]) {
+        if (H >= (unsigned)I)
+          continue;
+        Separators[I].insert(H);
+        InvSeparators[H].insert(I);
+      }
+    }
+  }
+
+  dbgs() << "Separators:\n";
+  for (unsigned I = 0; I < MF->size(); ++I) {
+    dbgs() << I << ": ";
+    for (unsigned J : Separators[I]) {
+      dbgs() << J << ' ';
+    }
+    dbgs() << '\n';
+  }
+
+  // Thorup, Lemma 12.
+  SmallVector<Node> Tree(MF->size());
+  Tree[0].MBBs = {0};
+  for (unsigned I = 1; I < MF->size(); ++I) {
+    unsigned H = 0;
+    for (unsigned S : Separators[I])
+      H = std::max(H, S);
+    Tree[H].Children.insert(I);
+    Tree[I].MBBs = Separators[I];
+    Tree[I].MBBs.insert(I);
+  }
+  dumpTree(Tree);
 }
 
 bool MOSRegAlloc::nearerNextUse(Register Left, Register Right,
