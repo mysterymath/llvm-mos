@@ -203,6 +203,7 @@ private:
   // Map from value to imaginary register
   DenseMap<Register, Register> ImagAlloc;
 
+  DenseMap<const MachineBasicBlock *, DenseSet<Register>> MBBInRegVals;
   DenseMap<const MachineBasicBlock *, DenseSet<Register>> MBBOutRegVals;
 
   unsigned NumImag16Avail;
@@ -691,6 +692,8 @@ void MOSRegAlloc::assignImagRegs() {
       LLVM_DEBUG(dbgs() << '\n');
     }
 
+    MBBInRegVals[MBB] = RegVals;
+
     const auto Assign = [&](Register R, MachineBasicBlock::iterator Pos) {
       if (NeverImagVals.contains(R))
         return;
@@ -768,6 +771,16 @@ void MOSRegAlloc::assignImagRegs() {
         }
         dbgs() << '\n';
       });
+    }
+  }
+
+  for (MachineBasicBlock &MBB : *MF) {
+    const DenseSet<Register> &OutRegVals = MBBOutRegVals[&MBB];
+    for (MachineBasicBlock *Succ : MBB.successors()) {
+      for (Register R : MBBInRegVals[Succ]) {
+        assert(OutRegVals.contains(R) &&
+               "MBB value reload not yet implemented.");
+      }
     }
   }
 }
