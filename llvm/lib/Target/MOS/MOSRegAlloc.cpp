@@ -827,28 +827,110 @@ static void dumpTree(const SmallVectorImpl<Node> &Tree, unsigned N = 0,
   for (unsigned C : Tree[N].Children)
     dumpTree(Tree, C, Indent + 2);
 }
+
+struct Position {
+  MachineBasicBlock *MBB;
+  MachineBasicBlock::iterator Pos;
+
+  // False if before any moves at this position, true if after any moves at this
+  // position. If before moves, the position is constrained by the
+  // post-conditions of the previous instruction. If after moves, the position
+  // is constrained by the pre-conditions of the next instruction.
+  bool AfterMoves;
+
+  bool operator==(Position Other) const {
+    return MBB == Other.MBB && Pos == Other.Pos &&
+           AfterMoves == Other.AfterMoves;
+  }
+};
+
+} // namespace
+
+template <> struct DenseMapInfo<Position> {
+  static inline Position getEmptyKey() {
+    return Position{
+        DenseMapInfo<MachineBasicBlock *>::getEmptyKey(), {}, false};
+  }
+  static inline Position getTombstoneKey() {
+    return Position{
+        DenseMapInfo<MachineBasicBlock *>::getTombstoneKey(), {}, false};
+  }
+  static unsigned getHashValue(const Position &Val) {
+    MachineInstr *PosMI = Val.Pos == Val.MBB->end() ? nullptr : &*Val.Pos;
+    auto T = std::make_tuple(Val.MBB, PosMI, (char)Val.AfterMoves);
+    return DenseMapInfo<decltype(T)>::getHashValue(T);
+  }
+  static bool isEqual(const Position &LHS, const Position &RHS) {
+    return LHS.MBB == RHS.MBB && LHS.Pos == RHS.Pos &&
+           LHS.AfterMoves == RHS.AfterMoves;
+  }
+};
+
+namespace {
+
+SmallVector<Position> positionSuccessors(Position Pos) {
+  if (!Pos.AfterMoves)
+    return {{Pos.MBB, Pos.Pos, true}};
+  if (Pos.Pos != Pos.MBB->getFirstTerminator())
+    return {{Pos.MBB, std::next(Pos.Pos), false}};
+  SmallVector<Position> Successors;
+  for (MachineBasicBlock *Succ : Pos.MBB->successors())
+    Successors.push_back({Succ, Succ->getFirstNonPHI(), false});
+  return Successors;
+}
+
+SmallVector<Position> positionPredecessors(Position Pos) {
+  if (Pos.AfterMoves)
+    return {{Pos.MBB, Pos.Pos, false}};
+  if (Pos.Pos != Pos.MBB->getFirstNonPHI())
+    return {{Pos.MBB, std::prev(Pos.Pos), true}};
+  SmallVector<Position> Predecessors;
+  for (MachineBasicBlock *Pred : Pos.MBB->predecessors())
+    Predecessors.push_back({Pred, Pred->getFirstTerminator(), true});
+  return Predecessors;
+}
+
 } // namespace
 
 void MOSRegAlloc::decomposeToTree() {
   LLVM_DEBUG(dbgs() << "Producing tree decomposition of basic block graph.\n");
 
-  SmallVector<MachineBasicBlock *> MBBs(MF->size());
-  DenseMap<MachineBasicBlock *, unsigned> MBBIndices;
-  for (const auto &[I, MBB] : llvm::enumerate(*MF)) {
-    MBBs[I] = &MBB;
-    MBBIndices[&MBB] = I;
+  SmallVector<Position> Positions;
+  DenseMap<Position, unsigned> PositionIndices;
+  for (MachineBasicBlock &MBB : *MF) {
+    MachineBasicBlock::iterator E = MBB.getFirstTerminator();
+    for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(); I != E; ++I) {
+      Positions.push_back({&MBB, I, false});
+      PositionIndices[Positions.back()] = Positions.size() - 1;
+      Positions.push_back({&MBB, I, true});
+      PositionIndices[Positions.back()] = Positions.size() - 1;
+    }
+    Positions.push_back({&MBB, E, false});
+    PositionIndices[Positions.back()] = Positions.size() - 1;
+    Positions.push_back({&MBB, E, true});
+    PositionIndices[Positions.back()] = Positions.size() - 1;
   }
 
-  for (const auto &[I, MBB] : llvm::enumerate(MBBs)) {
-    dbgs() << "I: " << I << '\n';
-    MBB->dump();
+  for (const auto [P, I] : PositionIndices) {
+    assert(Positions[I] == P);
+  }
+
+  for (Position P : Positions) {
+    for (Position S : positionSuccessors(P)) {
+      assert(PositionIndices.contains(S));
+      assert(llvm::is_contained(positionPredecessors(S), P));
+    }
+    for (Position S : positionPredecessors(P)) {
+      assert(PositionIndices.contains(S));
+      assert(llvm::is_contained(positionSuccessors(S), P));
+    }
   }
 
   DenseMap<unsigned, unsigned> MaxJJump;
   DenseMap<unsigned, unsigned> MaxSJump;
-  for (const auto &[I, MBB] : llvm::enumerate(MBBs)) {
-    for (MachineBasicBlock *Succ : MBB->successors()) {
-      unsigned J = MBBIndices[Succ];
+  for (const auto &[I, Pos] : llvm::enumerate(Positions)) {
+    for (Position Succ : positionSuccessors(Pos)) {
+      unsigned J = PositionIndices[Succ];
       if (J <= I)
         continue;
       const auto Res = MaxJJump.try_emplace(I, J);
@@ -859,8 +941,8 @@ void MOSRegAlloc::decomposeToTree() {
         Res2.first->second = J;
     }
 
-    for (MachineBasicBlock *Pred : MBB->predecessors()) {
-      unsigned J = MBBIndices[Pred];
+    for (Position Pred : positionPredecessors(Pos)) {
+      unsigned J = PositionIndices[Pred];
       if (J <= I)
         continue;
       const auto Res = MaxSJump.try_emplace(I, J);
@@ -905,36 +987,31 @@ void MOSRegAlloc::decomposeToTree() {
 
   // Permute blocks into Thorup listing order.
   {
-    SmallVector<MachineBasicBlock *> OrderedMBBs(MF->size());
+    SmallVector<Position> OrderedPositions(Positions.size());
     for (const auto &[I, L] : llvm::enumerate(Listing))
-      OrderedMBBs[L] = MBBs[I];
+      OrderedPositions[L] = Positions[I];
 
-    MBBs.swap(OrderedMBBs);
-    for (const auto &[I, MBB] : llvm::enumerate(MBBs))
-      MBBIndices[MBB] = I;
-  }
-
-  for (const auto &[I, MBB] : llvm::enumerate(MBBs)) {
-    dbgs() << "I: " << I << '\n';
-    MBB->dump();
+    Positions.swap(OrderedPositions);
+    for (const auto &[I, Pos] : llvm::enumerate(Positions))
+      PositionIndices[Pos] = I;
   }
 
   // Compute the minimum separators for each block. (Thorup Algorithm A).
   SmallVector<DenseSet<unsigned>> Separators(MF->size());
   SmallVector<DenseSet<unsigned>> InvSeparators(MF->size());
   DenseSet<unsigned> DSet;
-  for (int I = MF->size() - 1; I >= 0; --I) {
-    MachineBasicBlock *MBB = MBBs[I];
-    for (MachineBasicBlock *Succ : MBB->successors()) {
-      unsigned H = MBBIndices[Succ];
+  for (int I = Positions.size() - 1; I >= 0; --I) {
+    Position Pos = Positions[I];
+    for (Position Succ : positionSuccessors(Pos)) {
+      unsigned H = PositionIndices[Succ];
       if (H >= (unsigned)I)
         continue;
       Separators[I].insert(H);
       InvSeparators[H].insert(I);
     }
     // Note that the graph is considered undirected here.
-    for (MachineBasicBlock *Pred : MBB->predecessors()) {
-      unsigned H = MBBIndices[Pred];
+    for (Position Pred : positionPredecessors(Pos)) {
+      unsigned H = PositionIndices[Pred];
       if (H >= (unsigned)I)
         continue;
       Separators[I].insert(H);
