@@ -236,6 +236,7 @@ private:
   DenseMap<const MachineLoop *, DenseSet<Register>> LoopUsedVals;
 
   DenseMap<Position, SmallSet<Register, 8>> PositionLiveVals;
+  DenseMap<Position, unsigned> PositionIndices;
 
   void countAvailImag16Regs();
   void findCSRVals(const MachineDomTreeNode &MDTN,
@@ -243,7 +244,7 @@ private:
   void findNeverImagVals();
   void scanLoops();
   void assignImagRegs();
-  void collectPositionLiveVals();
+  void scanPositions();
   void decomposeToTree();
 
   bool nearerNextUse(Register Left, Register Right,
@@ -266,6 +267,8 @@ private:
   bool isImagPressureOver(const ImagPressure &IP) const;
   void rewriteVReg(Register From, Register To, MachineBasicBlock &MBB,
                    MachineBasicBlock::iterator Pos);
+
+  void dumpTree();
 };
 
 } // namespace
@@ -372,7 +375,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   ImagAlloc.clear();
 
   assignImagRegs();
-  collectPositionLiveVals();
+  scanPositions();
   decomposeToTree();
 
   // Recompute liveness and kill dead instructions.
@@ -832,7 +835,7 @@ void findMaximalChains(DenseMap<unsigned, unsigned> &MaxChainsByEnd,
 }
 
 struct Node {
-  DenseSet<unsigned> MBBs;
+  SmallSet<Position, 5> Positions;
   DenseSet<unsigned> Children;
 };
 
@@ -841,7 +844,7 @@ static void dumpTree(const SmallVectorImpl<Node> &Tree, unsigned N = 0,
   for (unsigned I = 0; I < Indent; ++I)
     dbgs() << ' ';
   dbgs() << N << ": ";
-  for (unsigned M : Tree[N].MBBs)
+  for (unsigned M : Tree[N].Positions)
     dbgs() << M << ' ';
   dbgs() << '\n';
   for (unsigned C : Tree[N].Children)
@@ -896,10 +899,15 @@ SmallVector<Position> positionPredecessors(Position Pos) {
 
 } // namespace
 
-void MOSRegAlloc::collectPositionLiveVals() {
+void MOSRegAlloc::scanPositions() {
   LLVM_DEBUG(dbgs() << "Collecting live vals for each position.\n");
 
+  PositionLiveVals.clear();
+  LLVM_DEBUG(PositionIndices.clear());
+
   SmallSet<Register, 8> LiveVals;
+  unsigned Idx = 0;
+  (void)Idx;
   for (MachineBasicBlock &MBB : *MF) {
     for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
       Register R = Register::index2VirtReg(I);
@@ -910,8 +918,14 @@ void MOSRegAlloc::collectPositionLiveVals() {
     MachineBasicBlock::iterator E = MBB.getFirstTerminator();
     for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(); I != E; ++I) {
       const MachineInstr &MI = *I;
-      PositionLiveVals[Position{&MBB, I, false}] = LiveVals;
-      PositionLiveVals[Position{&MBB, I, true}] = LiveVals;
+      Position Before = {&MBB, I, false};
+      Position After = {&MBB, I, true};
+      PositionLiveVals[Before] = LiveVals;
+      PositionLiveVals[After] = LiveVals;
+      LLVM_DEBUG({
+        PositionIndices[Before] = Idx++;
+        PositionIndices[After] = Idx++;
+      });
       for (const MachineOperand &MO : MI.defs())
         if (MO.isEarlyClobber() && MO.getReg().isVirtual())
           LiveVals.insert(MO.getReg());
@@ -925,8 +939,14 @@ void MOSRegAlloc::collectPositionLiveVals() {
         if (MO.isDead())
           LiveVals.erase(MO.getReg());
     }
-    PositionLiveVals[Position{&MBB, E, false}] = LiveVals;
-    PositionLiveVals[Position{&MBB, E, true}] = LiveVals;
+    Position Before = {&MBB, E, false};
+    Position After = {&MBB, E, true};
+    PositionLiveVals[Before] = LiveVals;
+    PositionLiveVals[After] = LiveVals;
+    LLVM_DEBUG({
+      PositionIndices[Before] = Idx++;
+      PositionIndices[After] = Idx++;
+    });
   }
 }
 
