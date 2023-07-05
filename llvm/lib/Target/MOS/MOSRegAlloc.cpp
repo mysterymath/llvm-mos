@@ -905,20 +905,9 @@ void MOSRegAlloc::scanPositions() {
         LiveVals.insert(R);
     }
 
-    for (MachineInstr &MI : MBB.phis()) {
-      for (const MachineOperand &MO : MI.defs())
-        if (MO.isEarlyClobber() && MO.getReg().isVirtual())
-          LiveVals.insert(MO.getReg());
-      for (const MachineOperand &MO : MI.uses())
-        if (MO.isReg() && MO.isKill())
-          LiveVals.erase(MO.getReg());
-      for (const MachineOperand &MO : MI.defs())
-        if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
-          LiveVals.insert(MO.getReg());
-      for (const MachineOperand &MO : MI.defs())
-        if (MO.isDead())
-          LiveVals.erase(MO.getReg());
-    }
+    for (MachineInstr &MI : MBB.phis())
+      if (!MI.getOperand(0).isDead())
+        LiveVals.insert(MI.getOperand(0).getReg());
 
     MachineBasicBlock::iterator E = MBB.getFirstTerminator();
     for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(); I != E; ++I) {
