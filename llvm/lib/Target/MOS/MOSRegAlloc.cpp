@@ -171,6 +171,22 @@ public:
   }
 };
 
+struct Position {
+  MachineBasicBlock *MBB;
+  MachineBasicBlock::iterator Pos;
+
+  // False if before any moves at this position, true if after any moves at this
+  // position. If before moves, the position is constrained by the
+  // post-conditions of the previous instruction. If after moves, the position
+  // is constrained by the pre-conditions of the next instruction.
+  bool AfterMoves;
+
+  bool operator==(Position Other) const {
+    return MBB == Other.MBB && Pos == Other.Pos &&
+           AfterMoves == Other.AfterMoves;
+  }
+};
+
 class MOSRegAlloc : public MachineFunctionPass {
 public:
   static char ID;
@@ -219,12 +235,15 @@ private:
   // Values used anywhere within each loop
   DenseMap<const MachineLoop *, DenseSet<Register>> LoopUsedVals;
 
+  DenseMap<Position, SmallSet<Register, 8>> PositionLiveVals;
+
   void countAvailImag16Regs();
   void findCSRVals(const MachineDomTreeNode &MDTN,
                    const SmallSet<Register, 8> &DomLiveOutVals = {});
   void findNeverImagVals();
   void scanLoops();
   void assignImagRegs();
+  void collectPositionLiveVals();
   void decomposeToTree();
 
   bool nearerNextUse(Register Left, Register Right,
@@ -353,6 +372,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   ImagAlloc.clear();
 
   assignImagRegs();
+  collectPositionLiveVals();
   decomposeToTree();
 
   // Recompute liveness and kill dead instructions.
@@ -828,22 +848,6 @@ static void dumpTree(const SmallVectorImpl<Node> &Tree, unsigned N = 0,
     dumpTree(Tree, C, Indent + 2);
 }
 
-struct Position {
-  MachineBasicBlock *MBB;
-  MachineBasicBlock::iterator Pos;
-
-  // False if before any moves at this position, true if after any moves at this
-  // position. If before moves, the position is constrained by the
-  // post-conditions of the previous instruction. If after moves, the position
-  // is constrained by the pre-conditions of the next instruction.
-  bool AfterMoves;
-
-  bool operator==(Position Other) const {
-    return MBB == Other.MBB && Pos == Other.Pos &&
-           AfterMoves == Other.AfterMoves;
-  }
-};
-
 } // namespace
 
 template <> struct DenseMapInfo<Position> {
@@ -891,6 +895,40 @@ SmallVector<Position> positionPredecessors(Position Pos) {
 }
 
 } // namespace
+
+void MOSRegAlloc::collectPositionLiveVals() {
+  LLVM_DEBUG(dbgs() << "Collecting live vals for each position.\n");
+
+  SmallSet<Register, 8> LiveVals;
+  for (MachineBasicBlock &MBB : *MF) {
+    for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
+      Register R = Register::index2VirtReg(I);
+      if (!MRI->use_nodbg_empty(R) && LV->isLiveIn(R, MBB))
+        LiveVals.insert(R);
+    }
+
+    MachineBasicBlock::iterator E = MBB.getFirstTerminator();
+    for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(); I != E; ++I) {
+      const MachineInstr &MI = *I;
+      PositionLiveVals[Position{&MBB, I, false}] = LiveVals;
+      PositionLiveVals[Position{&MBB, I, true}] = LiveVals;
+      for (const MachineOperand &MO : MI.defs())
+        if (MO.isEarlyClobber() && MO.getReg().isVirtual())
+          LiveVals.insert(MO.getReg());
+      for (const MachineOperand &MO : MI.uses())
+        if (MO.isReg() && MO.isKill())
+          LiveVals.erase(MO.getReg());
+      for (const MachineOperand &MO : MI.defs())
+        if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
+          LiveVals.insert(MO.getReg());
+      for (const MachineOperand &MO : MI.defs())
+        if (MO.isDead())
+          LiveVals.erase(MO.getReg());
+    }
+    PositionLiveVals[Position{&MBB, E, false}] = LiveVals;
+    PositionLiveVals[Position{&MBB, E, true}] = LiveVals;
+  }
+}
 
 void MOSRegAlloc::decomposeToTree() {
   LLVM_DEBUG(dbgs() << "Producing tree decomposition of basic block graph.\n");
