@@ -382,6 +382,9 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   ImagAlloc.clear();
 
   assignImagRegs();
+
+  // TODO: Recompute liveness flags and kill dead instructions. Still in SSA.
+
   scanPositions();
   decomposeToTree();
 
@@ -905,56 +908,62 @@ void MOSRegAlloc::scanPositions() {
         LiveVals.insert(R);
     }
 
-    for (MachineInstr &MI : MBB.phis())
+    for (MachineInstr &MI : MBB.phis()) {
       if (!MI.getOperand(0).isDead())
         LiveVals.insert(MI.getOperand(0).getReg());
+    }
+
+    const auto DumpPos = [&](Position Pos) {
+      dbgs() << PositionIndices[Pos] << ":";
+      if (Pos.AfterMoves)
+        dbgs() << " after moves";
+      else
+        dbgs() << " before moves";
+      dbgs() << " %bb." << Pos.MBB->getNumber() << ':';
+      if (Pos.Pos == Pos.MBB->end())
+        dbgs() << " end\n";
+      else
+        dbgs() << ' ' << *Pos.Pos;
+      dbgs() << "Live vals:";
+      for (Register R : LiveVals)
+        dbgs() << ' ' << printReg(R);
+      dbgs() << '\n';
+    };
+    (void)DumpPos;
+
+    const auto RecordPos = [&](Position Pos) {
+      PositionLiveVals[Pos] = LiveVals;
+      LLVM_DEBUG({
+        PositionIndices[Pos] = Idx++;
+        DumpPos(Pos);
+      });
+    };
 
     MachineBasicBlock::iterator E = MBB.getFirstTerminator();
+    RecordPos({&MBB, MBB.getFirstNonPHI(), false});
     for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(); I != E; ++I) {
       const MachineInstr &MI = *I;
-      Position Before = {&MBB, I, false};
-      Position After = {&MBB, I, true};
-      PositionLiveVals[Before] = LiveVals;
-      PositionLiveVals[After] = LiveVals;
-      LLVM_DEBUG({
-        dbgs() << Idx << ',' << Idx + 1 << ": %bb." << MBB.getNumber() << ": "
-               << *I;
-        dbgs() << "Live vals: ";
-        for (Register R : LiveVals)
-          dbgs() << printReg(R) << ' ';
-        dbgs() << '\n';
 
-        PositionIndices[Before] = Idx++;
-        PositionIndices[After] = Idx++;
-      });
       for (const MachineOperand &MO : MI.defs())
         if (MO.isEarlyClobber() && MO.getReg().isVirtual())
           LiveVals.insert(MO.getReg());
+
+      RecordPos({&MBB, I, true});
+
       for (const MachineOperand &MO : MI.uses())
         if (MO.isReg() && MO.isKill())
           LiveVals.erase(MO.getReg());
       for (const MachineOperand &MO : MI.defs())
         if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
           LiveVals.insert(MO.getReg());
+
+      RecordPos({&MBB, std::next(I), false});
+
       for (const MachineOperand &MO : MI.defs())
         if (MO.isDead())
           LiveVals.erase(MO.getReg());
     }
-    Position Before = {&MBB, E, false};
-    Position After = {&MBB, E, true};
-    PositionLiveVals[Before] = LiveVals;
-    PositionLiveVals[After] = LiveVals;
-    LLVM_DEBUG({
-      dbgs() << Idx << ',' << Idx + 1 << ": %bb." << MBB.getNumber()
-             << ": End\n";
-      dbgs() << "Live vals: ";
-      for (Register R : LiveVals)
-        dbgs() << printReg(R) << ' ';
-      dbgs() << '\n';
-
-      PositionIndices[Before] = Idx++;
-      PositionIndices[After] = Idx++;
-    });
+    RecordPos({&MBB, E, true});
   }
 }
 
