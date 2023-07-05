@@ -187,6 +187,11 @@ struct Position {
   }
 };
 
+struct Node {
+  SmallVector<Position> Positions;
+  SmallVector<Node *> Children;
+};
+
 class MOSRegAlloc : public MachineFunctionPass {
 public:
   static char ID;
@@ -238,6 +243,8 @@ private:
   DenseMap<Position, SmallSet<Register, 8>> PositionLiveVals;
   DenseMap<Position, unsigned> PositionIndices;
 
+  std::vector<Node> Tree;
+
   void countAvailImag16Regs();
   void findCSRVals(const MachineDomTreeNode &MDTN,
                    const SmallSet<Register, 8> &DomLiveOutVals = {});
@@ -268,7 +275,7 @@ private:
   void rewriteVReg(Register From, Register To, MachineBasicBlock &MBB,
                    MachineBasicBlock::iterator Pos);
 
-  void dumpTree();
+  void dumpTree(Node *Root = nullptr, unsigned Indent = 0);
 };
 
 } // namespace
@@ -834,23 +841,6 @@ void findMaximalChains(DenseMap<unsigned, unsigned> &MaxChainsByEnd,
   }
 }
 
-struct Node {
-  SmallSet<Position, 5> Positions;
-  DenseSet<unsigned> Children;
-};
-
-static void dumpTree(const SmallVectorImpl<Node> &Tree, unsigned N = 0,
-                     unsigned Indent = 0) {
-  for (unsigned I = 0; I < Indent; ++I)
-    dbgs() << ' ';
-  dbgs() << N << ": ";
-  for (unsigned M : Tree[N].Positions)
-    dbgs() << M << ' ';
-  dbgs() << '\n';
-  for (unsigned C : Tree[N].Children)
-    dumpTree(Tree, C, Indent + 2);
-}
-
 } // namespace
 
 template <> struct DenseMapInfo<Position> {
@@ -915,6 +905,21 @@ void MOSRegAlloc::scanPositions() {
         LiveVals.insert(R);
     }
 
+    for (MachineInstr &MI : MBB.phis()) {
+      for (const MachineOperand &MO : MI.defs())
+        if (MO.isEarlyClobber() && MO.getReg().isVirtual())
+          LiveVals.insert(MO.getReg());
+      for (const MachineOperand &MO : MI.uses())
+        if (MO.isReg() && MO.isKill())
+          LiveVals.erase(MO.getReg());
+      for (const MachineOperand &MO : MI.defs())
+        if (!MO.isEarlyClobber() && MO.getReg().isVirtual())
+          LiveVals.insert(MO.getReg());
+      for (const MachineOperand &MO : MI.defs())
+        if (MO.isDead())
+          LiveVals.erase(MO.getReg());
+    }
+
     MachineBasicBlock::iterator E = MBB.getFirstTerminator();
     for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(); I != E; ++I) {
       const MachineInstr &MI = *I;
@@ -923,6 +928,13 @@ void MOSRegAlloc::scanPositions() {
       PositionLiveVals[Before] = LiveVals;
       PositionLiveVals[After] = LiveVals;
       LLVM_DEBUG({
+        dbgs() << Idx << ',' << Idx + 1 << ": %bb." << MBB.getNumber() << ": "
+               << *I;
+        dbgs() << "Live vals: ";
+        for (Register R : LiveVals)
+          dbgs() << printReg(R) << ' ';
+        dbgs() << '\n';
+
         PositionIndices[Before] = Idx++;
         PositionIndices[After] = Idx++;
       });
@@ -944,6 +956,13 @@ void MOSRegAlloc::scanPositions() {
     PositionLiveVals[Before] = LiveVals;
     PositionLiveVals[After] = LiveVals;
     LLVM_DEBUG({
+      dbgs() << Idx << ',' << Idx + 1 << ": %bb." << MBB.getNumber()
+             << ": End\n";
+      dbgs() << "Live vals: ";
+      for (Register R : LiveVals)
+        dbgs() << printReg(R) << ' ';
+      dbgs() << '\n';
+
       PositionIndices[Before] = Idx++;
       PositionIndices[After] = Idx++;
     });
@@ -969,29 +988,14 @@ void MOSRegAlloc::decomposeToTree() {
     PositionIndices[Positions.back()] = Positions.size() - 1;
   }
 
-  for (const auto [P, I] : PositionIndices)
-    assert(Positions[I] == P);
-  for (Position P : Positions) {
-    for (Position S : positionSuccessors(P)) {
-      assert(PositionIndices.contains(S));
-      assert(llvm::is_contained(positionPredecessors(S), P));
-    }
-    for (Position S : positionPredecessors(P)) {
-      assert(PositionIndices.contains(S));
-      assert(llvm::is_contained(positionSuccessors(S), P));
-    }
-  }
-
   DenseMap<unsigned, unsigned> MaxJJump;
   DenseMap<unsigned, unsigned> MaxSJump;
   for (MachineBasicBlock &MBB : *MF) {
     Position From = {&MBB, MBB.getFirstTerminator(), true};
-    assert(PositionIndices.contains(From));
     unsigned I = PositionIndices[From];
 
     for (MachineBasicBlock *Succ : MBB.successors()) {
       Position To = {Succ, Succ->getFirstNonPHI(), false};
-      assert(PositionIndices.contains(To));
       unsigned J = PositionIndices[To];
       assert(I != J);
       if (I < J) {
@@ -1055,8 +1059,8 @@ void MOSRegAlloc::decomposeToTree() {
   }
 
   // Compute the minimum separators for each block. (Thorup Algorithm A).
-  SmallVector<DenseSet<unsigned>> Separators(Positions.size());
-  SmallVector<DenseSet<unsigned>> InvSeparators(Positions.size());
+  SmallVector<SmallSet<unsigned, 5>> Separators(Positions.size());
+  SmallVector<SmallSet<unsigned, 5>> InvSeparators(Positions.size());
   DenseSet<unsigned> DSet;
   for (int I = Positions.size() - 1; I >= 0; --I) {
     Position Pos = Positions[I];
@@ -1097,17 +1101,28 @@ void MOSRegAlloc::decomposeToTree() {
   }
 
   // Thorup, Lemma 12.
-  SmallVector<Node> Tree(Positions.size());
-  Tree[0].MBBs = {0};
+  SmallVector<SmallSet<unsigned, 5>> NodePositions(Positions.size());
+  SmallVector<SmallSet<unsigned, 5>> NodeChildren(Positions.size());
+  NodePositions[0].insert(0);
   for (unsigned I = 1; I < Positions.size(); ++I) {
     unsigned H = 0;
     for (unsigned S : Separators[I])
       H = std::max(H, S);
-    Tree[H].Children.insert(I);
-    Tree[I].MBBs = Separators[I];
-    Tree[I].MBBs.insert(I);
+    NodeChildren[H].insert(I);
+    NodePositions[I] = Separators[I];
+    NodePositions[I].insert(I);
   }
-  dumpTree(Tree);
+
+  Tree.clear();
+  Tree.resize(Positions.size());
+  for (unsigned I = 0, E = Positions.size(); I != E; ++I) {
+    for (unsigned P : NodePositions[I])
+      Tree[I].Positions.push_back(Positions[P]);
+    for (unsigned C : NodeChildren[I])
+      Tree[I].Children.push_back(&Tree[C]);
+  }
+
+  dumpTree();
 }
 
 bool MOSRegAlloc::nearerNextUse(Register Left, Register Right,
@@ -1367,6 +1382,20 @@ void MOSRegAlloc::rewriteVReg(Register From, Register To,
     LV->recomputeForSingleDefVirtReg(R);
   for (Register R : AffectedRegs)
     recomputeNextUseDists(R);
+}
+
+void MOSRegAlloc::dumpTree(Node *Root, unsigned Indent) {
+  if (!Root)
+    Root = &Tree[0];
+  for (unsigned I = 0; I < Indent; ++I)
+    dbgs() << ' ';
+  dbgs() << Root - &Tree[0] << ": ";
+  for (Position P : Root->Positions) {
+    dbgs() << PositionIndices[P] << ' ';
+  }
+  dbgs() << '\n';
+  for (Node *C : Root->Children)
+    dumpTree(C, Indent + 2);
 }
 
 char MOSRegAlloc::ID = 0;
