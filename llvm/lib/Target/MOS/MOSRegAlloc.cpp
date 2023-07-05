@@ -911,10 +911,8 @@ void MOSRegAlloc::decomposeToTree() {
     PositionIndices[Positions.back()] = Positions.size() - 1;
   }
 
-  for (const auto [P, I] : PositionIndices) {
+  for (const auto [P, I] : PositionIndices)
     assert(Positions[I] == P);
-  }
-
   for (Position P : Positions) {
     for (Position S : positionSuccessors(P)) {
       assert(PositionIndices.contains(S));
@@ -928,26 +926,28 @@ void MOSRegAlloc::decomposeToTree() {
 
   DenseMap<unsigned, unsigned> MaxJJump;
   DenseMap<unsigned, unsigned> MaxSJump;
-  for (const auto &[I, Pos] : llvm::enumerate(Positions)) {
-    for (Position Succ : positionSuccessors(Pos)) {
-      unsigned J = PositionIndices[Succ];
-      if (J <= I)
-        continue;
-      const auto Res = MaxJJump.try_emplace(I, J);
-      if (!Res.second && J > Res.first->second)
-        Res.first->second = J;
-      const auto Res2 = MaxSJump.try_emplace(I, J);
-      if (!Res2.second && J > Res2.first->second)
-        Res2.first->second = J;
-    }
+  for (MachineBasicBlock &MBB : *MF) {
+    Position From = {&MBB, MBB.getFirstTerminator(), true};
+    assert(PositionIndices.contains(From));
+    unsigned I = PositionIndices[From];
 
-    for (Position Pred : positionPredecessors(Pos)) {
-      unsigned J = PositionIndices[Pred];
-      if (J <= I)
-        continue;
-      const auto Res = MaxSJump.try_emplace(I, J);
-      if (!Res.second && J > Res.first->second)
-        Res.first->second = J;
+    for (MachineBasicBlock *Succ : MBB.successors()) {
+      Position To = {Succ, Succ->getFirstNonPHI(), false};
+      assert(PositionIndices.contains(To));
+      unsigned J = PositionIndices[To];
+      assert(I != J);
+      if (I < J) {
+        const auto Res = MaxJJump.try_emplace(I, J);
+        if (!Res.second && J > Res.first->second)
+          Res.first->second = J;
+        const auto Res2 = MaxSJump.try_emplace(I, J);
+        if (!Res2.second && J > Res2.first->second)
+          Res2.first->second = J;
+      } else {
+        const auto Res = MaxSJump.try_emplace(J, I);
+        if (!Res.second && I > Res.first->second)
+          Res.first->second = I;
+      }
     }
   }
   dbgs() << "MaxJJump\n";
