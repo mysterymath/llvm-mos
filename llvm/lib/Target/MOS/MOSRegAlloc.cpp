@@ -958,21 +958,21 @@ void MOSRegAlloc::decomposeToTree() {
     dbgs() << formatv("({0}, {1})\n", I, J);
 
   DenseMap<unsigned, unsigned> MaximalJChainsByEnd;
-  findMaximalChains(MaximalJChainsByEnd, MaxJJump, MF->size());
+  findMaximalChains(MaximalJChainsByEnd, MaxJJump, Positions.size());
   dbgs() << "MaxJChains\n";
   for (const auto &[I, J] : MaximalJChainsByEnd)
     dbgs() << formatv("({0}, {1})\n", I, J);
 
   DenseMap<unsigned, unsigned> MaximalSChainsByEnd;
-  findMaximalChains(MaximalSChainsByEnd, MaxSJump, MF->size());
+  findMaximalChains(MaximalSChainsByEnd, MaxSJump, Positions.size());
   dbgs() << "MaxSChains\n";
   for (const auto &[I, J] : MaximalSChainsByEnd)
     dbgs() << formatv("({0}, {1})\n", I, J);
 
   // Algorithm D given by Thorup, for finding a good listing.
-  std::vector<int> Listing(MF->size(), -1);
+  std::vector<int> Listing(Positions.size(), -1);
   unsigned I = 0;
-  for (int J = MF->size() - 1; J >= 0; --J) {
+  for (int J = Positions.size() - 1; J >= 0; --J) {
     if (Listing[J] < 0)
       Listing[J] = I++;
 
@@ -997,8 +997,8 @@ void MOSRegAlloc::decomposeToTree() {
   }
 
   // Compute the minimum separators for each block. (Thorup Algorithm A).
-  SmallVector<DenseSet<unsigned>> Separators(MF->size());
-  SmallVector<DenseSet<unsigned>> InvSeparators(MF->size());
+  SmallVector<DenseSet<unsigned>> Separators(Positions.size());
+  SmallVector<DenseSet<unsigned>> InvSeparators(Positions.size());
   DenseSet<unsigned> DSet;
   for (int I = Positions.size() - 1; I >= 0; --I) {
     Position Pos = Positions[I];
@@ -1030,7 +1030,7 @@ void MOSRegAlloc::decomposeToTree() {
   }
 
   dbgs() << "Separators:\n";
-  for (unsigned I = 0; I < MF->size(); ++I) {
+  for (unsigned I = 0; I < Positions.size(); ++I) {
     dbgs() << I << ": ";
     for (unsigned J : Separators[I]) {
       dbgs() << J << ' ';
@@ -1039,9 +1039,9 @@ void MOSRegAlloc::decomposeToTree() {
   }
 
   // Thorup, Lemma 12.
-  SmallVector<Node> Tree(MF->size());
+  SmallVector<Node> Tree(Positions.size());
   Tree[0].MBBs = {0};
-  for (unsigned I = 1; I < MF->size(); ++I) {
+  for (unsigned I = 1; I < Positions.size(); ++I) {
     unsigned H = 0;
     for (unsigned S : Separators[I])
       H = std::max(H, S);
