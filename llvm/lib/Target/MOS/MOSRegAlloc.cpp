@@ -188,8 +188,22 @@ struct Position {
 };
 
 struct Node {
+  enum class Type { Intro, Forget, Join };
+
   SmallVector<Position> Positions;
   SmallVector<Node *> Children;
+
+  Type getType() const {
+    if (Children.empty())
+      return Type::Intro;
+    if (Children.size() > 1)
+      return Type::Join;
+    Node *Child = Children[0];
+    assert(Child->Positions.size() != Positions.size() &&
+           "Node must be either introduce or forget.");
+    return Child->Positions.size() > Positions.size() ? Type::Forget
+                                                      : Type::Intro;
+  }
 };
 
 class MOSRegAlloc : public MachineFunctionPass {
@@ -1159,7 +1173,7 @@ void MOSRegAlloc::decomposeToTree() {
     }
 
     if (NumRemoved > 1 || (NumRemoved && NumInserted)) {
-      unsigned NewChild = NodeChildren.size();
+      unsigned NewChild = NodePositions.size();
       NodePositions.emplace_back();
       NodePositions[NewChild] = NodePositions[Root];
       NodePositions[NewChild].erase(ARemoved);
@@ -1173,7 +1187,7 @@ void MOSRegAlloc::decomposeToTree() {
     }
 
     if (NumInserted > 1) {
-      unsigned NewChild = NodeChildren.size();
+      unsigned NewChild = NodePositions.size();
       NodePositions.emplace_back();
       NodePositions[NewChild] = NodePositions[Root];
       NodePositions[NewChild].insert(AnInserted);
@@ -1190,6 +1204,13 @@ void MOSRegAlloc::decomposeToTree() {
       MakeSubTreeNice(C);
   };
   MakeSubTreeNice(0);
+  // Make the root node have no positions
+  unsigned RootCopy = NodePositions.size();
+  NodePositions.push_back(NodePositions[0]);
+  NodeChildren.push_back(NodeChildren[0]);
+  NodePositions[0].clear();
+  NodeChildren[0].clear();
+  NodeChildren[0].insert(RootCopy);
 
   Tree.clear();
   Tree.resize(NodePositions.size());
@@ -1467,7 +1488,19 @@ void MOSRegAlloc::dumpTree(Node *Root, unsigned Indent) {
     Root = &Tree[0];
   for (unsigned I = 0; I < Indent; ++I)
     dbgs() << ' ';
-  dbgs() << Root - &Tree[0] << ": ";
+  dbgs() << Root - &Tree[0];
+  switch (Root->getType()) {
+  case Node::Type::Forget:
+    dbgs() << 'F';
+    break;
+  case Node::Type::Intro:
+    dbgs() << 'I';
+    break;
+  case Node::Type::Join:
+    dbgs() << 'J';
+    break;
+  }
+  dbgs() << ": ";
   for (Position P : Root->Positions) {
     dbgs() << PositionIndices[P] << ' ';
   }
