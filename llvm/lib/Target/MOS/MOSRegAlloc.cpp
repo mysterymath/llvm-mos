@@ -1111,9 +1111,89 @@ void MOSRegAlloc::decomposeToTree() {
     NodePositions[I].insert(I);
   }
 
+  // Produce a "nice" tree decomposition, where the position set differs by at
+  // most one node between parents and children, and nodes with multiple
+  // children have the same position set as their children.
+  std::function<void(unsigned)> MakeSubTreeNice = [&](unsigned Root) {
+    if (NodeChildren[Root].size() > 1) {
+      SmallSet<unsigned, 5> JoinChildren;
+      while (!NodeChildren[Root].empty()) {
+        unsigned Child = *NodeChildren[Root].begin();
+        NodeChildren[Root].erase(Child);
+        if (NodePositions[Root] != NodePositions[Child]) {
+          unsigned NewChild = NodeChildren.size();
+          NodePositions.emplace_back();
+          NodePositions[NewChild] = NodePositions[Root];
+          NodeChildren.emplace_back();
+          NodeChildren[NewChild].insert(Child);
+          Child = NewChild;
+        }
+        JoinChildren.insert(Child);
+      }
+      NodeChildren[Root] = std::move(JoinChildren);
+      for (unsigned C : NodeChildren[Root])
+        MakeSubTreeNice(C);
+      return;
+    }
+
+    SmallSet<unsigned, 5> ChildPositions;
+    if (NodeChildren[Root].size() == 1) {
+      unsigned Child = *NodeChildren[Root].begin();
+      ChildPositions = NodePositions[Child];
+    }
+    unsigned NumRemoved = 0;
+    unsigned ARemoved;
+    for (unsigned P : NodePositions[Root]) {
+      if (!ChildPositions.contains(P)) {
+        NumRemoved++;
+        ARemoved = P;
+      }
+    }
+    unsigned NumInserted = 0;
+    unsigned AnInserted;
+    for (unsigned P : ChildPositions) {
+      if (!NodePositions[Root].contains(P)) {
+        NumInserted++;
+        AnInserted = P;
+      }
+    }
+
+    if (NumRemoved > 1 || (NumRemoved && NumInserted)) {
+      unsigned NewChild = NodeChildren.size();
+      NodePositions.emplace_back();
+      NodePositions[NewChild] = NodePositions[Root];
+      NodePositions[NewChild].erase(ARemoved);
+      NodeChildren.emplace_back();
+      if (NodeChildren[Root].size() == 1)
+        NodeChildren[NewChild].insert(*NodeChildren[Root].begin());
+      NodeChildren[Root].clear();
+      NodeChildren[Root].insert(NewChild);
+      MakeSubTreeNice(NewChild);
+      return;
+    }
+
+    if (NumInserted > 1) {
+      unsigned NewChild = NodeChildren.size();
+      NodePositions.emplace_back();
+      NodePositions[NewChild] = NodePositions[Root];
+      NodePositions[NewChild].insert(AnInserted);
+      NodeChildren.emplace_back();
+      if (NodeChildren[Root].size() == 1)
+        NodeChildren[NewChild].insert(*NodeChildren[Root].begin());
+      NodeChildren[Root].clear();
+      NodeChildren[Root].insert(NewChild);
+      MakeSubTreeNice(NewChild);
+      return;
+    }
+
+    for (unsigned C : NodeChildren[Root])
+      MakeSubTreeNice(C);
+  };
+  MakeSubTreeNice(0);
+
   Tree.clear();
-  Tree.resize(Positions.size());
-  for (unsigned I = 0, E = Positions.size(); I != E; ++I) {
+  Tree.resize(NodePositions.size());
+  for (unsigned I = 0, E = NodePositions.size(); I != E; ++I) {
     for (unsigned P : NodePositions[I])
       Tree[I].Positions.push_back(Positions[P]);
     for (unsigned C : NodeChildren[I])
