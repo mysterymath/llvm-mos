@@ -189,16 +189,17 @@ struct Position {
 
 // Map from physical register to the value it holds. NoReg (0) means that the
 // register is free. If a register is not in the map, it is unconstrained.
-typedef DenseMap<Register, Register> Alloc;
 
 struct Node {
+  typedef DenseMap<Register, Register> Alloc;
+
   enum class Type { Intro, Forget, Join };
 
   SmallVector<Position> Positions;
   SmallVector<Node *> Children;
 
   struct AllocCost {
-    SmallVector<Alloc> PosAllocs;
+    DenseMap<Position, Alloc> PosAllocs;
     unsigned Cost;
   };
 
@@ -206,7 +207,7 @@ struct Node {
   // for allocations not mentioned are unknown, therefore the best known cost is
   // taken as infinite. Costs whose calculation involves positions in this node
   // are not included.
-  SmallVector<AllocCost> AllocCosts;
+  SmallVector<AllocCost, 0> AllocCosts;
 
   Type getType() const {
     if (Children.empty())
@@ -283,7 +284,7 @@ private:
   void scanPositions();
   void decomposeToTree();
 
-  void improveSubtree(Node *Root);
+  unsigned improveSubtree(Node *Root);
 
   bool nearerNextUse(Register Left, Register Right,
                      const MachineBasicBlock &MBB,
@@ -419,15 +420,10 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   scanPositions();
   decomposeToTree();
 
-  unsigned BestCost;
+  Node::AllocCost *BestAllocCost;
   for (int I = 0; I < 10000; ++I) {
-    improveSubtree(&Tree[0]);
-
-    assert(!Tree[0].AllocCosts.empty() && "Could not find solution.");
-    assert(Tree[0].AllocCosts.size() == 1 &&
-           "Root should have at most one best solution.");
-    BestCost = Tree[0].AllocCosts[0].Cost;
-    LLVM_DEBUG(dbgs() << "Best Cost: " << BestCost << '\n');
+    BestAllocCost = &Tree[0].AllocCosts[improveSubtree(&Tree[0])];
+    LLVM_DEBUG(dbgs() << "Best Cost: " << BestAllocCost->Cost << '\n');
   }
 
   // Recompute liveness and kill dead instructions.
@@ -1252,14 +1248,37 @@ void MOSRegAlloc::decomposeToTree() {
   dumpTree();
 }
 
-void MOSRegAlloc::improveSubtree(Node *Root) {
+unsigned MOSRegAlloc::improveSubtree(Node *Root) {
   switch (Root->getType()) {
   case Node::Type::Forget:
-    break;
-  case Node::Type::Intro:
-    break;
+    return 0;
+  case Node::Type::Intro: {
+    Node *Child = Root->Children[0];
+    Position IntroducedPos;
+    for (Position P : Root->Positions) {
+      if (llvm::is_contained(Child->Positions, P)) {
+        IntroducedPos = P;
+        break;
+      }
+    }
+
+    Node::AllocCost *ChildImprovement =
+        &Child->AllocCosts[improveSubtree(Child)];
+    Node::AllocCost AC = *ChildImprovement;
+    AC.PosAllocs[IntroducedPos] = Node::Alloc{};
+    for (Node::AllocCost &CurAC : Root->AllocCosts) {
+      if (CurAC.PosAllocs != AC.PosAllocs)
+        continue;
+      assert(AC.Cost < CurAC.Cost &&
+             "Improving a child should always improve an introduce node.");
+      CurAC.Cost = AC.Cost;
+      return &CurAC - Root->AllocCosts.begin();
+    }
+    Root->AllocCosts.push_back(std::move(AC));
+    return Root->AllocCosts.size() - 1;
+  }
   case Node::Type::Join:
-    break;
+    return 0;
   }
 }
 
