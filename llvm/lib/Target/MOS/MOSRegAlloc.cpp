@@ -187,11 +187,26 @@ struct Position {
   }
 };
 
+// Map from physical register to the value it holds. NoReg (0) means that the
+// register is free. If a register is not in the map, it is unconstrained.
+typedef DenseMap<Register, Register> Alloc;
+
 struct Node {
   enum class Type { Intro, Forget, Join };
 
   SmallVector<Position> Positions;
   SmallVector<Node *> Children;
+
+  struct AllocCost {
+    SmallVector<Alloc> PosAllocs;
+    unsigned Cost;
+  };
+
+  // Best known cost for the subtree at this node for various allocations. Costs
+  // for allocations not mentioned are unknown, therefore the best known cost is
+  // taken as infinite. Costs whose calculation involves positions in this node
+  // are not included.
+  SmallVector<AllocCost> AllocCosts;
 
   Type getType() const {
     if (Children.empty())
@@ -267,6 +282,8 @@ private:
   void assignImagRegs();
   void scanPositions();
   void decomposeToTree();
+
+  void improveSubtree(Node *Root);
 
   bool nearerNextUse(Register Left, Register Right,
                      const MachineBasicBlock &MBB,
@@ -401,6 +418,17 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
   scanPositions();
   decomposeToTree();
+
+  unsigned BestCost;
+  for (int I = 0; I < 10000; ++I) {
+    improveSubtree(&Tree[0]);
+
+    assert(!Tree[0].AllocCosts.empty() && "Could not find solution.");
+    assert(Tree[0].AllocCosts.size() == 1 &&
+           "Root should have at most one best solution.");
+    BestCost = Tree[0].AllocCosts[0].Cost;
+    LLVM_DEBUG(dbgs() << "Best Cost: " << BestCost << '\n');
+  }
 
   // Recompute liveness and kill dead instructions.
   for (MachineBasicBlock *MBB : post_order(&MF)) {
@@ -1222,6 +1250,17 @@ void MOSRegAlloc::decomposeToTree() {
   }
 
   dumpTree();
+}
+
+void MOSRegAlloc::improveSubtree(Node *Root) {
+  switch (Root->getType()) {
+  case Node::Type::Forget:
+    break;
+  case Node::Type::Intro:
+    break;
+  case Node::Type::Join:
+    break;
+  }
 }
 
 bool MOSRegAlloc::nearerNextUse(Register Left, Register Right,
