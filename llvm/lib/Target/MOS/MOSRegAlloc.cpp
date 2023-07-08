@@ -284,7 +284,7 @@ private:
   void scanPositions();
   void decomposeToTree();
 
-  unsigned improveSubtree(Node *Root);
+  std::optional<unsigned> improveSubtree(Node *Root);
 
   bool nearerNextUse(Register Left, Register Right,
                      const MachineBasicBlock &MBB,
@@ -420,11 +420,16 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   scanPositions();
   decomposeToTree();
 
-  Node::AllocCost *BestAllocCost;
+  Node::AllocCost *BestAllocCost = nullptr;
   for (int I = 0; I < 10000; ++I) {
-    BestAllocCost = &Tree[0].AllocCosts[improveSubtree(&Tree[0])];
+    std::optional<unsigned> ImprovementIdx = improveSubtree(&Tree[0]);
+    if (!ImprovementIdx)
+      break;
+    BestAllocCost = &Tree[0].AllocCosts[*ImprovementIdx];
     LLVM_DEBUG(dbgs() << "Best Cost: " << BestAllocCost->Cost << '\n');
   }
+  if (!BestAllocCost)
+    report_fatal_error("Could not solve physreg assignment problem");
 
   // Recompute liveness and kill dead instructions.
   for (MachineBasicBlock *MBB : post_order(&MF)) {
@@ -1248,11 +1253,25 @@ void MOSRegAlloc::decomposeToTree() {
   dumpTree();
 }
 
-unsigned MOSRegAlloc::improveSubtree(Node *Root) {
+std::optional<unsigned> MOSRegAlloc::improveSubtree(Node *Root) {
   switch (Root->getType()) {
   case Node::Type::Forget:
-    return 0;
+    return std::nullopt;
   case Node::Type::Intro: {
+    if (Root->Children.empty()) {
+      assert(Root->Positions.size() == 1 &&
+             "Leaf introduce nodes must have only one position.");
+
+      if (!Root->AllocCosts.empty())
+        return std::nullopt;
+
+      Node::AllocCost AC;
+      AC.Cost = 0;
+      AC.PosAllocs[Root->Positions.front()] = Node::Alloc{};
+      Root->AllocCosts.push_back(std::move(AC));
+      return 0;
+    }
+
     Node *Child = Root->Children[0];
     Position IntroducedPos;
     for (Position P : Root->Positions) {
@@ -1262,9 +1281,11 @@ unsigned MOSRegAlloc::improveSubtree(Node *Root) {
       }
     }
 
-    Node::AllocCost *ChildImprovement =
-        &Child->AllocCosts[improveSubtree(Child)];
-    Node::AllocCost AC = *ChildImprovement;
+    std::optional<unsigned> ChildIdx = improveSubtree(Child);
+    if (!ChildIdx)
+      return std::nullopt;
+
+    Node::AllocCost AC = Child->AllocCosts[*ChildIdx];
     AC.PosAllocs[IntroducedPos] = Node::Alloc{};
     for (Node::AllocCost &CurAC : Root->AllocCosts) {
       if (CurAC.PosAllocs != AC.PosAllocs)
@@ -1278,7 +1299,7 @@ unsigned MOSRegAlloc::improveSubtree(Node *Root) {
     return Root->AllocCosts.size() - 1;
   }
   case Node::Type::Join:
-    return 0;
+    return std::nullopt;
   }
 }
 
