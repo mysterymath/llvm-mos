@@ -198,9 +198,12 @@ struct Node {
   SmallVector<Position> Positions;
   SmallVector<Node *> Children;
 
+  unsigned LastChildImproved = 0;
+  SmallVector<unsigned> Selections;
+
   struct AllocCost {
     DenseMap<Position, Alloc> PosAllocs;
-    unsigned Cost;
+    unsigned Cost = 0;
   };
 
   // Best known cost for the subtree at this node for various allocations. Costs
@@ -1254,6 +1257,10 @@ void MOSRegAlloc::decomposeToTree() {
   dumpTree();
 }
 
+static bool joinAlloc(Node::Alloc &Dst, const Node::Alloc &Src) {}
+static bool allocCostSubsumes(const Node::AllocCost &L,
+                              const Node::AllocCost &R) {}
+
 std::optional<unsigned> MOSRegAlloc::improveSubtree(Node *Root) {
   switch (Root->getType()) {
   case Node::Type::Forget:
@@ -1267,7 +1274,6 @@ std::optional<unsigned> MOSRegAlloc::improveSubtree(Node *Root) {
         return std::nullopt;
 
       Node::AllocCost AC;
-      AC.Cost = 0;
       AC.PosAllocs[Root->Positions.front()] = Node::Alloc{};
       Root->AllocCosts.push_back(std::move(AC));
       return 0;
@@ -1299,8 +1305,80 @@ std::optional<unsigned> MOSRegAlloc::improveSubtree(Node *Root) {
     Root->AllocCosts.push_back(std::move(AC));
     return Root->AllocCosts.size() - 1;
   }
-  case Node::Type::Join:
-    return std::nullopt;
+  case Node::Type::Join: {
+    for (Node *Child : Root->Children)
+      if (Child->AllocCosts.empty())
+        if (!improveSubtree(Child))
+          return std::nullopt;
+
+    if (Root->Selections.empty())
+      Root->Selections.resize(Root->Children.size());
+
+    while (true) {
+      Node::AllocCost AC = Root->Children[0]->AllocCosts[Root->Selections[0]];
+      bool Joined = true;
+      for (unsigned I = 1, E = Root->Selections.size(); I != E; ++I) {
+        const Node::AllocCost &ChildAC =
+            Root->Children[I]->AllocCosts[Root->Selections[I]];
+        AC.Cost += ChildAC.Cost;
+        for (const auto &[P, A] : ChildAC.PosAllocs) {
+          if (!joinAlloc(AC.PosAllocs[P], A)) {
+            Joined = false;
+            break;
+          }
+        }
+        if (!Joined)
+          break;
+      }
+      if (Joined) {
+        bool NewACSubsumed = false;
+        Node::AllocCost *NewEnd = Root->AllocCosts.end();
+        for (Node::AllocCost &ExistingAC : Root->AllocCosts) {
+          if (allocCostSubsumes(ExistingAC, AC)) {
+            NewACSubsumed = true;
+            break;
+          }
+          if (allocCostSubsumes(AC, ExistingAC)) {
+            std::swap(Root->AllocCosts.back(), ExistingAC);
+            --NewEnd;
+          }
+        }
+        if (!NewACSubsumed) {
+          Root->AllocCosts.erase(NewEnd, Root->AllocCosts.end());
+          Root->AllocCosts.push_back(std::move(AC));
+          return Root->AllocCosts.size() - 1;
+        }
+      }
+
+      bool AtEnd = false;
+      {
+        unsigned I, E;
+        for (I = 0, E = Root->Selections.size(); I != E; ++I) {
+          if (++Root->Selections[I] < Root->Children[I]->AllocCosts.size())
+            break;
+          Root->Selections[I] = 0;
+        }
+        AtEnd = I == E;
+      }
+
+      if (AtEnd) {
+        unsigned StartChildIdx = Root->LastChildImproved;
+        bool AnyChildImproved = false;
+        do {
+          if (++Root->LastChildImproved == Root->Children.size())
+            Root->LastChildImproved = 0;
+          std::optional<unsigned> ChildImprovementIdx =
+              improveSubtree(Root->Children[Root->LastChildImproved]);
+          if (!ChildImprovementIdx)
+            continue;
+          AnyChildImproved = true;
+          Root->Selections[Root->LastChildImproved] = *ChildImprovementIdx;
+        } while (Root->LastChildImproved != StartChildIdx);
+        if (!AnyChildImproved)
+          return std::nullopt;
+      }
+    }
+  }
   }
 }
 
