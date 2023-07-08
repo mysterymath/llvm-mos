@@ -415,7 +415,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
   assignImagRegs();
 
-  // TODO: Recompute liveness flags and kill dead instructions. Still in SSA.
+  // TODO: Kill flags should be accurate, but dead may not be. Kill dead
+  // instructions. Still in SSA.
 
   scanPositions();
   decomposeToTree();
