@@ -74,6 +74,7 @@
 #include "llvm/ExecutionEngine/Orc/Core.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <pthread.h>
@@ -187,30 +188,38 @@ struct Position {
   }
 };
 
+} // namespace
+
+template <> struct DenseMapInfo<Position> {
+  static inline Position getEmptyKey() {
+    return Position{
+        DenseMapInfo<MachineBasicBlock *>::getEmptyKey(), {}, false};
+  }
+  static inline Position getTombstoneKey() {
+    return Position{
+        DenseMapInfo<MachineBasicBlock *>::getTombstoneKey(), {}, false};
+  }
+  static unsigned getHashValue(const Position &Val) {
+    MachineInstr *PosMI = Val.Pos == Val.MBB->end() ? nullptr : &*Val.Pos;
+    auto T = std::make_tuple(Val.MBB, PosMI, (char)Val.AfterMoves);
+    return DenseMapInfo<decltype(T)>::getHashValue(T);
+  }
+  static bool isEqual(const Position &LHS, const Position &RHS) {
+    return LHS.MBB == RHS.MBB && LHS.Pos == RHS.Pos &&
+           LHS.AfterMoves == RHS.AfterMoves;
+  }
+};
+
+namespace {
+
 // Map from physical register to the value it holds. NoReg (0) means that the
 // register is free. If a register is not in the map, it is unconstrained.
 
 struct Node {
-  typedef DenseMap<Register, Register> Alloc;
-
   enum class Type { Intro, Forget, Join };
 
   SmallVector<Position> Positions;
   SmallVector<Node *> Children;
-
-  unsigned LastChildImproved = 0;
-  SmallVector<unsigned> Selections;
-
-  struct AllocCost {
-    DenseMap<Position, Alloc> PosAllocs;
-    unsigned Cost = 0;
-  };
-
-  // Best known cost for the subtree at this node for various allocations. Costs
-  // for allocations not mentioned are unknown, therefore the best known cost is
-  // taken as infinite. Costs whose calculation involves positions in this node
-  // are not included.
-  SmallVector<AllocCost, 0> AllocCosts;
 
   Type getType() const {
     if (Children.empty())
@@ -223,6 +232,53 @@ struct Node {
     return Child->Positions.size() > Positions.size() ? Type::Forget
                                                       : Type::Intro;
   }
+};
+
+struct Solution {
+  typedef DenseMap<Register, Register> Alloc;
+  DenseMap<Position, Alloc> Allocs;
+  unsigned Cost;
+
+  bool join(const Solution &Other) {
+    for (const auto &[P, OtherA] : Other.Allocs) {
+      Alloc &A = Allocs[P];
+      // Check that everything in this allocation is compatible with everything
+      // in the other.
+      for (const auto &[PReg, VReg] : A) {
+        auto It = OtherA.find(PReg);
+        if (It != OtherA.end() && It->second != VReg)
+          return false;
+      }
+    }
+
+    for (const auto &[P, OtherA] : Other.Allocs) {
+      Alloc &A = Allocs[P];
+      // Include any new constraints from the other.
+      for (const auto &[PReg, VReg] : OtherA)
+        A.try_emplace(PReg, VReg);
+    }
+    return true;
+  }
+
+  bool dominates(const Solution &Other) const {
+    if (Other.Cost < Cost)
+      return false;
+
+    // All of these requirements must also be required by other.
+    for (const auto &[P, A] : Allocs) {
+      auto It = Other.Allocs.find(P);
+      const Alloc &OtherA = It->second;
+      for (const auto &[PReg, VReg] : A) {
+        auto It = OtherA.find(PReg);
+        if (It == OtherA.end() || It->second != VReg)
+          return false;
+      }
+    }
+
+    return true;
+  }
+
+  bool operator<(const Solution &Other) const { return Cost < Other.Cost; }
 };
 
 class MOSRegAlloc : public MachineFunctionPass {
@@ -276,7 +332,7 @@ private:
   DenseMap<Position, SmallSet<Register, 8>> PositionLiveVals;
   DenseMap<Position, unsigned> PositionIndices;
 
-  std::vector<Node> Tree;
+  SmallVector<Node, 0> Tree;
 
   void countAvailImag16Regs();
   void findCSRVals(const MachineDomTreeNode &MDTN,
@@ -287,7 +343,8 @@ private:
   void scanPositions();
   void decomposeToTree();
 
-  std::optional<unsigned> improveSubtree(Node *Root);
+  SmallVector<Solution> solveSubtree(Node *Root);
+  SmallVector<Solution> forgetPosition(const Solution &S, Position P);
 
   bool nearerNextUse(Register Left, Register Right,
                      const MachineBasicBlock &MBB,
@@ -424,16 +481,13 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   scanPositions();
   decomposeToTree();
 
-  Node::AllocCost *BestAllocCost = nullptr;
-  for (int I = 0; I < 10000; ++I) {
-    std::optional<unsigned> ImprovementIdx = improveSubtree(&Tree[0]);
-    if (!ImprovementIdx)
-      break;
-    BestAllocCost = &Tree[0].AllocCosts[*ImprovementIdx];
-    LLVM_DEBUG(dbgs() << "Best Cost: " << BestAllocCost->Cost << '\n');
-  }
-  if (!BestAllocCost)
-    report_fatal_error("Could not solve physreg assignment problem");
+  SmallVector<Solution> Solutions = solveSubtree(Tree.begin());
+  if (Solutions.empty())
+    report_fatal_error("could not find physical register assignment");
+  assert(Solutions.size() == 1 &&
+         "Root should have exactly one best solution.");
+  Solution Best = Solutions.front();
+  LLVM_DEBUG(dbgs() << "Solution cost: " << Best.Cost << '\n');
 
   // Recompute liveness and kill dead instructions.
   for (MachineBasicBlock *MBB : post_order(&MF)) {
@@ -893,26 +947,6 @@ void findMaximalChains(DenseMap<unsigned, unsigned> &MaxChainsByEnd,
 
 } // namespace
 
-template <> struct DenseMapInfo<Position> {
-  static inline Position getEmptyKey() {
-    return Position{
-        DenseMapInfo<MachineBasicBlock *>::getEmptyKey(), {}, false};
-  }
-  static inline Position getTombstoneKey() {
-    return Position{
-        DenseMapInfo<MachineBasicBlock *>::getTombstoneKey(), {}, false};
-  }
-  static unsigned getHashValue(const Position &Val) {
-    MachineInstr *PosMI = Val.Pos == Val.MBB->end() ? nullptr : &*Val.Pos;
-    auto T = std::make_tuple(Val.MBB, PosMI, (char)Val.AfterMoves);
-    return DenseMapInfo<decltype(T)>::getHashValue(T);
-  }
-  static bool isEqual(const Position &LHS, const Position &RHS) {
-    return LHS.MBB == RHS.MBB && LHS.Pos == RHS.Pos &&
-           LHS.AfterMoves == RHS.AfterMoves;
-  }
-};
-
 namespace {
 
 SmallVector<Position> positionSuccessors(Position Pos) {
@@ -1257,129 +1291,113 @@ void MOSRegAlloc::decomposeToTree() {
   dumpTree();
 }
 
-static bool joinAlloc(Node::Alloc &Dst, const Node::Alloc &Src) {}
-static bool allocCostSubsumes(const Node::AllocCost &L,
-                              const Node::AllocCost &R) {}
+SmallVector<Solution> MOSRegAlloc::solveSubtree(Node *Root) {
+  constexpr unsigned MaxSolutions = 10;
 
-std::optional<unsigned> MOSRegAlloc::improveSubtree(Node *Root) {
   switch (Root->getType()) {
-  case Node::Type::Forget:
-    return std::nullopt;
   case Node::Type::Intro: {
+    SmallVector<Solution> ChildSolutions;
+    Position P;
     if (Root->Children.empty()) {
-      assert(Root->Positions.size() == 1 &&
-             "Leaf introduce nodes must have only one position.");
-
-      if (!Root->AllocCosts.empty())
-        return std::nullopt;
-
-      Node::AllocCost AC;
-      AC.PosAllocs[Root->Positions.front()] = Node::Alloc{};
-      Root->AllocCosts.push_back(std::move(AC));
-      return 0;
+      ChildSolutions.emplace_back();
+      Solution &S = ChildSolutions.back();
+      S.Cost = 0;
+      P = Root->Positions.front();
+    } else {
+      ChildSolutions = solveSubtree(Root->Children.front());
+      for (Position CandP : Root->Positions) {
+        if (!is_contained(Root->Children[0]->Positions, CandP)) {
+          P = CandP;
+          break;
+        }
+      }
     }
+    for (Solution &S : ChildSolutions)
+      S.Allocs[P] = Solution::Alloc{};
+    return ChildSolutions;
+  }
+  case Node::Type::Join: {
+    SmallVector<Solution> Solutions = solveSubtree(Root->Children.front());
+    SmallVector<Solution> NewSolutions;
+    for (unsigned I = 1, E = Root->Children.size(); I != E; ++I) {
+      NewSolutions.clear();
+      for (const Solution &S : solveSubtree(Root->Children[I])) {
+        for (const Solution &Existing : Solutions) {
+          Solution Joined = Existing;
+          if (!Joined.join(S))
+            continue;
 
-    Node *Child = Root->Children[0];
-    Position IntroducedPos;
-    for (Position P : Root->Positions) {
-      if (llvm::is_contained(Child->Positions, P)) {
-        IntroducedPos = P;
+          bool IncludeSolution = true;
+          Solution *NewEnd = NewSolutions.end();
+          for (Solution &J : NewSolutions) {
+            if (J.dominates(Joined)) {
+              IncludeSolution = false;
+              break;
+            }
+            if (Joined.dominates(J)) {
+              --NewEnd;
+              std::swap(J, *NewEnd);
+            }
+          }
+          if (!IncludeSolution)
+            continue;
+          NewSolutions.erase(NewEnd, NewSolutions.end());
+          NewSolutions.push_back(Joined);
+        }
+      }
+
+      if (NewSolutions.size() > MaxSolutions) {
+        Solution *NewEnd = NewSolutions.begin() + MaxSolutions;
+        std::nth_element(NewSolutions.begin(), NewEnd, NewSolutions.end());
+        NewSolutions.erase(NewEnd, NewSolutions.end());
+      }
+      Solutions.swap(NewSolutions);
+    }
+    return Solutions;
+  }
+  case Node::Type::Forget: {
+    Position P;
+    for (Position CandP : Root->Children.front()->Positions) {
+      if (!is_contained(Root->Positions, CandP)) {
+        P = CandP;
         break;
       }
     }
 
-    std::optional<unsigned> ChildIdx = improveSubtree(Child);
-    if (!ChildIdx)
-      return std::nullopt;
-
-    Node::AllocCost AC = Child->AllocCosts[*ChildIdx];
-    AC.PosAllocs[IntroducedPos] = Node::Alloc{};
-    for (Node::AllocCost &CurAC : Root->AllocCosts) {
-      if (CurAC.PosAllocs != AC.PosAllocs)
-        continue;
-      assert(AC.Cost < CurAC.Cost &&
-             "Improving a child should always improve an introduce node.");
-      CurAC.Cost = AC.Cost;
-      return &CurAC - Root->AllocCosts.begin();
-    }
-    Root->AllocCosts.push_back(std::move(AC));
-    return Root->AllocCosts.size() - 1;
-  }
-  case Node::Type::Join: {
-    for (Node *Child : Root->Children)
-      if (Child->AllocCosts.empty())
-        if (!improveSubtree(Child))
-          return std::nullopt;
-
-    if (Root->Selections.empty())
-      Root->Selections.resize(Root->Children.size());
-
-    while (true) {
-      Node::AllocCost AC = Root->Children[0]->AllocCosts[Root->Selections[0]];
-      bool Joined = true;
-      for (unsigned I = 1, E = Root->Selections.size(); I != E; ++I) {
-        const Node::AllocCost &ChildAC =
-            Root->Children[I]->AllocCosts[Root->Selections[I]];
-        AC.Cost += ChildAC.Cost;
-        for (const auto &[P, A] : ChildAC.PosAllocs) {
-          if (!joinAlloc(AC.PosAllocs[P], A)) {
-            Joined = false;
+    SmallVector<Solution> Solutions;
+    for (Solution &C : solveSubtree(Root->Children.front())) {
+      for (Solution &F : forgetPosition(C, P)) {
+        bool IncludeSolution = true;
+        Solution *NewEnd = Solutions.end();
+        for (Solution &S : Solutions) {
+          if (S.dominates(F)) {
+            IncludeSolution = false;
             break;
           }
-        }
-        if (!Joined)
-          break;
-      }
-      if (Joined) {
-        bool NewACSubsumed = false;
-        Node::AllocCost *NewEnd = Root->AllocCosts.end();
-        for (Node::AllocCost &ExistingAC : Root->AllocCosts) {
-          if (allocCostSubsumes(ExistingAC, AC)) {
-            NewACSubsumed = true;
-            break;
-          }
-          if (allocCostSubsumes(AC, ExistingAC)) {
-            std::swap(Root->AllocCosts.back(), ExistingAC);
+          if (F.dominates(S)) {
             --NewEnd;
+            std::swap(S, *NewEnd);
           }
         }
-        if (!NewACSubsumed) {
-          Root->AllocCosts.erase(NewEnd, Root->AllocCosts.end());
-          Root->AllocCosts.push_back(std::move(AC));
-          return Root->AllocCosts.size() - 1;
-        }
+        if (!IncludeSolution)
+          continue;
+        Solutions.erase(NewEnd, Solutions.end());
+        Solutions.push_back(F);
       }
+    }
 
-      bool AtEnd = false;
-      {
-        unsigned I, E;
-        for (I = 0, E = Root->Selections.size(); I != E; ++I) {
-          if (++Root->Selections[I] < Root->Children[I]->AllocCosts.size())
-            break;
-          Root->Selections[I] = 0;
-        }
-        AtEnd = I == E;
-      }
-
-      if (AtEnd) {
-        unsigned StartChildIdx = Root->LastChildImproved;
-        bool AnyChildImproved = false;
-        do {
-          if (++Root->LastChildImproved == Root->Children.size())
-            Root->LastChildImproved = 0;
-          std::optional<unsigned> ChildImprovementIdx =
-              improveSubtree(Root->Children[Root->LastChildImproved]);
-          if (!ChildImprovementIdx)
-            continue;
-          AnyChildImproved = true;
-          Root->Selections[Root->LastChildImproved] = *ChildImprovementIdx;
-        } while (Root->LastChildImproved != StartChildIdx);
-        if (!AnyChildImproved)
-          return std::nullopt;
-      }
+    if (Solutions.size() > MaxSolutions) {
+      Solution *NewEnd = Solutions.begin() + MaxSolutions;
+      std::nth_element(Solutions.begin(), NewEnd, Solutions.end());
+      Solutions.erase(NewEnd, Solutions.end());
     }
   }
   }
+  return {};
+}
+
+SmallVector<Solution> MOSRegAlloc::forgetPosition(const Solution &S, Position P) {
+  return {};
 }
 
 bool MOSRegAlloc::nearerNextUse(Register Left, Register Right,
