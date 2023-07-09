@@ -257,6 +257,8 @@ struct Solution {
       for (const auto &[PReg, VReg] : OtherA)
         A.try_emplace(PReg, VReg);
     }
+
+    Cost += Other.Cost;
     return true;
   }
 
@@ -1391,13 +1393,16 @@ SmallVector<Solution> MOSRegAlloc::solveSubtree(Node *Root) {
       std::nth_element(Solutions.begin(), NewEnd, Solutions.end());
       Solutions.erase(NewEnd, Solutions.end());
     }
+    return Solutions;
   }
   }
-  return {};
 }
 
-SmallVector<Solution> MOSRegAlloc::forgetPosition(const Solution &S, Position P) {
-  return {};
+SmallVector<Solution> MOSRegAlloc::forgetPosition(const Solution &S,
+                                                  Position P) {
+  Solution F = S;
+  F.Allocs.erase(P);
+  return {F};
 }
 
 bool MOSRegAlloc::nearerNextUse(Register Left, Register Right,
