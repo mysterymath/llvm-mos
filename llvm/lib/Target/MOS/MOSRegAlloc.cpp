@@ -345,8 +345,9 @@ private:
   void scanPositions();
   void decomposeToTree();
 
-  SmallVector<Solution> solveSubtree(Node *Root);
-  SmallVector<Solution> forgetPosition(const Solution &S, Position P);
+  SmallVector<Solution> solveSubtree(const Node &Root);
+  SmallVector<Solution> forgetPosition(const Node &Root, const Solution &S,
+                                       Position P);
 
   bool nearerNextUse(Register Left, Register Right,
                      const MachineBasicBlock &MBB,
@@ -483,7 +484,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   scanPositions();
   decomposeToTree();
 
-  SmallVector<Solution> Solutions = solveSubtree(Tree.begin());
+  SmallVector<Solution> Solutions = solveSubtree(Tree.front());
   if (Solutions.empty())
     report_fatal_error("could not find physical register assignment");
   assert(Solutions.size() == 1 &&
@@ -1293,22 +1294,22 @@ void MOSRegAlloc::decomposeToTree() {
   dumpTree();
 }
 
-SmallVector<Solution> MOSRegAlloc::solveSubtree(Node *Root) {
+SmallVector<Solution> MOSRegAlloc::solveSubtree(const Node &Root) {
   constexpr unsigned MaxSolutions = 10;
 
-  switch (Root->getType()) {
+  switch (Root.getType()) {
   case Node::Type::Intro: {
     SmallVector<Solution> ChildSolutions;
     Position P;
-    if (Root->Children.empty()) {
+    if (Root.Children.empty()) {
       ChildSolutions.emplace_back();
       Solution &S = ChildSolutions.back();
       S.Cost = 0;
-      P = Root->Positions.front();
+      P = Root.Positions.front();
     } else {
-      ChildSolutions = solveSubtree(Root->Children.front());
-      for (Position CandP : Root->Positions) {
-        if (!is_contained(Root->Children[0]->Positions, CandP)) {
+      ChildSolutions = solveSubtree(*Root.Children.front());
+      for (Position CandP : Root.Positions) {
+        if (!is_contained(Root.Children[0]->Positions, CandP)) {
           P = CandP;
           break;
         }
@@ -1319,11 +1320,11 @@ SmallVector<Solution> MOSRegAlloc::solveSubtree(Node *Root) {
     return ChildSolutions;
   }
   case Node::Type::Join: {
-    SmallVector<Solution> Solutions = solveSubtree(Root->Children.front());
+    SmallVector<Solution> Solutions = solveSubtree(*Root.Children.front());
     SmallVector<Solution> NewSolutions;
-    for (unsigned I = 1, E = Root->Children.size(); I != E; ++I) {
+    for (unsigned I = 1, E = Root.Children.size(); I != E; ++I) {
       NewSolutions.clear();
-      for (const Solution &S : solveSubtree(Root->Children[I])) {
+      for (const Solution &S : solveSubtree(*Root.Children[I])) {
         for (const Solution &Existing : Solutions) {
           Solution Joined = Existing;
           if (!Joined.join(S))
@@ -1359,16 +1360,16 @@ SmallVector<Solution> MOSRegAlloc::solveSubtree(Node *Root) {
   }
   case Node::Type::Forget: {
     Position P;
-    for (Position CandP : Root->Children.front()->Positions) {
-      if (!is_contained(Root->Positions, CandP)) {
+    for (Position CandP : Root.Children.front()->Positions) {
+      if (!is_contained(Root.Positions, CandP)) {
         P = CandP;
         break;
       }
     }
 
     SmallVector<Solution> Solutions;
-    for (Solution &C : solveSubtree(Root->Children.front())) {
-      for (Solution &F : forgetPosition(C, P)) {
+    for (Solution &C : solveSubtree(*Root.Children.front())) {
+      for (Solution &F : forgetPosition(Root, C, P)) {
         bool IncludeSolution = true;
         Solution *NewEnd = Solutions.end();
         for (Solution &S : Solutions) {
@@ -1398,11 +1399,50 @@ SmallVector<Solution> MOSRegAlloc::solveSubtree(Node *Root) {
   }
 }
 
-SmallVector<Solution> MOSRegAlloc::forgetPosition(const Solution &S,
-                                                  Position P) {
-  Solution F = S;
-  F.Allocs.erase(P);
-  return {F};
+SmallVector<Solution>
+MOSRegAlloc::forgetPosition(const Node &Root, const Solution &S, Position P) {
+  // TODO: Accurate costs utilizing:
+  // - liveness
+  // - block frequency
+  // - imag reg allocation
+  // - rematerialization
+
+  DenseSet<Position> AdjP;
+  for (Position Succ : positionSuccessors(P))
+    if (is_contained(Root.Positions, Succ))
+      AdjP.insert(Succ);
+  for (Position Pred : positionSuccessors(P))
+    if (is_contained(Root.Positions, Pred))
+      AdjP.insert(Pred);
+
+  // The first and last MBB position do not have a constraining MI.
+  if ((P.Pos == P.MBB->begin() && !P.AfterMoves) ||
+      (P.Pos == P.MBB->end() && P.AfterMoves)) {
+    Solution F = S;
+    F.Allocs.erase(P);
+    const auto &Alloc = S.Allocs.find(P)->second;
+    for (Position Adj : AdjP) {
+      const auto &AdjAlloc = S.Allocs.find(Adj)->second;
+      for (const auto &[PReg, VReg] : Alloc) {
+        auto It = AdjAlloc.find(PReg);
+        if (It != AdjAlloc.end() && It->second != VReg)
+          F.Cost++;
+      }
+    }
+
+    // All unconstrained choices at P take their minimum value.
+
+    // TODO: Even unconstrained choices at P may incur a cost. P may have
+    // multiple successors and predecessors with differing allocations; P can
+    // take the lowest cost allocation to mediate, but that also incurs a cost
+    // that must be recorded.
+
+    return {F};
+  }
+
+  // TODO
+
+  return {};
 }
 
 bool MOSRegAlloc::nearerNextUse(Register Left, Register Right,
