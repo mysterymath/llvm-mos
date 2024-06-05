@@ -202,8 +202,6 @@ public:
   // scheduling.
   bool alwaysRequiresMachineScheduler() const override { return true; }
 
-  void addMachineSSAOptimization() override;
-
   // Register pressure is too high to work without optimized register
   // allocation.
   void addFastRegAlloc() override { addOptimizedRegAlloc(); }
@@ -276,12 +274,6 @@ void MOSPassConfig::addPreGlobalInstructionSelect() {
 bool MOSPassConfig::addGlobalInstructionSelect() {
   addPass(new InstructionSelect());
   return false;
-}
-
-void MOSPassConfig::addMachineSSAOptimization() {
-  TargetPassConfig::addMachineSSAOptimization();
-  if (getOptLevel() != CodeGenOptLevel::None)
-    addPass(createMOSInsertCopiesPass());
 }
 
 void MOSPassConfig::addOptimizedRegAlloc() {
