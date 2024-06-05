@@ -202,8 +202,7 @@ MOSLegalizerInfo::MOSLegalizerInfo(const MOSSubtarget &STI) {
       .custom();
 
   getActionDefinitionsBuilder(G_SELECT)
-      .customFor({P, PZ})
-      .legalFor({S1, S8})
+      .legalFor({S1, S8, P, PZ})
       .widenScalarToNextMultipleOf(0, 8)
       .maxScalar(0, S8)
       .unsupported();
@@ -450,8 +449,6 @@ bool MOSLegalizerInfo::legalizeCustom(LegalizerHelper &Helper, MachineInstr &MI,
     return legalizeShiftRotate(Helper, MRI, MI, LocObserver);
   case G_ICMP:
     return legalizeICmp(Helper, MRI, MI);
-  case G_SELECT:
-    return legalizeSelect(Helper, MRI, MI);
   case G_ABS:
     return legalizeAbs(Helper, MRI, MI);
   case G_PTR_ADD:
@@ -1339,35 +1336,6 @@ bool MOSLegalizerInfo::legalizeICmp(LegalizerHelper &Helper,
     llvm_unreachable("Unexpected integer comparison type.");
   }
 
-  return true;
-}
-
-bool MOSLegalizerInfo::legalizeSelect(LegalizerHelper &Helper,
-                                      MachineRegisterInfo &MRI,
-                                      MachineInstr &MI) const {
-  MachineIRBuilder &Builder = Helper.MIRBuilder;
-
-  auto [Dst, Test, LHS, RHS] = MI.getFirst4Regs();
-
-  LLT P = MRI.getType(Dst);
-  assert(P.isPointer());
-
-  LLT S = LLT::scalar(P.getScalarSizeInBits());
-
-  assert(MRI.getType(Dst) == P);
-  assert(MRI.getType(Test) == LLT::scalar(1));
-  assert(MRI.getType(LHS) == P);
-  assert(MRI.getType(RHS) == P);
-
-  Helper.Observer.changingInstr(MI);
-  MI.getOperand(2).setReg(Builder.buildPtrToInt(S, LHS).getReg(0));
-  MI.getOperand(3).setReg(Builder.buildPtrToInt(S, RHS).getReg(0));
-  Register Tmp = MRI.createGenericVirtualRegister(S);
-  MI.getOperand(0).setReg(Tmp);
-  Helper.Observer.changedInstr(MI);
-
-  Builder.setInsertPt(Builder.getMBB(), std::next(Builder.getInsertPt()));
-  Builder.buildIntToPtr(Dst, Tmp);
   return true;
 }
 

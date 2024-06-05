@@ -253,6 +253,7 @@ bool MOSInstructionSelector::select(MachineInstr &MI) {
   case MOS::G_LOAD_INDIR:
   case MOS::G_LOAD_INDIR_IDX:
   case MOS::G_PHI:
+  case MOS::G_SELECT:
   case MOS::G_STORE_INDIR:
   case MOS::G_STORE_INDIR_IDX:
   case MOS::G_BRINDIRECT_IDX:
@@ -1992,6 +1993,9 @@ bool MOSInstructionSelector::selectGeneric(MachineInstr &MI) {
   case MOS::G_PHI:
     Opcode = MOS::PHI;
     break;
+  case MOS::G_SELECT:
+    Opcode = MOS::Select;
+    break;
   case MOS::G_STORE_ZP_IDX:
     Opcode = MOS::STZpIdx;
     break;
@@ -2011,8 +2015,9 @@ bool MOSInstructionSelector::selectGeneric(MachineInstr &MI) {
   MI.setDesc(TII.get(Opcode));
   MI.addImplicitDefUseOperands(*MI.getMF());
   // Establish any tied operands and known register classes.
-  if (!constrainSelectedInstRegOperands(MI, TII, TRI, RBI))
-    return false;
+  if (Opcode != MOS::Select)
+    if (!constrainSelectedInstRegOperands(MI, TII, TRI, RBI))
+      return false;
   // Make sure that the outputs have register classes.
   constrainGenericOp(MI);
   return true;
