@@ -1112,27 +1112,18 @@ bool MOSInstructionSelector::selectSbc(MachineInstr &MI) {
   MachineIRBuilder Builder(MI);
   const auto &MRI = *Builder.getMRI();
 
-  Register A = MI.getOperand(0).getReg();
-  Register N = MI.getOperand(2).getReg();
-  Register V = MI.getOperand(3).getReg();
-  Register Z = MI.getOperand(4).getReg();
+  auto [A, COut, N, V, Z] = MI.getFirst5Regs();
+  Register L = MI.getOperand(5).getReg();
   Register R = MI.getOperand(6).getReg();
+  Register CIn = MI.getOperand(7).getReg();
 
   // Outputs that are unused may not need to be generated.
   if (Builder.getMRI()->use_nodbg_empty(A))
     A = MOS::NoRegister;
-  if (Builder.getMRI()->use_nodbg_empty(N))
-    N = MOS::NoRegister;
   if (Builder.getMRI()->use_nodbg_empty(V))
     V = MOS::NoRegister;
-  if (Builder.getMRI()->use_nodbg_empty(Z))
-    Z = MOS::NoRegister;
 
-  assert(!N && !Z &&
-         "All N and Z uses must be selected to terminator instructions.");
-
-  auto CInConst =
-      getIConstantVRegValWithLookThrough(MI.getOperand(7).getReg(), MRI);
+  auto CInConst = getIConstantVRegValWithLookThrough(CIn, MRI);
   bool CInSet = CInConst && !CInConst->Value.isZero();
 
   auto RConst = getIConstantVRegValWithLookThrough(R, *Builder.getMRI());
@@ -1143,55 +1134,47 @@ bool MOSInstructionSelector::selectSbc(MachineInstr &MI) {
   if (!A && !V && CInSet) {
     if (!Instr && RConst) {
       assert(RConst->Value.getBitWidth() == 8);
-      Instr =
-          Builder.buildInstr(MOS::CMPImm, {MI.getOperand(1)},
-                             {MI.getOperand(5), RConst->Value.getZExtValue()});
+      Instr = Builder.buildInstr(MOS::CMPImm, {COut, N, Z},
+                                 {L, RConst->Value.getZExtValue()});
     }
     MachineOperand Addr =
         MachineOperand::CreateReg(MOS::NoRegister, /*isDef=*/false);
     if (!Instr &&
-        mi_match(MI.getOperand(6).getReg(), MRI,
+        mi_match(R, MRI,
                  m_all_of(m_MInstr(Load), m_FoldedLdAbs(MI, Addr, AA)))) {
-      Instr =
-          Builder
-              .buildInstr(MOS::CMPAbs, {MI.getOperand(1)}, {MI.getOperand(5)})
-              .add(Addr)
-              .cloneMemRefs(*Load);
+      Instr = Builder.buildInstr(MOS::CMPAbs, {COut, N, Z}, {L})
+                  .add(Addr)
+                  .cloneMemRefs(*Load);
     }
     Register Idx;
     bool ZP;
-    if (!Instr && mi_match(MI.getOperand(6).getReg(), MRI,
+    if (!Instr && mi_match(R, MRI,
                            m_all_of(m_MInstr(Load),
                                     m_FoldedLdIdx(MI, Addr, Idx, ZP, AA)))) {
       Instr = Builder
-                  .buildInstr(ZP ? MOS::CMPZpIdx : MOS::CMPAbsIdx,
-                              {MI.getOperand(1)}, {MI.getOperand(5)})
+                  .buildInstr(ZP ? MOS::CMPZpIdx : MOS::CMPAbsIdx, {COut, N, Z},
+                              {L})
                   .add(Addr)
                   .addUse(Idx)
                   .cloneMemRefs(*Load);
     }
     Register RegAddr;
     if (!Instr &&
-        mi_match(MI.getOperand(6).getReg(), MRI,
+        mi_match(R, MRI,
                  m_all_of(m_MInstr(Load), m_FoldedLdIndir(MI, RegAddr, AA)))) {
-      Instr = Builder
-                  .buildInstr(MOS::CMPIndir, {MI.getOperand(1)},
-                              {MI.getOperand(5), RegAddr})
+      Instr = Builder.buildInstr(MOS::CMPIndir, {COut, N, Z}, {L, RegAddr})
                   .cloneMemRefs(*Load);
     }
     if (!Instr &&
-        mi_match(MI.getOperand(6).getReg(), MRI,
+        mi_match(R, MRI,
                  m_all_of(m_MInstr(Load),
                           m_FoldedLdIndirIdx(MI, RegAddr, Idx, AA)))) {
-      Instr = Builder
-                  .buildInstr(MOS::CMPIndirIdx, {MI.getOperand(1)},
-                              {MI.getOperand(5), RegAddr, Idx})
-                  .cloneMemRefs(*Load);
+      Instr =
+          Builder.buildInstr(MOS::CMPIndirIdx, {COut, N, Z}, {L, RegAddr, Idx})
+              .cloneMemRefs(*Load);
     }
-    if (!Instr) {
-      Instr = Builder.buildInstr(MOS::CMPImag8, {MI.getOperand(1)},
-                                 {MI.getOperand(5), MI.getOperand(6)});
-    }
+    if (!Instr)
+      Instr = Builder.buildInstr(MOS::CMPImag8, {COut, N, Z}, {L, R});
   } else {
     if (!Instr && RConst) {
       assert(RConst->Value.getBitWidth() == 8);
@@ -1255,6 +1238,9 @@ bool MOSInstructionSelector::selectSbc(MachineInstr &MI) {
           MOS::SBCImag8, {MI.getOperand(0), MI.getOperand(1), MI.getOperand(3)},
           {MI.getOperand(5), MI.getOperand(6), MI.getOperand(7)});
     }
+    auto CmpZero = Builder.buildInstr(MOS::CmpZero, {N, Z}, {L});
+    if (!constrainSelectedInstRegOperands(*CmpZero, TII, TRI, RBI))
+      return false;
   }
   if (!constrainSelectedInstRegOperands(*Instr, TII, TRI, RBI))
     return false;
@@ -1319,8 +1305,7 @@ bool MOSInstructionSelector::selectAddr(MachineInstr &MI) {
   if (Op.isCImm())
     Op.ChangeToImmediate(Op.getCImm()->getSExtValue());
 
-  MachineInstrBuilder Instr = buildLdImm(Builder, MI.getOperand(0))
-                                  .add(Op);
+  MachineInstrBuilder Instr = buildLdImm(Builder, MI.getOperand(0)).add(Op);
   if (!constrainSelectedInstRegOperands(*Instr, TII, TRI, RBI))
     return false;
   MI.eraseFromParent();
@@ -1383,9 +1368,9 @@ GLshrE_match<ADDR_P, CARRYIN_P> m_GLshrE(Register &CarryOut, const ADDR_P &Addr,
   return {CarryOut, Addr, CarryIn};
 }
 
-// Replace all uses of a given virtual register after a given instruction with a
-// new one. The given machine instruction must dominate all references outside
-// the containing basic block. This allows folding a multi-def machine
+// Replace all uses of a given virtual register after a given instruction with
+// a new one. The given machine instruction must dominate all references
+// outside the containing basic block. This allows folding a multi-def machine
 // instruction into a later one in the same block by rewriting all later
 // references to use new vregs.
 static void replaceUsesAfter(MachineBasicBlock::iterator MI, Register From,
@@ -1446,8 +1431,9 @@ IncDecMBAbs_match m_IncDecMBAbs(MachineInstr *&IncDec, MachineOperand &Addr,
 bool MOSInstructionSelector::selectStore(MachineInstr &MI) {
   MachineIRBuilder Builder(MI);
 
-  // Read-modify-write instruction patterns are rooted at store instructions, so
-  // select one if possible. This can make an entire instruction sequence dead.
+  // Read-modify-write instruction patterns are rooted at store instructions,
+  // so select one if possible. This can make an entire instruction sequence
+  // dead.
   if (!(*MI.memoperands_begin())->isVolatile())
     if (selectRMW(MI))
       return true;
@@ -1708,9 +1694,10 @@ bool MOSInstructionSelector::selectMergeValues(MachineInstr &MI) {
   if (LoConst && HiConst) {
     uint64_t Val =
         HiConst->Value.getZExtValue() << 8 | LoConst->Value.getZExtValue();
-    auto Instr = STI.hasSPC700()
-        ? Builder.buildInstr(MOS::LDImm16SPC700, {Dst}, {Val})
-        : Builder.buildInstr(MOS::LDImm16, {Dst, &MOS::GPRRegClass}, {Val});
+    auto Instr =
+        STI.hasSPC700()
+            ? Builder.buildInstr(MOS::LDImm16SPC700, {Dst}, {Val})
+            : Builder.buildInstr(MOS::LDImm16, {Dst, &MOS::GPRRegClass}, {Val});
     if (!constrainSelectedInstRegOperands(*Instr, TII, TRI, RBI))
       return false;
     MI.eraseFromParent();

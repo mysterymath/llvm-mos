@@ -375,7 +375,7 @@ let Predicates = [HasHUC6280] in {
 //===---------------------------------------------------------------------===//
 
 class MOSCMP : MOSLogicalInstr {
-  dag OutOperandList = (outs Cc:$carry);
+  dag OutOperandList = (outs Cc:$carry, Nc:$n, Zc:$z);
   let isCompare = true;
 }
 
