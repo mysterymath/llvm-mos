@@ -43,8 +43,6 @@ struct Node;
 struct SchedulingDAG {
   SmallVector<std::unique_ptr<Node>, 0> Nodes;
   unsigned NextIdx;
-
-  void print();
 };
 
 class MOSRegAlloc : public MachineFunctionPass {
@@ -72,7 +70,10 @@ struct Node {
   unsigned Idx;
   SmallVector<MachineInstr *> Instrs;
   SmallVector<Edge> Defs;
+  SmallVector<Edge> EarlyClobberDefs;
   SmallVector<Edge> Uses;
+
+  void printEdges(StringRef Name, const SmallVector<Edge> &Edges) const;
 };
 
 bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
@@ -92,11 +93,16 @@ void MOSRegAlloc::buildDAG(MachineFunction &MF) {
     for (MachineInstr &MI : MBB) {
       auto N = std::make_unique<Node>();
       N->Idx = DAG.NextIdx++;
+
       N->Instrs.push_back(&MI);
       for (MachineOperand &MO : MI.operands()) {
         if (!MO.isReg())
           continue;
-        SmallVector<Edge> *Edges = MO.isDef() ? &N->Defs : &N->Uses;
+        SmallVector<Edge> *Edges;
+        if (MO.isDef())
+          Edges = MO.isEarlyClobber() ? &N->EarlyClobberDefs : &N->Defs;
+        else
+          Edges = &N->Uses;
         Edges->push_back({MO.getReg(),
                           TII.getRegClass(TII.get(MI.getOpcode()),
                                           MO.getOperandNo(), &TRI, MF),
@@ -109,30 +115,31 @@ void MOSRegAlloc::buildDAG(MachineFunction &MF) {
   for (const std::unique_ptr<Node> &N : DAG.Nodes) {
     dbgs() << "Node " << N->Idx << ":\n";
 
-    dbgs() << "Defs: ";
-    for (const Edge &E : N->Defs) {
-      dbgs() << printReg(E.Reg);
-      if (E.RC) {
-        dbgs() << "(" << TRI.getRegClassName(E.RC) << ")";
-        dbgs() << " ";
-      }
-    }
+    N->printEdges("Defs", N->Defs);
+    N->printEdges("Early Clobber Defs", N->EarlyClobberDefs);
+    N->printEdges("Uses", N->Uses);
 
-    dbgs() << "\nUses: ";
-    for (const Edge &E : N->Uses) {
-      dbgs() << printReg(E.Reg);
-      if (E.RC) {
-        dbgs() << "(" << TRI.getRegClassName(E.RC) << ")";
-        dbgs() << " ";
-      }
-    }
-
-    dbgs() << "\nInstrs:\n";
+    dbgs() << "Instrs:\n";
     for (const MachineInstr *MI : N->Instrs)
       dbgs() << *MI;
 
     dbgs() << '\n';
   }
+}
+
+void Node::printEdges(StringRef Name, const SmallVector<Edge> &Edges) const {
+  if (Edges.empty())
+    return;
+  const TargetRegisterInfo &TRI =
+      *Instrs.front()->getMF()->getSubtarget().getRegisterInfo();
+  dbgs() << Name << ": ";
+  for (const Edge &E : Edges) {
+    dbgs() << printReg(E.Reg);
+    if (E.RC)
+      dbgs() << "(" << TRI.getRegClassName(E.RC) << ")";
+    dbgs() << ' ';
+  }
+  dbgs() << '\n';
 }
 
 } // namespace
