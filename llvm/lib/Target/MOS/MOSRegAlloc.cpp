@@ -134,7 +134,7 @@ void Node::printEdges(StringRef Name, const SmallVector<Edge> &Edges) const {
       *Instrs.front()->getMF()->getSubtarget().getRegisterInfo();
   dbgs() << Name << ": ";
   for (const Edge &E : Edges) {
-    dbgs() << printReg(E.Reg);
+    dbgs() << printReg(E.Reg, &TRI);
     if (E.RC)
       dbgs() << "(" << TRI.getRegClassName(E.RC) << ")";
     dbgs() << ' ';
