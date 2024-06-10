@@ -26,6 +26,7 @@
 
 #include "MOSRegAlloc.h"
 
+#include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
@@ -41,8 +42,11 @@ struct DAG;
 struct Node;
 
 struct SchedulingDAG {
+  DenseMap<Register, const MachineInstr *> Constants;
   SmallVector<std::unique_ptr<Node>, 0> Nodes;
   unsigned NextIdx;
+
+  void clear();
 };
 
 class MOSRegAlloc : public MachineFunctionPass {
@@ -86,14 +90,27 @@ void MOSRegAlloc::buildDAG(MachineFunction &MF) {
   const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
   const TargetRegisterInfo &TRI = *MF.getSubtarget().getRegisterInfo();
 
-  DAG.Nodes.clear();
+  DAG.clear();
   DAG.NextIdx = 0;
 
   for (MachineBasicBlock &MBB : MF) {
     for (MachineInstr &MI : MBB) {
-      auto N = std::make_unique<Node>();
-      N->Idx = DAG.NextIdx++;
+      switch (MI.getOpcode()) {
+      case MOS::LDImm:
+      case MOS::LDImm1:
+      case MOS::LDImm16:
+        DAG.Constants[MI.getOperand(0).getReg()] = &MI;
+        continue;
+      default:
+        break;
+      }
 
+      if (MI.isPHI() || MI.isCopy() || MI.isRegSequence())
+        continue;
+
+      DAG.Nodes.push_back(std::make_unique<Node>());
+      Node *N = DAG.Nodes.back().get();
+      N->Idx = DAG.NextIdx++;
       N->Instrs.push_back(&MI);
       for (MachineOperand &MO : MI.operands()) {
         if (!MO.isReg())
@@ -108,8 +125,14 @@ void MOSRegAlloc::buildDAG(MachineFunction &MF) {
                                           MO.getOperandNo(), &TRI, MF),
                           /*Node=*/nullptr});
       }
-      DAG.Nodes.push_back(std::move(N));
     }
+  }
+
+  if (!DAG.Constants.empty()) {
+    dbgs() << "Constants:\n";
+    for (const auto &[Reg, MI] : DAG.Constants)
+      dbgs() << printReg(Reg, &TRI) << ": " << *MI;
+    dbgs() << '\n';
   }
 
   for (const std::unique_ptr<Node> &N : DAG.Nodes) {
@@ -125,6 +148,11 @@ void MOSRegAlloc::buildDAG(MachineFunction &MF) {
 
     dbgs() << '\n';
   }
+}
+
+void SchedulingDAG::clear() {
+  Constants.clear();
+  Nodes.clear();
 }
 
 void Node::printEdges(StringRef Name, const SmallVector<Edge> &Edges) const {
