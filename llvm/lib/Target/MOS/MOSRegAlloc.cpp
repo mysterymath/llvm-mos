@@ -27,12 +27,25 @@
 #include "MOSRegAlloc.h"
 
 #include "MOS.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
+#include "llvm/CodeGen/TargetRegisterInfo.h"
 
 #define DEBUG_TYPE "mos-regalloc"
 
 using namespace llvm;
 
 namespace {
+
+struct DAG;
+struct Node;
+
+struct SchedulingDAG {
+  SmallVector<std::unique_ptr<Node>, 0> Nodes;
+  unsigned NextIdx;
+
+  void print();
+};
 
 class MOSRegAlloc : public MachineFunctionPass {
 public:
@@ -43,9 +56,84 @@ public:
   }
 
   bool runOnMachineFunction(MachineFunction &MF) override;
+
+  void buildDAG(MachineFunction &MF);
+
+  SchedulingDAG DAG;
 };
 
-bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) { return true; }
+struct Edge {
+  Register Reg;
+  const TargetRegisterClass *RC;
+  Node *Node;
+};
+
+struct Node {
+  unsigned Idx;
+  SmallVector<MachineInstr *> Instrs;
+  SmallVector<Edge> Defs;
+  SmallVector<Edge> Uses;
+};
+
+bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
+  buildDAG(MF);
+
+  return true;
+}
+
+void MOSRegAlloc::buildDAG(MachineFunction &MF) {
+  const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
+  const TargetRegisterInfo &TRI = *MF.getSubtarget().getRegisterInfo();
+
+  DAG.Nodes.clear();
+  DAG.NextIdx = 0;
+
+  for (MachineBasicBlock &MBB : MF) {
+    for (MachineInstr &MI : MBB) {
+      auto N = std::make_unique<Node>();
+      N->Idx = DAG.NextIdx++;
+      N->Instrs.push_back(&MI);
+      for (MachineOperand &MO : MI.operands()) {
+        if (!MO.isReg())
+          continue;
+        SmallVector<Edge> *Edges = MO.isDef() ? &N->Defs : &N->Uses;
+        Edges->push_back({MO.getReg(),
+                          TII.getRegClass(TII.get(MI.getOpcode()),
+                                          MO.getOperandNo(), &TRI, MF),
+                          /*Node=*/nullptr});
+      }
+      DAG.Nodes.push_back(std::move(N));
+    }
+  }
+
+  for (const std::unique_ptr<Node> &N : DAG.Nodes) {
+    dbgs() << "Node " << N->Idx << ":\n";
+
+    dbgs() << "Defs: ";
+    for (const Edge &E : N->Defs) {
+      dbgs() << printReg(E.Reg);
+      if (E.RC) {
+        dbgs() << "(" << TRI.getRegClassName(E.RC) << ")";
+        dbgs() << " ";
+      }
+    }
+
+    dbgs() << "\nUses: ";
+    for (const Edge &E : N->Uses) {
+      dbgs() << printReg(E.Reg);
+      if (E.RC) {
+        dbgs() << "(" << TRI.getRegClassName(E.RC) << ")";
+        dbgs() << " ";
+      }
+    }
+
+    dbgs() << "\nInstrs:\n";
+    for (const MachineInstr *MI : N->Instrs)
+      dbgs() << *MI;
+
+    dbgs() << '\n';
+  }
+}
 
 } // namespace
 
