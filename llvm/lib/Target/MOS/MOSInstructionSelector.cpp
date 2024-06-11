@@ -340,6 +340,27 @@ static bool shouldFoldMemAccess(const MachineInstr &Dst,
   return true;
 }
 
+struct Imm_match {
+  MachineOperand &Imm;
+
+  bool match(const MachineRegisterInfo &MRI, Register Reg) {
+    std::optional<ValueAndVReg> Cst;
+    if (mi_match(Reg, MRI, m_GCst(Cst))) {
+      Imm = MachineOperand::CreateImm(Cst->Value.getSExtValue());
+      return true;
+    }
+    const MachineInstr *GVPart =
+        getOpcodeDef(MOS::G_GLOBAL_VALUE_PART, Reg, MRI);
+    if (GVPart) {
+      Imm = GVPart->getOperand(1);
+      return true;
+    }
+    return false;
+  }
+};
+
+inline Imm_match m_Imm(MachineOperand &Imm) { return {Imm}; }
+
 struct FoldedLdAbs_match {
   const MachineInstr &Tgt;
   MachineOperand &Addr;
@@ -1772,11 +1793,13 @@ bool MOSInstructionSelector::selectAddE(MachineInstr &MI) {
   LLT S1 = LLT::scalar(1);
 
   MachineInstrBuilder Instr = [&]() {
-    if (auto RConst = getIConstantVRegValWithLookThrough(R, MRI)) {
-      assert(RConst->Value.getBitWidth() == 8);
-      return Builder.buildInstr(MOS::ADCImm, {Result, CarryOut, S1},
-                                {L, RConst->Value.getZExtValue(), CarryIn});
-    }
+    MachineOperand Imm = MachineOperand::CreateReg(0, false);
+    if (mi_match(L, MRI, m_Imm(Imm)))
+      std::swap(L, R);
+    if (mi_match(R, MRI, m_Imm(Imm)))
+      return Builder.buildInstr(MOS::ADCImm, {Result, CarryOut, S1}, {L})
+          .add(Imm)
+          .addUse(CarryIn);
     MachineOperand Addr = MachineOperand::CreateReg(0, false);
     if (mi_match(L, MRI, m_FoldedLdAbs(MI, Addr, AA)))
       std::swap(L, R);
