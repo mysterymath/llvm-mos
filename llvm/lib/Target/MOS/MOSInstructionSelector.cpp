@@ -219,7 +219,7 @@ bool MOSInstructionSelector::select(MachineInstr &MI) {
     return selectFrameIndex(MI);
   case MOS::G_BLOCK_ADDR:
   case MOS::G_CONSTANT:
-  case MOS::G_GLOBAL_VALUE:
+  case MOS::G_GLOBAL_VALUE_PART:
     return selectAddr(MI);
   case MOS::G_STORE_ZP_IDX:
   case MOS::G_STORE_ABS:
@@ -1915,7 +1915,6 @@ bool MOSInstructionSelector::selectUnMergeValues(MachineInstr &MI) {
     LoHi = selectFrameIndexLoHi(*SrcMI);
     break;
   case MOS::G_BLOCK_ADDR:
-  case MOS::G_GLOBAL_VALUE:
     LoHi = selectAddrLoHi(*SrcMI);
     break;
   }
