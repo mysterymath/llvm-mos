@@ -85,7 +85,14 @@ MOSLegalizerInfo::MOSLegalizerInfo(const MOSSubtarget &STI) {
       .maxScalar(0, S8)
       .unsupported();
 
-  getActionDefinitionsBuilder({G_GLOBAL_VALUE, G_FRAME_INDEX, G_BLOCK_ADDR})
+  // Only the low or high half of a pointer can be generated in a single
+  // instruction.
+  getActionDefinitionsBuilder(G_GLOBAL_VALUE)
+      .legalFor({PZ})
+      .customFor({P})
+      .unsupported();
+
+  getActionDefinitionsBuilder({G_FRAME_INDEX, G_BLOCK_ADDR})
       .legalFor({P, PZ})
       .unsupported();
 
@@ -419,6 +426,10 @@ bool MOSLegalizerInfo::legalizeCustom(LegalizerHelper &Helper, MachineInstr &MI,
   switch (MI.getOpcode()) {
   default:
     llvm_unreachable("Invalid opcode for custom legalization.");
+  // Constants
+  case G_GLOBAL_VALUE:
+    return legalizeGlobalValue(Helper, MRI, MI);
+
   // Integer Extension and Truncation
   case G_ANYEXT:
     return legalizeAnyExt(Helper, MRI, MI);
@@ -524,6 +535,22 @@ static auto unmergeDefsSplitHigh(MachineInstr *MI) {
   };
   return LowsAndHigh{make_range(MI->operands_begin(), MI->operands_end() - 2),
                      MI->getOperand(MI->getNumOperands() - 2)};
+}
+
+bool MOSLegalizerInfo::legalizeGlobalValue(LegalizerHelper &Helper,
+                                           MachineRegisterInfo &MRI,
+                                           MachineInstr &MI) const {
+  MachineIRBuilder &Builder = Helper.MIRBuilder;
+  const GlobalValue *GV = MI.getOperand(1).getGlobal();
+  auto Lo = Builder.buildInstr(MOS::G_GLOBAL_VALUE_PART, {LLT::scalar(8)}, {})
+                .addGlobalAddress(GV, /*Offset=*/0, MOS::MO_LO);
+  auto Hi = Builder.buildInstr(MOS::G_GLOBAL_VALUE_PART, {LLT::scalar(8)}, {})
+                .addGlobalAddress(GV, /*Offset=*/0, MOS::MO_HI);
+  auto Merge =
+      Builder.buildMergeValues({LLT::scalar(16)}, {Lo.getReg(0), Hi.getReg(0)});
+  Builder.buildIntToPtr({MI.getOperand(0)}, Merge);
+  MI.eraseFromParent();
+  return true;
 }
 
 bool MOSLegalizerInfo::legalizeAnyExt(LegalizerHelper &Helper,

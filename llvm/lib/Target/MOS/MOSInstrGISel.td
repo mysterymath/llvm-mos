@@ -192,3 +192,10 @@ def G_BRINDIRECT_IDX : MOSGenericInstruction {
   let isBarrier = true;
   let isIndirectBranch = true;
 }
+
+// The low or high part of a global value, based on the target flags applied to
+// the global.
+def G_GLOBAL_VALUE_PART : MOSGenericInstruction {
+  let OutOperandList = (outs type0:$dst);
+  let InOperandList = (ins type1:$gv);
+}
