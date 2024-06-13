@@ -10,8 +10,7 @@
 //
 // Unlike MachineScheduler, this operates on SSA, since the MOS register
 // allocator takes SSA. This pass also performs two-address instruction
-// chaining and commutation. Constants, vreg-vreg copies, and REG_SEQUENCE are
-// left alone, since they are handled symbolically by the register allocator.
+// chaining and commutation.
 //
 //===----------------------------------------------------------------------===//
 
@@ -19,6 +18,7 @@
 
 #include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
+#include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
@@ -29,14 +29,14 @@ using namespace llvm;
 
 namespace {
 
-struct DAG;
-struct Node;
+struct Node {
+  unsigned Idx;
+  MachineInstr *Instr;
+};
 
 struct SchedulingDAG {
-  DenseMap<Register, const MachineInstr *> Constants;
-  SmallVector<std::unique_ptr<Node>, 0> Nodes;
+  SmallVector<Node, 0> Nodes;
   unsigned NextIdx;
-
   void clear();
 };
 
@@ -50,115 +50,42 @@ public:
 
   bool runOnMachineFunction(MachineFunction &MF) override;
 
-  void buildDAG(MachineFunction &MF);
+  void scheduleBlock(MachineBasicBlock &MBB);
+  void buildDAG();
 
+  MachineBasicBlock *MBB;
   SchedulingDAG DAG;
 };
 
-struct Edge {
-  Register Reg;
-  const TargetRegisterClass *RC;
-  Node *Node;
-};
-
-struct Node {
-  unsigned Idx;
-  SmallVector<MachineInstr *> Instrs;
-  SmallVector<Edge> Defs;
-  SmallVector<Edge> EarlyClobberDefs;
-  SmallVector<Edge> Uses;
-
-  void printEdges(StringRef Name, const SmallVector<Edge> &Edges) const;
-};
-
 bool MOSSched::runOnMachineFunction(MachineFunction &MF) {
-  buildDAG(MF);
+  for (MachineBasicBlock &MBB : MF)
+    scheduleBlock(MBB);
 
   return true;
 }
 
-void MOSSched::buildDAG(MachineFunction &MF) {
-  const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
-  const TargetRegisterInfo &TRI = *MF.getSubtarget().getRegisterInfo();
+void MOSSched::scheduleBlock(MachineBasicBlock &MBB) {
+  dbgs() << "Scheduling block " << MBB.getName() << '\n';
+  this->MBB = &MBB;
+  buildDAG();
+  dbgs() << '\n';
+}
 
+void MOSSched::buildDAG() {
   DAG.clear();
-  DAG.NextIdx = 0;
 
-  for (MachineBasicBlock &MBB : MF) {
-    for (MachineInstr &MI : MBB) {
-      switch (MI.getOpcode()) {
-      case MOS::LDImm:
-      case MOS::LDImm1:
-      case MOS::LDImm16:
-        DAG.Constants[MI.getOperand(0).getReg()] = &MI;
-        continue;
-      default:
-        break;
-      }
+  for (MachineInstr &MI : *MBB)
+    DAG.Nodes.push_back({DAG.NextIdx++, &MI});
 
-      if (MI.isPHI() || MI.isCopy() || MI.isRegSequence())
-        continue;
-
-      DAG.Nodes.push_back(std::make_unique<Node>());
-      Node *N = DAG.Nodes.back().get();
-      N->Idx = DAG.NextIdx++;
-      N->Instrs.push_back(&MI);
-      for (MachineOperand &MO : MI.operands()) {
-        if (!MO.isReg())
-          continue;
-        SmallVector<Edge> *Edges;
-        if (MO.isDef())
-          Edges = MO.isEarlyClobber() ? &N->EarlyClobberDefs : &N->Defs;
-        else
-          Edges = &N->Uses;
-        Edges->push_back({MO.getReg(),
-                          TII.getRegClass(TII.get(MI.getOpcode()),
-                                          MO.getOperandNo(), &TRI, MF),
-                          /*Node=*/nullptr});
-      }
-    }
-  }
-
-  if (!DAG.Constants.empty()) {
-    dbgs() << "Constants:\n";
-    for (const auto &[Reg, MI] : DAG.Constants)
-      dbgs() << printReg(Reg, &TRI) << ": " << *MI;
-    dbgs() << '\n';
-  }
-
-  for (const std::unique_ptr<Node> &N : DAG.Nodes) {
-    dbgs() << "Node " << N->Idx << ":\n";
-
-    N->printEdges("Defs", N->Defs);
-    N->printEdges("Early Clobber Defs", N->EarlyClobberDefs);
-    N->printEdges("Uses", N->Uses);
-
-    dbgs() << "Instrs:\n";
-    for (const MachineInstr *MI : N->Instrs)
-      dbgs() << *MI;
-
+  for (const Node &N : DAG.Nodes) {
+    dbgs() << "Node " << N.Idx << ": " << *N.Instr;
     dbgs() << '\n';
   }
 }
 
 void SchedulingDAG::clear() {
-  Constants.clear();
   Nodes.clear();
-}
-
-void Node::printEdges(StringRef Name, const SmallVector<Edge> &Edges) const {
-  if (Edges.empty())
-    return;
-  const TargetRegisterInfo &TRI =
-      *Instrs.front()->getMF()->getSubtarget().getRegisterInfo();
-  dbgs() << Name << ": ";
-  for (const Edge &E : Edges) {
-    dbgs() << printReg(E.Reg, &TRI);
-    if (E.RC)
-      dbgs() << "(" << TRI.getRegClassName(E.RC) << ")";
-    dbgs() << ' ';
-  }
-  dbgs() << '\n';
+  NextIdx = 0;
 }
 
 } // namespace
