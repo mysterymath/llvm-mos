@@ -1,4 +1,4 @@
-//===-- MOSRegAlloc.h - MOS Register Allocator ------------------*- C++ -*-===//
+//===-- MOSSched.h - MOS Instruction Scheduler ------------------*- C++ -*-===//
 //
 // Part of LLVM-MOS, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,19 +6,19 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file declares the register allocator.
+// This file declares the instruction scheduler.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef LLVM_LIB_TARGET_MOS_MOSREGALLOC_H
-#define LLVM_LIB_TARGET_MOS_MOSREGALLOC_H
+#ifndef LLVM_LIB_TARGET_MOS_MOSSCHED_H
+#define LLVM_LIB_TARGET_MOS_MOSSCHED_H
 
 #include "llvm/CodeGen/MachineFunctionPass.h"
 
 namespace llvm {
 
-MachineFunctionPass *createMOSRegAllocPass();
+MachineFunctionPass *createMOSSchedPass();
 
 } // namespace llvm
 
-#endif // not LLVM_LIB_TARGET_MOS_MOSREGALLOC_H
+#endif // not LLVM_LIB_TARGET_MOS_MOSSCHED_H

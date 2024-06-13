@@ -1,4 +1,4 @@
-//===-- MOSRegAlloc.cpp - MOS Register Allocator --------------------------===//
+//===-- MOSSched.cpp - MOS Register Allocator --------------------------===//
 //
 // Part of LLVM-MOS, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -6,25 +6,16 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file defines the MOS register allocator.
+// This file defines the MOS instruction scheduler.
 //
-// The usual LLVM pipeline involves phase-separated instruction scheduling and
-// register allocation. Contrast the usual 6502 assembly programmer, which can
-// solve both problems simultaneously, using information about one problem to
-// inform decisions about the other.
-//
-// The general problem of combined instruction scheduling and register
-// allocation is more difficult than either, and both problems are already quite
-// difficult. However, the 6502 has much more circularity between the two
-// problems, owing to its irregularity. Luckily, that same irregularity makes
-// the space of possible solutions have extremely sharp gradients, which allows
-// heuristic techniques to work well. This works much less well if the problems
-// are considered separately, since a large don't-care region in one problem may
-// have an overwhelming preference in the in the other.
+// Unlike MachineScheduler, this operates on SSA, since the MOS register
+// allocator takes SSA. This pass also performs two-address instruction
+// chaining and commutation. Constants, vreg-vreg copies, and REG_SEQUENCE are
+// left alone, since they are handled symbolically by the register allocator.
 //
 //===----------------------------------------------------------------------===//
 
-#include "MOSRegAlloc.h"
+#include "MOSSched.h"
 
 #include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
@@ -32,7 +23,7 @@
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 
-#define DEBUG_TYPE "mos-regalloc"
+#define DEBUG_TYPE "mos-sched"
 
 using namespace llvm;
 
@@ -49,12 +40,12 @@ struct SchedulingDAG {
   void clear();
 };
 
-class MOSRegAlloc : public MachineFunctionPass {
+class MOSSched : public MachineFunctionPass {
 public:
   static char ID;
 
-  MOSRegAlloc() : MachineFunctionPass(ID) {
-    llvm::initializeMOSRegAllocPass(*PassRegistry::getPassRegistry());
+  MOSSched() : MachineFunctionPass(ID) {
+    llvm::initializeMOSSchedPass(*PassRegistry::getPassRegistry());
   }
 
   bool runOnMachineFunction(MachineFunction &MF) override;
@@ -80,13 +71,13 @@ struct Node {
   void printEdges(StringRef Name, const SmallVector<Edge> &Edges) const;
 };
 
-bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
+bool MOSSched::runOnMachineFunction(MachineFunction &MF) {
   buildDAG(MF);
 
   return true;
 }
 
-void MOSRegAlloc::buildDAG(MachineFunction &MF) {
+void MOSSched::buildDAG(MachineFunction &MF) {
   const TargetInstrInfo &TII = *MF.getSubtarget().getInstrInfo();
   const TargetRegisterInfo &TRI = *MF.getSubtarget().getRegisterInfo();
 
@@ -172,8 +163,8 @@ void Node::printEdges(StringRef Name, const SmallVector<Edge> &Edges) const {
 
 } // namespace
 
-char MOSRegAlloc::ID = 0;
+char MOSSched::ID = 0;
 
-INITIALIZE_PASS(MOSRegAlloc, DEBUG_TYPE, "MOS Register Allocator", false, false)
+INITIALIZE_PASS(MOSSched, DEBUG_TYPE, "MOS Instruction Scheduler", false, false)
 
-MachineFunctionPass *llvm::createMOSRegAllocPass() { return new MOSRegAlloc(); }
+MachineFunctionPass *llvm::createMOSSchedPass() { return new MOSSched(); }
