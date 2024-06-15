@@ -3,8 +3,7 @@
 // Part of LLVM-MOS, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-//
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 //
 // This file defines the MOS instruction scheduler.
 //
@@ -18,6 +17,7 @@
 
 #include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
@@ -31,11 +31,13 @@ namespace {
 
 struct Node {
   unsigned Idx;
-  MachineInstr *Instr;
+  MachineInstr *MI;
+  SmallSet<Node *, 4> Predecessors;
 };
 
 struct SchedulingDAG {
-  SmallVector<Node, 0> Nodes;
+  SmallVector<Node, 10> Nodes;
+  DenseMap<const MachineInstr *, Node *> MINodes;
   unsigned NextIdx;
   void clear();
 };
@@ -75,10 +77,32 @@ void MOSSched::buildDAG() {
   DAG.clear();
 
   for (MachineInstr &MI : *MBB)
-    DAG.Nodes.push_back({DAG.NextIdx++, &MI});
+    DAG.Nodes.push_back({DAG.NextIdx++, &MI, {}});
+
+  unsigned I = 0;
+  for (MachineInstr &MI : *MBB)
+    DAG.MINodes.try_emplace(&MI, &DAG.Nodes[I++]);
+
+  const MachineRegisterInfo &MRI = MBB->getParent()->getRegInfo();
+  for (Node &N : DAG.Nodes) {
+    for (MachineOperand &MO : N.MI->explicit_uses()) {
+      if (!MO.isReg() || !MO.getReg().isVirtual())
+        continue;
+      MachineInstr *Def = MRI.getUniqueVRegDef(MO.getReg());
+      if (Def->getParent() != MBB)
+        continue;
+      N.Predecessors.insert(DAG.MINodes.find(Def)->second);
+    }
+  }
 
   for (const Node &N : DAG.Nodes) {
-    dbgs() << "Node " << N.Idx << ": " << *N.Instr;
+    dbgs() << "Node " << N.Idx << ": " << *N.MI;
+    if (!N.Predecessors.empty()) {
+      dbgs() << "Predecessors:";
+      for (Node *P : N.Predecessors)
+        dbgs() << ' ' << P->Idx;
+      dbgs() << '\n';
+    }
     dbgs() << '\n';
   }
 }
