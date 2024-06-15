@@ -168,8 +168,6 @@ let isPressureFineGrained = true in {
   def Yc : MOSReg8Class<(add Y)>;
   def Cc : MOSReg1Class<(add C)>;
   def Vc : MOSReg1Class<(add V)>;
-  def Nc : MOSReg1Class<(add N)>;
-  def Zc : MOSReg1Class<(add Z)>;
   def Pc : MOSReg8Class<(add P)>;
 }
 
@@ -188,11 +186,15 @@ let isPressureFineGrained = true in {
   def AY : MOSReg8Class<(add A, Y)>;
   def XY : MOSReg8Class<(add X, Y)>;
 }
-def Flag : MOSReg1Class<(add C, N, V, Z)>;
 let isAllocatable = false in {
+  def Flag : MOSReg1Class<(add C, N, V, Z)>;
   def AP : MOSReg8Class<(add A, P)>;
   def AXYP : MOSReg8Class<(add A, X, Y, P)>;
 }
+
+// While not directly used, unless this is present, the TableGen-erated intersection
+// register class between Anyi1 and Flags will not be allocatable.
+def AllocatableFlags : MOSReg1Class<(add Cc, Vc)>;
 
 // MOS assembly mnemonics may only have the following registers as parameters
 // following the comma in a mnemonic, e.g. lda hello, x
@@ -200,7 +202,7 @@ def MOSAsmParamRegClass : MOSReg8Class<(add X, Y, S)>;
 
 // Sum types of all available storage locations for a size.
 
-def Anyi1 : MOSReg1Class<(add (sequence "RC%uLSB", 0, !add(MaxImag8Regs, -1)), Flag, GPR_LSB)>;
+def Anyi1 : MOSReg1Class<(add (sequence "RC%uLSB", 0, !add(MaxImag8Regs, -1)), CV_GPR_LSB)>;
 def Anyi8 : MOSReg8Class<(add Imag8, GPR)>;
 
 def Fake : MOSReg<13, "Fake">;

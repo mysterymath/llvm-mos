@@ -66,6 +66,8 @@ private:
                           LostDebugLocObserver &LocObserver) const;
   bool legalizeICmp(LegalizerHelper &Helper, MachineRegisterInfo &MRI,
                     MachineInstr &MI) const;
+  bool legalizeSelect(LegalizerHelper &Helper, MachineRegisterInfo &MRI,
+                      MachineInstr &MI) const;
   bool legalizeAbs(LegalizerHelper &Helper, MachineRegisterInfo &MRI,
                    MachineInstr &MI) const;
   bool legalizePtrAdd(LegalizerHelper &Helper, MachineRegisterInfo &MRI,

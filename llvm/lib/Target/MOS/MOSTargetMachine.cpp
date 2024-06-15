@@ -257,6 +257,7 @@ bool MOSPassConfig::addLegalizeMachineIR() {
 void MOSPassConfig::addPreRegBankSelect() {
   if (getOptLevel() != CodeGenOptLevel::None)
     addPass(createMOSCombiner());
+  addPass(createMOSLowerSelectPass());
 }
 
 bool MOSPassConfig::addRegBankSelect() {

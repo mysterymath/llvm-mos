@@ -287,13 +287,6 @@ def DecDcpMB : MOSIncDecMB {
   let Predicates = [Has6502X];
 }
 
-// Generic G_SELECT analog. Lowered to real instructions and control flow
-// during scheduling / register allocation.
-def Select : MOSPseudo {
-  dag OutOperandList = (outs unknown:$dst);
-  dag InOperandList = (ins Anyi1:$tst, unknown:$true, unknown:$false);
-}
-
 // Use the diamond control flow pattern to load one of two immediates based on
 // the value of a flag. The output must either be to CV_GPR_LSB or GPR.
 def SelectImm : MOSPseudo {
