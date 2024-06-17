@@ -1,4 +1,4 @@
-body:             |
+ody:             |
   bb.1.entry:
     successors: %bb.2(0x80000000)
 2:
@@ -76,13 +76,13 @@ body:             |
     %285:ac = COPY %232
 
 3:
-    %223:ac, %224:cc, %284:vc = ADCImm %285, target-flags(lo) @flags, %227
+    %223:ac, %224:cc, dead %284:vc = ADCImm %285, target-flags(lo) @flags, %227
 
 4:
     %283:ac = COPY %233
 
 5:
-    %225:ac, %226:cc, %282:vc = ADCImm %283, target-flags(hi) @flags, %224
+    %225:ac, dead %226:cc, dead %282:vc = ADCImm %283, target-flags(hi) @flags, %224
 
 6:
     %218:imag16 = REG_SEQUENCE %223, %subreg.sublo, %225, %subreg.subhi
@@ -100,19 +100,19 @@ body:             |
     %206:ac, %207:cc = ASL %232
 
 3:
-    %208:ac, %203:cc = ROL %233, %207
+    %208:ac, dead %203:cc = ROL %233, %207
 
 4:
-    %197:ac, %198:cc, %281:vc = ADCImag8 %206, %232, %227
+    %197:ac, %198:cc, dead %281:vc = ADCImag8 %206, %232, %227
 
 5:
-    %199:ac, %200:cc, %280:vc = ADCImag8 %208, %233, %198
+    %199:ac, dead %200:cc, dead %280:vc = ADCImag8 %208, %233, %198
 
 6:
-    %188:ac, %189:cc, %279:vc = ADCImm %197, 3, %227
+    %188:ac, %189:cc, dead %279:vc = ADCImm %197, 3, %227
 
 7:
-    %190:ac, %191:cc, %278:vc = ADCImm %199, 0, %189
+    %190:ac, dead %191:cc, dead %278:vc = ADCImm %199, 0, %189
 
     CmpBrImm %bb.26, undef $z, 1, %190, 31, implicit-def $c
     JMP %bb.27
@@ -156,10 +156,10 @@ body:             |
     %165:ac = PHI %245, %bb.5, %146, %bb.23, %146, %bb.24
 
 2:
-    %156:ac, %157:cc, %277:vc = ADCImm %164, target-flags(lo) @flags, %227
+    %156:ac, %157:cc, dead %277:vc = ADCImm %164, target-flags(lo) @flags, %227
 
 3:
-    %158:ac, %159:cc, %276:vc = ADCImm %165, target-flags(hi) @flags, %157
+    %158:ac, dead %159:cc, dead %276:vc = ADCImm %165, target-flags(hi) @flags, %157
 
 4:
     %151:imag16 = REG_SEQUENCE %156, %subreg.sublo, %158, %subreg.subhi
@@ -168,10 +168,10 @@ body:             |
     STIndirIdx %11, %151, %216 :: (store (s8) into %ir.scevgep, !tbaa !3)
 
 6:
-    %144:ac, %145:cc, %274:vc = ADCImag8 %164, %275, %227
+    %144:ac, %145:cc, dead %274:vc = ADCImag8 %164, %275, %227
 
 7:
-    %146:ac, %147:cc, %272:vc = ADCImag8 %165, %273, %145
+    %146:ac, dead %147:cc, dead %272:vc = ADCImag8 %165, %273, %145
 
     CmpBrImm %bb.23, undef $z, 1, %146, 31, implicit-def $c
     JMP %bb.24
@@ -215,16 +215,16 @@ body:             |
     %108:gpr, %109:gpr = IncMB %232(tied-def 0), %233(tied-def 1), implicit-def $c, implicit-def $v
 
 2:
-    %102:ac, %103:cc, %271:vc = ADCImm %244, 3, %227
+    %102:ac, %103:cc, dead %271:vc = ADCImm %244, 3, %227
 
 3:
-    %104:ac, %105:cc, %270:vc = ADCImm %245, 0, %103
+    %104:ac, dead %105:cc, dead %270:vc = ADCImm %245, 0, %103
 
 4:
-    %94:ac, %95:cc, %269:vc = ADCImm %250, 2, %227
+    %94:ac, %95:cc, dead %269:vc = ADCImm %250, 2, %227
 
 5:
-    %96:ac, %97:cc, %268:vc = ADCImm %251, 0, %95
+    %96:ac, dead %97:cc, dead %268:vc = ADCImm %251, 0, %95
 
     CmpBrImm %bb.17, undef $z, 1, %109, 31, implicit-def $c
     JMP %bb.3
@@ -275,3 +275,5 @@ body:             |
 Step 1: Split into atomic scheduling units, including stubs for MBB begin and end.
   - Counts can be per MBB; no need to schedule across
   - Skip nodes that don't need to be scheduled (PHIs, Terminators)
+
+Step 2: Find dead defs and mark them
