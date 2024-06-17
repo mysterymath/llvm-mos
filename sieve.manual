@@ -7,7 +7,6 @@ ody:             |
 3:
     %266:gpr = LDImm target-flags(hi) @flags
 
-4:
     %267:imag16 = REG_SEQUENCE %265, %subreg.sublo, %266, %subreg.subhi
 
 5:
@@ -40,21 +39,27 @@ ody:             |
     ADJCALLSTACKDOWN 0, 0, implicit-def $rs0, implicit $rs0
 
 3:
+Preds: 2
     $rs1 = COPY %267
 
 4:
+Preds: 2
     $a = COPY %2
 
 5:
+Preds: 2
     $x = COPY %263
 
 6:
+Preds: 2
     $rc4 = COPY %264
 
 7:
+Preds: 2 3 4 5 6
     JSR &__memset, mos_csr, implicit $rs1, implicit $a, implicit $x, implicit $rc4
 
 8:
+Preds: 7
     ADJCALLSTACKUP 0, 0, implicit-def $rs0, implicit $rs0
 
 9:
@@ -72,22 +77,21 @@ ody:             |
     %232:imag8 = PHI %11, %bb.2, %108, %bb.8, %108, %bb.17
     %233:imag8 = PHI %11, %bb.2, %109, %bb.8, %109, %bb.17
 
-2:
     %285:ac = COPY %232
 
 3:
     %223:ac, %224:cc, dead %284:vc = ADCImm %285, target-flags(lo) @flags, %227
 
-4:
     %283:ac = COPY %233
 
 5:
+Preds: 3
     %225:ac, dead %226:cc, dead %282:vc = ADCImm %283, target-flags(hi) @flags, %224
 
-6:
     %218:imag16 = REG_SEQUENCE %223, %subreg.sublo, %225, %subreg.subhi
 
 7:
+Preds: 3 5
     %10:ac = LDIndirIdx %218, %216 :: (load (s8) from %ir.arrayidx7, !tbaa !3)
 
     CmpBrZero %bb.8, undef $z, 1, %10, implicit-def $c
@@ -100,18 +104,23 @@ ody:             |
     %206:ac, %207:cc = ASL %232
 
 3:
+Preds: 2
     %208:ac, dead %203:cc = ROL %233, %207
 
 4:
+Preds: 2
     %197:ac, %198:cc, dead %281:vc = ADCImag8 %206, %232, %227
 
 5:
+Preds: 3 4
     %199:ac, dead %200:cc, dead %280:vc = ADCImag8 %208, %233, %198
 
 6:
+Preds: 4
     %188:ac, %189:cc, dead %279:vc = ADCImm %197, 3, %227
 
 7:
+Preds: 5 6
     %190:ac, dead %191:cc, dead %278:vc = ADCImm %199, 0, %189
 
     CmpBrImm %bb.26, undef $z, 1, %190, 31, implicit-def $c
@@ -143,10 +152,7 @@ ody:             |
   bb.5.while.body.preheader:
     successors: %bb.6(0x80000000)
   
-2:
     %275:imag8 = COPY %250
-
-3:
     %273:imag8 = COPY %251
 
   bb.6.while.body:
@@ -159,18 +165,20 @@ ody:             |
     %156:ac, %157:cc, dead %277:vc = ADCImm %164, target-flags(lo) @flags, %227
 
 3:
+Preds: 2
     %158:ac, dead %159:cc, dead %276:vc = ADCImm %165, target-flags(hi) @flags, %157
 
-4:
     %151:imag16 = REG_SEQUENCE %156, %subreg.sublo, %158, %subreg.subhi
 
 5:
+Preds: 2 3
     STIndirIdx %11, %151, %216 :: (store (s8) into %ir.scevgep, !tbaa !3)
 
 6:
     %144:ac, %145:cc, dead %274:vc = ADCImag8 %164, %275, %227
 
 7:
+Preds: 6
     %146:ac, dead %147:cc, dead %272:vc = ADCImag8 %165, %273, %145
 
     CmpBrImm %bb.23, undef $z, 1, %146, 31, implicit-def $c
@@ -218,12 +226,14 @@ ody:             |
     %102:ac, %103:cc, dead %271:vc = ADCImm %244, 3, %227
 
 3:
+Preds: 2
     %104:ac, dead %105:cc, dead %270:vc = ADCImm %245, 0, %103
 
 4:
     %94:ac, %95:cc, dead %269:vc = ADCImm %250, 2, %227
 
 5:
+Preds: 4
     %96:ac, dead %97:cc, dead %268:vc = ADCImm %251, 0, %95
 
     CmpBrImm %bb.17, undef $z, 1, %109, 31, implicit-def $c
@@ -274,9 +284,17 @@ ody:             |
 
 Step 1: Split into atomic scheduling units, including stubs for MBB begin and end.
   - Counts can be per MBB; no need to schedule across
-  - Skip nodes that don't need to be scheduled (PHIs, Terminators)
+  - Skip nodes that don't need to be scheduled (PHIs, Terminators, vreg copies, REG_SEQUENCE)
 
 Step 2: Find dead defs and mark them
+
+Step 3: Mark precedent edges between scheduling units.
+ - No preds across basic blocks
+ - Vreg defs precede uses
+ - Look through vreg copies and REG_SEQUENCE
+ - ADJCALLSTACKDOWN precedes physreg defs before call
+ - ADJCALLSTACKDOWN and earlier physreg defs before call precede call
+ - call precedes ADJCALLSTACKUP
 
 A value should only be alive in a RC at loop entry if it can survive to at
 least one backedge. Otherwise, it would need to be reloaded  to that RC on
