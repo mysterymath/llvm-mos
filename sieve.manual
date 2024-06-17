@@ -277,3 +277,18 @@ Step 1: Split into atomic scheduling units, including stubs for MBB begin and en
   - Skip nodes that don't need to be scheduled (PHIs, Terminators)
 
 Step 2: Find dead defs and mark them
+
+A value should only be alive in a RC at loop entry if it can survive to at
+least one backedge. Otherwise, it would need to be reloaded  to that RC on
+every backedge, and it would be smaller and just as fast to do the reload in
+the loop header.
+
+Even before scheduling, we can construct a notion of "next use distance". The
+precise order of instructions isn't fixed, but the structure of the CFG and
+dependency graph is! We can consider distance to be the minimum path length to
+a use.
+
+Actually, that's *really* interesting, because we may have various defs and
+uses along those paths. Taking a trivial case, if every pass to a use has a use
+or def of another value in A, then the value couldn't possible survive in A to
+its next use!
