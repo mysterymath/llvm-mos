@@ -78,11 +78,13 @@ Preds: 7
     %233:imag8 = PHI %11, %bb.2, %109, %bb.8, %109, %bb.17
 
     %285:ac = COPY %232
+    %283:ac = COPY %233
+    %275:imag8 = COPY %250
+    %273:imag8 = COPY %251
 
 3:
     %223:ac, %224:cc, dead %284:vc = ADCImm %285, target-flags(lo) @flags, %227
 
-    %283:ac = COPY %233
 
 5:
 Preds: 3
@@ -152,8 +154,6 @@ Preds: 5 6
   bb.5.while.body.preheader:
     successors: %bb.6(0x80000000)
   
-    %275:imag8 = COPY %250
-    %273:imag8 = COPY %251
 
   bb.6.while.body:
     successors: %bb.23(0x40000000), %bb.24(0x40000000)
@@ -282,19 +282,21 @@ Preds: 4
 
 ...
 
-Step 1: Split into atomic scheduling units, including stubs for MBB begin and end.
+Step: Split into atomic scheduling units, including stubs for MBB begin and end.
   - Counts can be per MBB; no need to schedule across
   - Skip nodes that don't need to be scheduled (PHIs, Terminators, vreg copies, REG_SEQUENCE)
 
-Step 2: Find dead defs and mark them
+Step: Find dead defs and mark them
 
-Step 3: Mark precedent edges between scheduling units.
+Step: Mark precedent edges between scheduling units.
  - No preds across basic blocks
  - Vreg defs precede uses
  - Look through vreg copies and REG_SEQUENCE
  - ADJCALLSTACKDOWN precedes physreg defs before call
  - ADJCALLSTACKDOWN and earlier physreg defs before call precede call
  - call precedes ADJCALLSTACKUP
+
+Step: Move vreg-def COPY and REG_SEQUENCE to right below their sources.
 
 A value should only be alive in a RC at loop entry if it can survive to at
 least one backedge. Otherwise, it would need to be reloaded  to that RC on
