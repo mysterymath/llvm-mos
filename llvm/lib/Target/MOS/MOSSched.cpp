@@ -76,12 +76,13 @@ void MOSSched::scheduleBlock(MachineBasicBlock &MBB) {
 void MOSSched::buildDAG() {
   DAG.clear();
 
-  for (MachineInstr &MI : *MBB)
+  for (MachineInstr &MI : *MBB) {
+    if (MI.isPHI() || MI.isTerminator())
+      continue;
     DAG.Nodes.push_back({DAG.NextIdx++, &MI, {}});
-
-  unsigned I = 0;
-  for (MachineInstr &MI : *MBB)
-    DAG.MINodes.try_emplace(&MI, &DAG.Nodes[I++]);
+  }
+  for (Node &N : DAG.Nodes)
+    DAG.MINodes.try_emplace(N.MI, &N);
 
   const MachineRegisterInfo &MRI = MBB->getParent()->getRegInfo();
   for (Node &N : DAG.Nodes) {
@@ -91,7 +92,10 @@ void MOSSched::buildDAG() {
       MachineInstr *Def = MRI.getUniqueVRegDef(MO.getReg());
       if (Def->getParent() != MBB)
         continue;
-      N.Predecessors.insert(DAG.MINodes.find(Def)->second);
+      auto It = DAG.MINodes.find(Def);
+      if (It == DAG.MINodes.end())
+        continue;
+      N.Predecessors.insert(It->second);
     }
   }
 
