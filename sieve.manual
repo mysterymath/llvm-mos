@@ -1,0 +1,277 @@
+body:             |
+  bb.1.entry:
+    successors: %bb.2(0x80000000)
+2:
+    %265:gpr = LDImm target-flags(lo) @flags
+
+3:
+    %266:gpr = LDImm target-flags(hi) @flags
+
+4:
+    %267:imag16 = REG_SEQUENCE %265, %subreg.sublo, %266, %subreg.subhi
+
+5:
+    %2:gpr = LDImm 1
+
+6:
+    %263:gpr = LDImm -1
+
+7:
+    %264:gpr = LDImm 31
+
+8:
+    %11:ac = LDImm 0
+
+9:
+    %262:gpr = LDImm 3
+
+10:
+    %227:cc = LDImm1 0
+
+11:
+    %216:yc = LDImm 0
+
+  bb.2.for.cond1.preheader:
+    successors: %bb.3(0x80000000)
+    %258:anyi8 = PHI %2, %bb.1, %67, %bb.9, %67, %bb.11
+    %259:anyi8 = PHI %11, %bb.1, %68, %bb.9, %68, %bb.11
+
+2:
+    ADJCALLSTACKDOWN 0, 0, implicit-def $rs0, implicit $rs0
+
+3:
+    $rs1 = COPY %267
+
+4:
+    $a = COPY %2
+
+5:
+    $x = COPY %263
+
+6:
+    $rc4 = COPY %264
+
+7:
+    JSR &__memset, mos_csr, implicit $rs1, implicit $a, implicit $x, implicit $rc4
+
+8:
+    ADJCALLSTACKUP 0, 0, implicit-def $rs0, implicit $rs0
+
+9:
+  <end>
+  
+  bb.3.for.body6:
+    successors: %bb.8(0x30000000), %bb.4(0x50000000)
+  
+    %250:ac = PHI %262, %bb.2, %94, %bb.8, %94, %bb.17
+    %251:ac = PHI %11, %bb.2, %96, %bb.8, %96, %bb.17
+    %244:ac = PHI %262, %bb.2, %102, %bb.8, %102, %bb.17
+    %245:ac = PHI %11, %bb.2, %104, %bb.8, %104, %bb.17
+    %238:anyi8 = PHI %11, %bb.2, %114, %bb.8, %114, %bb.17
+    %239:anyi8 = PHI %11, %bb.2, %115, %bb.8, %115, %bb.17
+    %232:imag8 = PHI %11, %bb.2, %108, %bb.8, %108, %bb.17
+    %233:imag8 = PHI %11, %bb.2, %109, %bb.8, %109, %bb.17
+
+2:
+    %285:ac = COPY %232
+
+3:
+    %223:ac, %224:cc, %284:vc = ADCImm %285, target-flags(lo) @flags, %227
+
+4:
+    %283:ac = COPY %233
+
+5:
+    %225:ac, %226:cc, %282:vc = ADCImm %283, target-flags(hi) @flags, %224
+
+6:
+    %218:imag16 = REG_SEQUENCE %223, %subreg.sublo, %225, %subreg.subhi
+
+7:
+    %10:ac = LDIndirIdx %218, %216 :: (load (s8) from %ir.arrayidx7, !tbaa !3)
+
+    CmpBrZero %bb.8, undef $z, 1, %10, implicit-def $c
+    JMP %bb.4
+  
+  bb.4.if.then:
+    successors: %bb.26(0x40000000), %bb.27(0x40000000)
+
+2:
+    %206:ac, %207:cc = ASL %232
+
+3:
+    %208:ac, %203:cc = ROL %233, %207
+
+4:
+    %197:ac, %198:cc, %281:vc = ADCImag8 %206, %232, %227
+
+5:
+    %199:ac, %200:cc, %280:vc = ADCImag8 %208, %233, %198
+
+6:
+    %188:ac, %189:cc, %279:vc = ADCImm %197, 3, %227
+
+7:
+    %190:ac, %191:cc, %278:vc = ADCImm %199, 0, %189
+
+    CmpBrImm %bb.26, undef $z, 1, %190, 31, implicit-def $c
+    JMP %bb.27
+  
+  bb.26.if.then:
+    successors: %bb.7(0x40000000), %bb.28(0x40000000)
+  
+2:
+    %175:cc = CMPImm %188, 255
+
+    GBR %bb.7, %175, 1, implicit-def $c
+    JMP %bb.28
+  
+  bb.27.if.then:
+    successors: %bb.7(0x40000000), %bb.28(0x40000000)
+  
+1:
+    %180:cc = CMPImm %190, 31
+
+    GBR %bb.7, %180, 1, implicit-def $c
+    JMP %bb.28
+  
+  bb.28.if.then:
+    successors: %bb.5(0x80000000)
+
+    JMP %bb.5
+  
+  bb.5.while.body.preheader:
+    successors: %bb.6(0x80000000)
+  
+2:
+    %275:imag8 = COPY %250
+
+3:
+    %273:imag8 = COPY %251
+
+  bb.6.while.body:
+    successors: %bb.23(0x40000000), %bb.24(0x40000000)
+  
+    %164:ac = PHI %244, %bb.5, %144, %bb.23, %144, %bb.24
+    %165:ac = PHI %245, %bb.5, %146, %bb.23, %146, %bb.24
+
+2:
+    %156:ac, %157:cc, %277:vc = ADCImm %164, target-flags(lo) @flags, %227
+
+3:
+    %158:ac, %159:cc, %276:vc = ADCImm %165, target-flags(hi) @flags, %157
+
+4:
+    %151:imag16 = REG_SEQUENCE %156, %subreg.sublo, %158, %subreg.subhi
+
+5:
+    STIndirIdx %11, %151, %216 :: (store (s8) into %ir.scevgep, !tbaa !3)
+
+6:
+    %144:ac, %145:cc, %274:vc = ADCImag8 %164, %275, %227
+
+7:
+    %146:ac, %147:cc, %272:vc = ADCImag8 %165, %273, %145
+
+    CmpBrImm %bb.23, undef $z, 1, %146, 31, implicit-def $c
+    JMP %bb.24
+  
+  bb.23.while.body:
+    successors: %bb.6(0x40000000), %bb.25(0x40000000)
+  
+2:
+    %131:cc = CMPImm %144, 255
+
+    GBR %bb.6, %131, 0, implicit-def $c
+    JMP %bb.25
+  
+  bb.24.while.body:
+    successors: %bb.6(0x40000000), %bb.25(0x40000000)
+  
+1:
+    %136:cc = CMPImm %146, 31
+
+    GBR %bb.6, %136, 0, implicit-def $c
+    JMP %bb.25
+  
+  bb.25.while.body:
+    successors: %bb.7(0x80000000)
+  
+    JMP %bb.7
+  
+  bb.7.while.end:
+    successors: %bb.8(0x80000000)
+  
+1:
+    %118:anyi8, %119:anyi8 = IncMB %238(tied-def 0), %239(tied-def 1), implicit-def $c, implicit-def $v
+  
+  bb.8.for.inc14:
+    successors: %bb.17(0x40000000), %bb.3(0x40000000)
+  
+    %114:anyi8 = PHI %118, %bb.7, %238, %bb.3
+    %115:anyi8 = PHI %119, %bb.7, %239, %bb.3
+
+1:
+    %108:gpr, %109:gpr = IncMB %232(tied-def 0), %233(tied-def 1), implicit-def $c, implicit-def $v
+
+2:
+    %102:ac, %103:cc, %271:vc = ADCImm %244, 3, %227
+
+3:
+    %104:ac, %105:cc, %270:vc = ADCImm %245, 0, %103
+
+4:
+    %94:ac, %95:cc, %269:vc = ADCImm %250, 2, %227
+
+5:
+    %96:ac, %97:cc, %268:vc = ADCImm %251, 0, %95
+
+    CmpBrImm %bb.17, undef $z, 1, %109, 31, implicit-def $c
+    JMP %bb.3
+  
+  bb.17.for.inc14:
+    successors: %bb.19(0x40000000), %bb.3(0x40000000)
+  
+    CmpBrImm %bb.19, undef $z, 1, %108, 255, implicit-def $c
+    JMP %bb.3
+  
+  bb.19.for.inc14:
+    successors: %bb.9(0x80000000)
+  
+    JMP %bb.9
+  
+  bb.9.for.inc17:
+    successors: %bb.11(0x40000000), %bb.2(0x40000000)
+  
+1:
+    %67:gpr, %68:anyi8 = IncMB %258(tied-def 0), %259(tied-def 1), implicit-def $c, implicit-def $v
+
+    CmpBrZero %bb.11, undef $z, 1, %68, implicit-def $c
+    JMP %bb.2
+  
+  bb.11.for.inc17:
+    successors: %bb.13(0x40000000), %bb.2(0x40000000)
+  
+    CmpBrImm %bb.13, undef $z, 1, %67, 11, implicit-def $c
+    JMP %bb.2
+  
+  bb.13.for.inc17:
+    successors: %bb.10(0x80000000)
+  
+    JMP %bb.10
+  
+  bb.10.for.end19:
+
+1:
+    $a = COPY %114
+
+2:
+    $x = COPY %115
+
+    RTS implicit $a, implicit $x
+
+...
+
+Step 1: Split into atomic scheduling units, including stubs for MBB begin and end.
+  - Counts can be per MBB; no need to schedule across
+  - Skip nodes that don't need to be scheduled (PHIs, Terminators)
