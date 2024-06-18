@@ -19,6 +19,8 @@
 #include "MOS.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
@@ -50,6 +52,8 @@ public:
     llvm::initializeMOSSchedPass(*PassRegistry::getPassRegistry());
   }
 
+  void getAnalysisUsage(AnalysisUsage &AU) const override;
+
   bool runOnMachineFunction(MachineFunction &MF) override;
 
   void scheduleBlock(MachineBasicBlock &MBB);
@@ -59,7 +63,16 @@ public:
   SchedulingDAG DAG;
 };
 
+void MOSSched::getAnalysisUsage(AnalysisUsage &AU) const {
+  AU.addRequired<MachineDominatorTreeWrapperPass>();
+  AU.addRequired<MachineLoopInfo>();
+  MachineFunctionPass::getAnalysisUsage(AU);
+}
+
 bool MOSSched::runOnMachineFunction(MachineFunction &MF) {
+  getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree().print(dbgs());
+  getAnalysis<MachineLoopInfo>().getBase().print(dbgs());
+
   for (MachineBasicBlock &MBB : MF)
     scheduleBlock(MBB);
 

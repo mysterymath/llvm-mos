@@ -1,4 +1,4 @@
-ody:             |
+body:             |
   bb.1.entry:
     successors: %bb.2(0x80000000)
 2:
@@ -297,6 +297,28 @@ Step: Mark precedent edges between scheduling units.
  - call precedes ADJCALLSTACKUP
 
 Step: Move vreg-def COPY and REG_SEQUENCE to right below their sources.
+
+Step: Compute dominator tree and loop info
+1
+  2 header
+    3 header
+      8 latch 3
+        17 latch 3, exiting 3
+          19
+            9 latch 2
+              11 latch 2, exiting 2
+                13
+                  10
+      4
+        26
+        7
+        28
+          5
+            6 header
+              23 latch 6, exiting 6
+              25
+              24 latch 6, exiting 6
+        27
 
 A value should only be alive in a RC at loop entry if it can survive to at
 least one backedge. Otherwise, it would need to be reloaded  to that RC on
