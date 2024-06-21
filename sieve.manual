@@ -24,9 +24,6 @@ body:             |
 9:
     %262 = LDImm 3
 
-10:
-    %227 = LDImm1 0
-
 11:
     %216 = LDImm 0
 
@@ -67,11 +64,11 @@ body:             |
     $a = COPY %232
     $c = LDImm1 0
     $a, $c, dead $v = ADCImm $a, target-flags(lo) @flags, $c
-    %218 = UNDEF
-    %282 = INSERT_SUBREG $a, %218, sublo
+    %218:imag16 = UNDEF
+    %282:imag16 = INSERT_SUBREG $a, %218, sublo
     $a = COPY %233
     $a, dead $c, dead $v = ADCImm $a, target-flags(hi) @flags, $c
-    %283 = INSERT_SUBREG $a, %218, subhi
+    %283:imag16 = INSERT_SUBREG $a, %282:imag16, subhi
     $y = COPY %216
     $a = LDIndirIdx %283, $y :: (load (s8) from %ir.arrayidx7, !tbaa !3)
     CmpBrZero %bb.8, undef $z, 1, $a, implicit-def $c
@@ -129,14 +126,14 @@ body:             |
     %165 = PHI %245, %bb.5, %146, %bb.23, %146, %bb.24
 
     $a = COPY %164
-    $c = COPY %227
+    $c = LDImm1 0
     $a, $c, dead $v = ADCImm $a, target-flags(lo) @flags, $c
     %300 = UNDEF16
     %301 = INSERT_SUBREG %300, $a, sublo
     $a = COPY %165
     %158, dead %159, dead %276 = ADCImm $a, target-flags(hi) @flags, $c
     %151 = INSERT_SUBREG %158, %301, %subreg.subhi
-    $a = COPY %11
+    $a = LDImm 0
     $y = COPY %216
     STIndirIdx $a, %151, %216 :: (store (s8) into %ir.scevgep, !tbaa !3)
     $a = COPY %164
@@ -183,7 +180,7 @@ body:             |
 
 2:
     $a = COPY %244
-    $c = COPY %227
+    $c = LDImm1 0
     $a, $c, dead %271 = ADCImm $a, 3, $c
     %102 = COPY $a
     $a = COPY %245
@@ -192,7 +189,7 @@ body:             |
 
 4:
     $a = COPY %250
-    $c = COPY %227
+    $c = LDImm1 0
     $a, $c, dead %269 = ADCImm $a, 2, $c
     %94 = COPY $a
     $a = COPY %251
