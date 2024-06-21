@@ -35,36 +35,23 @@ body:             |
     %258 = PHI %2, %bb.1, %67, %bb.9, %67, %bb.11
     %259 = PHI %11, %bb.1, %68, %bb.9, %68, %bb.11
 
-2:
     ADJCALLSTACKDOWN 0, 0, implicit-def $rs0, implicit $rs0
 
 3:
-Preds: 2
     $rs1 = COPY %267
 
 4:
-Preds: 2
     $a = COPY %2
 
 5:
-Preds: 2
     $x = COPY %263
 
 6:
-Preds: 2
     $rc4 = COPY %264
 
-7:
-Preds: 2 3 4 5 6
     JSR &__memset, mos_csr, implicit $rs1, implicit $a, implicit $x, implicit $rc4
-
-8:
-Preds: 7
     ADJCALLSTACKUP 0, 0, implicit-def $rs0, implicit $rs0
 
-9:
-  <end>
-  
   bb.3.for.body6:
     successors: %bb.8(0x30000000), %bb.4(0x50000000)
   
@@ -77,68 +64,53 @@ Preds: 7
     %232 = PHI %11, %bb.2, %108, %bb.8, %108, %bb.17
     %233 = PHI %11, %bb.2, %109, %bb.8, %109, %bb.17
 
-3:
-    %223, %224, dead %284 = ADCImm %232, target-flags(lo) @flags, %227
-
-
-5:
-Preds: 3
-    %225, dead %226, dead %282 = ADCImm %233, target-flags(hi) @flags, %224
-
-    %218 = REG_SEQUENCE %223, %subreg.sublo, %225, %subreg.subhi
-
-7:
-Preds: 3 5
-    %10 = LDIndirIdx %218, %216 :: (load (s8) from %ir.arrayidx7, !tbaa !3)
-
-    CmpBrZero %bb.8, undef $z, 1, %10, implicit-def $c
+    $a = COPY %232
+    $c = LDImm1 0
+    $a, $c, dead $v = ADCImm $a, target-flags(lo) @flags, $c
+    %218 = UNDEF
+    %282 = INSERT_SUBREG $a, %218, sublo
+    $a = COPY %233
+    $a, dead $c, dead $v = ADCImm $a, target-flags(hi) @flags, $c
+    %283 = INSERT_SUBREG $a, %218, subhi
+    $y = COPY %216
+    $a = LDIndirIdx %283, $y :: (load (s8) from %ir.arrayidx7, !tbaa !3)
+    CmpBrZero %bb.8, undef $z, 1, $a, implicit-def $c
     JMP %bb.4
   
   bb.4.if.then:
     successors: %bb.26(0x40000000), %bb.27(0x40000000)
 
-2:
-    %206, %207 = ASL %232
-
-3:
-Preds: 2
-    %208, dead %203 = ROL %233, %207
-
-4:
-Preds: 2
-    %197, %198, dead %281 = ADCImag8 %206, %232, %227
-
-5:
-Preds: 3 4
-    %199, dead %200, dead %280 = ADCImag8 %208, %233, %198
-
-6:
-Preds: 4
-    %188, %189, dead %279 = ADCImm %197, 3, %227
-
-7:
-Preds: 5 6
-    %190, dead %191, dead %278 = ADCImm %199, 0, %189
-
-    CmpBrImm %bb.26, undef $z, 1, %190, 31, implicit-def $c
+    %206, $c = ASL %232
+    %208, dead $c = ROL %233, $c
+    $a = COPY %206
+    $c = LDImm1 0
+    $a, $c, dead $v = ADCImag8 $a, %232, $c
+    %197 = COPY $a
+    $a = COPY %208
+    $a, dead $c, dead $v = ADCImag8 $a, %233, $c
+    %199 = COPY $a
+    $a = COPY %197
+    $c = LDImm1 0
+    $a, $c, dead $v = ADCImm $a, 3, $c
+    %188 = COPY $a
+    $a = COPY %199
+    $a, dead $c, dead $v = ADCImm $a, 0, $c
+    %190 = COPY $a
+    CmpBrImm %bb.26, undef $z, 1, $a, 31, implicit-def $c
     JMP %bb.27
   
   bb.26.if.then:
     successors: %bb.7(0x40000000), %bb.28(0x40000000)
   
-2:
-    %175 = CMPImm %188, 255
-
-    GBR %bb.7, %175, 1, implicit-def $c
+    $c = CMPImm %188, 255
+    GBR %bb.7, $c, 1, implicit-def $c
     JMP %bb.28
   
   bb.27.if.then:
     successors: %bb.7(0x40000000), %bb.28(0x40000000)
   
-1:
-    %180 = CMPImm %190, 31
-
-    GBR %bb.7, %180, 1, implicit-def $c
+    $c = CMPImm %190, 31
+    GBR %bb.7, $c, 1, implicit-def $c
     JMP %bb.28
   
   bb.28.if.then:
@@ -156,45 +128,38 @@ Preds: 5 6
     %164 = PHI %244, %bb.5, %144, %bb.23, %144, %bb.24
     %165 = PHI %245, %bb.5, %146, %bb.23, %146, %bb.24
 
-2:
-    %156, %157, dead %277 = ADCImm %164, target-flags(lo) @flags, %227
-
-3:
-Preds: 2
-    %158, dead %159, dead %276 = ADCImm %165, target-flags(hi) @flags, %157
-
-    %151 = REG_SEQUENCE %156, %subreg.sublo, %158, %subreg.subhi
-
-5:
-Preds: 2 3
-    STIndirIdx %11, %151, %216 :: (store (s8) into %ir.scevgep, !tbaa !3)
-
-6:
-    %144, %145:cc, dead %274 = ADCImag8 %164, %250, %227
-
-7:
-Preds: 6
-    %146, dead %147, dead %272 = ADCImag8 %165, %251, %145
-
-    CmpBrImm %bb.23, undef $z, 1, %146, 31, implicit-def $c
+    $a = COPY %164
+    $c = COPY %227
+    $a, $c, dead $v = ADCImm $a, target-flags(lo) @flags, $c
+    %300 = UNDEF16
+    %301 = INSERT_SUBREG %300, $a, sublo
+    $a = COPY %165
+    %158, dead %159, dead %276 = ADCImm $a, target-flags(hi) @flags, $c
+    %151 = INSERT_SUBREG %158, %301, %subreg.subhi
+    $a = COPY %11
+    $y = COPY %216
+    STIndirIdx $a, %151, %216 :: (store (s8) into %ir.scevgep, !tbaa !3)
+    $a = COPY %164
+    $c = LDImm1 0
+    $a, $c, dead $v = ADCImag8 $a, %250, $c
+    %144 = COPY $a
+    $a = COPY %165
+    $a, dead $c, dead $v = ADCImag8 %165, %251, $c
+    CmpBrImm %bb.23, undef $z, 1, $a, 31, implicit-def $c
     JMP %bb.24
   
   bb.23.while.body:
     successors: %bb.6(0x40000000), %bb.25(0x40000000)
   
-2:
-    %131 = CMPImm %144, 255
-
-    GBR %bb.6, %131, 0, implicit-def $c
+    $c = CMPImm %144, 255
+    GBR %bb.6, $c, 0, implicit-def $c
     JMP %bb.25
   
   bb.24.while.body:
     successors: %bb.6(0x40000000), %bb.25(0x40000000)
   
-1:
-    %136 = CMPImm %146, 31
-
-    GBR %bb.6, %136, 0, implicit-def $c
+    $c = CMPImm %146, 31
+    GBR %bb.6, $c, 0, implicit-def $c
     JMP %bb.25
   
   bb.25.while.body:
@@ -205,7 +170,6 @@ Preds: 6
   bb.7.while.end:
     successors: %bb.8(0x80000000)
   
-1:
     %118, %119 = IncMB %238(tied-def 0), %239(tied-def 1), implicit-def $c, implicit-def $v
   
   bb.8.for.inc14:
@@ -218,18 +182,22 @@ Preds: 6
     %108, %109 = IncMB %232(tied-def 0), %233(tied-def 1), implicit-def $c, implicit-def $v
 
 2:
-    %102, %103, dead %271 = ADCImm %244, 3, %227
-
-3:
-Preds: 2
-    %104, dead %105, dead %270 = ADCImm %245, 0, %103
+    $a = COPY %244
+    $c = COPY %227
+    $a, $c, dead %271 = ADCImm $a, 3, $c
+    %102 = COPY $a
+    $a = COPY %245
+    $a, dead $c, dead $v = ADCImm $a, 0, $c
+    %104 = COPY $a
 
 4:
-    %94, %95, dead %269 = ADCImm %250, 2, %227
-
-5:
-Preds: 4
-    %96, dead %97, dead %268 = ADCImm %251, 0, %95
+    $a = COPY %250
+    $c = COPY %227
+    $a, $c, dead %269 = ADCImm $a, 2, $c
+    %94 = COPY $a
+    $a = COPY %251
+    $a, dead $c, dead $v = ADCImm $a, 0, $c
+    %96 = COPY $a
 
     CmpBrImm %bb.17, undef $z, 1, %109, 31, implicit-def $c
     JMP %bb.3
@@ -248,9 +216,7 @@ Preds: 4
   bb.9.for.inc17:
     successors: %bb.11(0x40000000), %bb.2(0x40000000)
   
-1:
     %67, %68 = IncMB %258(tied-def 0), %259(tied-def 1), implicit-def $c, implicit-def $v
-
     CmpBrZero %bb.11, undef $z, 1, %68, implicit-def $c
     JMP %bb.2
   
@@ -266,7 +232,6 @@ Preds: 4
     JMP %bb.10
   
   bb.10.for.end19:
-
 1:
     $a = COPY %114
 
@@ -320,3 +285,15 @@ live its whole life in a register, but if it can, it's imperative that it do
 so. Let's start by weeding out impossibilities.
 
 Step: Erase RCs and coalesce COPY; we'll recover them later.
+
+Step: Do easy scheduling and scheduling on V, then C, then A, to join single RC
+defs/uses with a compatible classes. Immediately rewrite to phys regs. Split
+REG_SEQUENCE as parts are scheduled.
+
+Step: Also, merge together scheduling units along those lines. Actually, *just*
+do this; the rest will fall out. (e.g. first merge all V opportunities, then
+all C opportunities, then all unique GPR opportunities, etc.). It's only an
+opportunity if nothing if the preg is free between the two vreg copies on
+either side of the link. Accordingly, we can just summarily rewrite!
+ 
+Step: Replace constants of copies that have been clobbered with remats.
