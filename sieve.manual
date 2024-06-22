@@ -3,11 +3,10 @@ body:             |
     successors: %bb.2(0x80000000)
 2:
     %265 = LDImm target-flags(lo) @flags
-
-3:
+    %302 = UNDEF16
+    %303 = INSERT_SUBREG %302, %265, lo
     %266 = LDImm target-flags(hi) @flags
-
-    %267 = REG_SEQUENCE %265, %subreg.sublo, %266, %subreg.subhi
+    %267 = INSERT_SUBREG %303, %266, hi
 
 5:
     %2 = LDImm 1
