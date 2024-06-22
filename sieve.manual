@@ -4,20 +4,11 @@ body:             |
 5:
     %2 = LDImm 1
 
-6:
-    %263 = LDImm -1
-
-7:
-    %264 = LDImm 31
-
 8:
     %11 = LDImm 0
 
 9:
     %262 = LDImm 3
-
-11:
-    %216 = LDImm 0
 
   bb.2.for.cond1.preheader:
     successors: %bb.3(0x80000000)
@@ -33,16 +24,18 @@ body:             |
     $rc3 = COPY %266
 
 4:
-    $a = COPY %2
+    $a = LDImm 1
 
 5:
-    $x = COPY %263
+    $x = LDImm -1
 
 6:
-    $rc4 = COPY %264
+    %302 = LDImm 31
+    $rc4 = COPY %302
 
     JSR &__memset, mos_csr, implicit $rs1, implicit $a, implicit $x, implicit $rc4
     ADJCALLSTACKUP 0, 0, implicit-def $rs0, implicit $rs0
+    %216 = LDImm 0
 
   bb.3.for.body6:
     successors: %bb.8(0x30000000), %bb.4(0x50000000)
@@ -292,6 +285,19 @@ Step: Merge MBB internal uses when all conflicts can be moved outside the unit.
  
 Step: Replace constants of copies that have been clobbered with remats.
 
-Step: Remat physreg COPY in a loop where the source couldn't possibly survive
-through the whole loop in that register. Such would always require a COPY, and
-it's better to remat.
+Step: Remat physreg COPY of constant in a loop where the source couldn't
+possibly survive through the whole loop in that register. Such would always
+require a COPY, and it's better to remat.
+  - This might be *surprisingly* general. Does it apply to non-constants too?
+  - Don't remat into an inner loop if it might survive in the outer!
+
+Invariant: Registers with subregs are top-down assignable.
+
+As nodes are sheduled, continuously assign subregs to internal-only vregs and
+split as necessary. This generalizes the single-register case?
+
+Step: If a tie doesn't kill its argument, we have a problem. We need to insert
+a copy of its argument, and either rewrite the tie to use the copy or rewrite
+all other uses to use the copy. Either will make the tie kill its argument.
+Look at what inserting either kind of copy does to the performance gradient of
+the resulting RCs; choose the better.
