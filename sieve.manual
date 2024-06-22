@@ -1,13 +1,6 @@
 body:             |
   bb.1.entry:
     successors: %bb.2(0x80000000)
-2:
-    %265 = LDImm target-flags(lo) @flags
-    %302 = UNDEF16
-    %303 = INSERT_SUBREG %302, %265, lo
-    %266 = LDImm target-flags(hi) @flags
-    %267 = INSERT_SUBREG %303, %266, hi
-
 5:
     %2 = LDImm 1
 
@@ -33,8 +26,11 @@ body:             |
 
     ADJCALLSTACKDOWN 0, 0, implicit-def $rs0, implicit $rs0
 
-3:
-    $rs1 = COPY %267
+2:
+    %265 = LDImm target-flags(lo) @flags
+    $rc2 = COPY %265
+    %266 = LDImm target-flags(hi) @flags
+    $rc3 = COPY %266
 
 4:
     $a = COPY %2
@@ -291,5 +287,11 @@ do this; the rest will fall out. (e.g. first merge all V opportunities, then
 all C opportunities, then all unique GPR opportunities, etc.). It's only an
 opportunity if nothing if the preg is free between the two vreg copies on
 either side of the link. Accordingly, we can just summarily rewrite!
+
+Step: Merge MBB internal uses when all conflicts can be moved outside the unit. 
  
 Step: Replace constants of copies that have been clobbered with remats.
+
+Step: Remat physreg COPY in a loop where the source couldn't possibly survive
+through the whole loop in that register. Such would always require a COPY, and
+it's better to remat.
