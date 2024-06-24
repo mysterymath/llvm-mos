@@ -1,15 +1,9 @@
 body:             |
   bb.1.entry:
     successors: %bb.2(0x80000000)
-5:
-    %2 = LDImm 1
-
-8:
-    %11 = LDImm 0
-
-9:
     %262 = LDImm 3
-
+    %2 = LDImm 1
+    %11 = LDImm 0
   bb.2.for.cond1.preheader:
     successors: %bb.3(0x80000000)
     %258 = PHI %2, %bb.1, %67, %bb.9, %67, %bb.11
@@ -17,22 +11,14 @@ body:             |
 
     ADJCALLSTACKDOWN 0, 0, implicit-def $rs0, implicit $rs0
 
-2:
-    %265 = LDImm target-flags(lo) @flags
+    %265:gpr = LDImm target-flags(lo) @flags
     $rc2 = COPY %265
-    %266 = LDImm target-flags(hi) @flags
+    %266:gpr = LDImm target-flags(hi) @flags
     $rc3 = COPY %266
-
-4:
-    $a = LDImm 1
-
-5:
-    $x = LDImm -1
-
-6:
-    %302 = LDImm 31
+    %302:gpr = LDImm 31
     $rc4 = COPY %302
-
+    $a = LDImm 1
+    $x = LDImm -1
     JSR &__memset, mos_csr, implicit $rs1, implicit $a, implicit $x, implicit $rc4
     ADJCALLSTACKUP 0, 0, implicit-def $rs0, implicit $rs0
     %216 = LDImm 0
@@ -162,20 +148,13 @@ body:             |
   
     %114 = PHI %118, %bb.7, %238, %bb.3
     %115 = PHI %119, %bb.7, %239, %bb.3
-
-1:
-    %108, %109 = IncMB %232(tied-def 0), %233(tied-def 1), implicit-def $c, implicit-def $v
-
-2:
-    $a = COPY %244
+    $a = COPY %24
     $c = LDImm1 0
     $a, $c, dead %271 = ADCImm $a, 3, $c
     %102 = COPY $a
     $a = COPY %245
     $a, dead $c, dead $v = ADCImm $a, 0, $c
     %104 = COPY $a
-
-4:
     $a = COPY %250
     $c = LDImm1 0
     $a, $c, dead %269 = ADCImm $a, 2, $c
@@ -183,7 +162,7 @@ body:             |
     $a = COPY %251
     $a, dead $c, dead $v = ADCImm $a, 0, $c
     %96 = COPY $a
-
+    %108, %109 = IncMB %232(tied-def 0), %233(tied-def 1), implicit-def $c, implicit-def $v
     CmpBrImm %bb.17, undef $z, 1, %109, 31, implicit-def $c
     JMP %bb.3
   
@@ -217,12 +196,8 @@ body:             |
     JMP %bb.10
   
   bb.10.for.end19:
-1:
     $a = COPY %114
-
-2:
     $x = COPY %115
-
     RTS implicit $a, implicit $x
 
 ...
@@ -301,3 +276,7 @@ a copy of its argument, and either rewrite the tie to use the copy or rewrite
 all other uses to use the copy. Either will make the tie kill its argument.
 Look at what inserting either kind of copy does to the performance gradient of
 the resulting RCs; choose the better.
+
+Step: If all defs and uses are PHIs with equivalent distances, schedule in original order.
+
+Step: Schedule to avoid introducing unnecessary RC conflicts with remaining nodes.
