@@ -51,22 +51,22 @@ body:             |
   bb.4.if.then:
     successors: %bb.26(0x40000000), %bb.27(0x40000000)
 
-    %206, $c = ASL %232
-    %208, dead $c = ROL %233, $c
-    $a = COPY %206
+    $a = COPY %232
+    $a, $c = ASL $a
+    %304:imag8 = COPY %233
+    %208:imag8, dead $c = ROL %304, $c
     $c = LDImm1 0
     $a, $c, dead $v = ADCImag8 $a, %232, $c
-    %197 = COPY $a
+    %197:xy = COPY $a
     $a = COPY %208
     $a, dead $c, dead $v = ADCImag8 $a, %233, $c
-    %199 = COPY $a
-    $a = COPY %197
+    %199:xy = COPY $a
+    $a = COPY %197:xy
     $c = LDImm1 0
     $a, $c, dead $v = ADCImm $a, 3, $c
-    %188 = COPY $a
+    %188:xy = COPY $a
     $a = COPY %199
     $a, dead $c, dead $v = ADCImm $a, 0, $c
-    %190 = COPY $a
     CmpBrImm %bb.26, undef $z, 1, $a, 31, implicit-def $c
     JMP %bb.27
   
@@ -80,7 +80,7 @@ body:             |
   bb.27.if.then:
     successors: %bb.7(0x40000000), %bb.28(0x40000000)
   
-    $c = CMPImm %190, 31
+    $c = CMPImm $a, 31
     GBR %bb.7, $c, 1, implicit-def $c
     JMP %bb.28
   
