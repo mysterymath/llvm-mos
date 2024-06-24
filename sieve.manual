@@ -102,18 +102,18 @@ body:             |
     $a = COPY %164
     $c = LDImm1 0
     $a, $c, dead $v = ADCImm $a, target-flags(lo) @flags, $c
-    %300 = UNDEF16
-    %301 = INSERT_SUBREG %300, $a, sublo
+    %300:imag16 = UNDEF16
+    %301:imag16 = INSERT_SUBREG %300, $a, sublo
     $a = COPY %165
-    %158, dead %159, dead %276 = ADCImm $a, target-flags(hi) @flags, $c
-    %151 = INSERT_SUBREG %158, %301, %subreg.subhi
+    $a, dead $c, dead $v = ADCImm $a, target-flags(hi) @flags, $c
+    %151:imag16 = INSERT_SUBREG $a, %301, %subreg.subhi
     $a = LDImm 0
     $y = COPY %216
     STIndirIdx $a, %151, %216 :: (store (s8) into %ir.scevgep, !tbaa !3)
     $a = COPY %164
     $c = LDImm1 0
     $a, $c, dead $v = ADCImag8 $a, %250, $c
-    %144 = COPY $a
+    %144:xy = COPY $a
     $a = COPY %165
     $a, dead $c, dead $v = ADCImag8 %165, %251, $c
     CmpBrImm %bb.23, undef $z, 1, $a, 31, implicit-def $c
@@ -129,7 +129,7 @@ body:             |
   bb.24.while.body:
     successors: %bb.6(0x40000000), %bb.25(0x40000000)
   
-    $c = CMPImm %146, 31
+    $c = CMPImm $a, 31
     GBR %bb.6, $c, 0, implicit-def $c
     JMP %bb.25
   
@@ -280,3 +280,20 @@ the resulting RCs; choose the better.
 Step: If all defs and uses are PHIs with equivalent distances, schedule in original order.
 
 Step: Schedule to avoid introducing unnecessary RC conflicts with remaining nodes.
+
+I do think we'll need a better representation of REG_SEQUENCE. We want subreg
+liveness like Greedy has; it has to be possible to piecewise increment e.g.
+only the high part of a pointer without copying it elsewhere. The high byte
+dies by itself, but it produces a *new* 16-bit value. That is, 16-bit
+REG_SEQUENCEs being alive just apply additional constraints on the placement of
+their constituents.
+
+The time that we can assign RCs is the moment that we can *prove* that nothing
+in the interim will preclude that RC from def to all of its uses. That is, no
+already assigned reg conflicts, and all vreg conflicts have live ranges at
+least as long, so they can be evicted if need be.
+
+Scheduling manipulates the shape of the register conflict graph! That's the
+*only* thing it does on the 6502! Is there a way to directly analyze what a
+given scheduling action does to the graph, and greedily pick the most
+beneficial changes?
