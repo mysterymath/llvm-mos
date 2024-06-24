@@ -297,3 +297,23 @@ Scheduling manipulates the shape of the register conflict graph! That's the
 *only* thing it does on the 6502! Is there a way to directly analyze what a
 given scheduling action does to the graph, and greedily pick the most
 beneficial changes?
+
+Goal is to cover uses with as few def live ranges for each value as possible.
+Our approach has been to choose defs that interfere with only nodes that most
+nodes interfere with. Choosing the shortest live ranges approximates this,
+since they interfere with only the longest live ranges. But we can be more
+explicit!
+
+Okay, new plan! Copy around each def and use. We'll make a new classless VREG
+to stand in for the value itself. We can then treat this like a global copy
+coalescing problem. Take two consecutive vregs and say "Okay, I'm going to
+merge these together and delete the copy." We'll only do this if it's *legal*.
+That means that taking an option may force certain copies; we count those
+against it. This will tend towards shorter live rangest first.
+
+Does this put us in scope for something like iterated register coalescing? This
+looks quite "classical". NO! We're not doing graph coloring; we don't have
+fixed "variables".
+
+We'll still want to try this all by hand, but let's automate the
+copy-everywhere part and get a fresh copy of the function.
