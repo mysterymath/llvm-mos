@@ -33,12 +33,12 @@ namespace {
 
 struct Node {
   unsigned Idx;
-  MachineInstr *MI;
+  SmallVector<MachineInstr *, 0> MIs;
   SmallSet<Node *, 4> Predecessors;
 };
 
 struct SchedulingDAG {
-  SmallVector<Node, 10> Nodes;
+  SmallVector<Node, 0> Nodes;
   DenseMap<const MachineInstr *, Node *> MINodes;
   unsigned NextIdx;
   void clear();
@@ -55,12 +55,10 @@ public:
   void getAnalysisUsage(AnalysisUsage &AU) const override;
 
   bool runOnMachineFunction(MachineFunction &MF) override;
+  void buildDAGs();
 
-  void scheduleBlock(MachineBasicBlock &MBB);
-  void buildDAG();
-
-  MachineBasicBlock *MBB;
-  SchedulingDAG DAG;
+  MachineFunction *MF;
+  DenseMap<MachineBasicBlock *, SchedulingDAG> DAGs;
 };
 
 void MOSSched::getAnalysisUsage(AnalysisUsage &AU) const {
@@ -72,55 +70,54 @@ void MOSSched::getAnalysisUsage(AnalysisUsage &AU) const {
 bool MOSSched::runOnMachineFunction(MachineFunction &MF) {
   getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree().print(dbgs());
   getAnalysis<MachineLoopInfo>().getBase().print(dbgs());
-
-  for (MachineBasicBlock &MBB : MF)
-    scheduleBlock(MBB);
-
+  this->MF = &MF;
+  buildDAGs();
   return true;
 }
 
-void MOSSched::scheduleBlock(MachineBasicBlock &MBB) {
-  dbgs() << "Scheduling block " << MBB.getName() << '\n';
-  this->MBB = &MBB;
-  buildDAG();
-  dbgs() << '\n';
-}
-
-void MOSSched::buildDAG() {
-  DAG.clear();
-
-  for (MachineInstr &MI : *MBB) {
-    if (MI.isPHI() || MI.isTerminator())
-      continue;
-    DAG.Nodes.push_back({DAG.NextIdx++, &MI, {}});
-  }
-  for (Node &N : DAG.Nodes)
-    DAG.MINodes.try_emplace(N.MI, &N);
-
-  const MachineRegisterInfo &MRI = MBB->getParent()->getRegInfo();
-  for (Node &N : DAG.Nodes) {
-    for (MachineOperand &MO : N.MI->explicit_uses()) {
-      if (!MO.isReg() || !MO.getReg().isVirtual())
+void MOSSched::buildDAGs() {
+  DAGs.clear();
+  for (MachineBasicBlock &MBB : *MF) {
+    SchedulingDAG &DAG = DAGs[&MBB];
+    for (MachineInstr &MI : MBB) {
+      if (MI.isPHI() || MI.isTerminator())
         continue;
-      MachineInstr *Def = MRI.getUniqueVRegDef(MO.getReg());
-      if (Def->getParent() != MBB)
-        continue;
-      auto It = DAG.MINodes.find(Def);
-      if (It == DAG.MINodes.end())
-        continue;
-      N.Predecessors.insert(It->second);
+      DAG.Nodes.push_back(Node{DAG.NextIdx++, {&MI}, {}});
     }
-  }
+    for (Node &N : DAG.Nodes)
+      for (MachineInstr *MI : N.MIs)
+        DAG.MINodes.try_emplace(MI, &N);
 
-  for (const Node &N : DAG.Nodes) {
-    dbgs() << "Node " << N.Idx << ": " << *N.MI;
-    if (!N.Predecessors.empty()) {
-      dbgs() << "Predecessors:";
-      for (Node *P : N.Predecessors)
-        dbgs() << ' ' << P->Idx;
+    const MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
+    for (Node &N : DAG.Nodes) {
+      for (MachineInstr *MI : N.MIs) {
+        for (MachineOperand &MO : MI->explicit_uses()) {
+          if (!MO.isReg() || !MO.getReg().isVirtual())
+            continue;
+          MachineInstr *Def = MRI.getUniqueVRegDef(MO.getReg());
+          if (Def->getParent() != &MBB)
+            continue;
+          auto It = DAG.MINodes.find(Def);
+          if (It == DAG.MINodes.end())
+            continue;
+          N.Predecessors.insert(It->second);
+        }
+      }
+    }
+
+    dbgs() << "MBB: " << MBB.getName() << '\n';
+    for (const Node &N : DAG.Nodes) {
+      dbgs() << "Node " << N.Idx << ":\n";
+      for (MachineInstr *MI : N.MIs)
+        dbgs() << *MI;
+      if (!N.Predecessors.empty()) {
+        dbgs() << "Predecessors:";
+        for (Node *P : N.Predecessors)
+          dbgs() << ' ' << P->Idx;
+        dbgs() << '\n';
+      }
       dbgs() << '\n';
     }
-    dbgs() << '\n';
   }
 }
 
