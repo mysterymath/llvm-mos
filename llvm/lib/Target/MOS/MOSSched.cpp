@@ -18,6 +18,7 @@
 #include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/ADT/iterator_range.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
@@ -102,6 +103,19 @@ void MOSSched::buildDAGs() {
             continue;
           N.Predecessors.insert(It->second);
         }
+
+        if ((MI->isCopy() && MI->getOperand(0).getReg().isPhysical()) ||
+            MI->getOpcode() == MOS::ADJCALLSTACKDOWN)
+          for (MachineInstr &Succ : llvm::make_range(
+                   std::next(MachineBasicBlock::iterator(MI)), MBB.end()))
+            if (Succ.isCall())
+              DAG.MINodes.find(&Succ)->second->Predecessors.insert(&N);
+
+        if (MI->getOpcode() == MOS::ADJCALLSTACKUP)
+          for (MachineInstr &Pred :
+               llvm::make_range(MBB.begin(), MachineBasicBlock::iterator(MI)))
+            if (Pred.isCall())
+              N.Predecessors.insert(DAG.MINodes.find(&Pred)->second);
       }
     }
 
