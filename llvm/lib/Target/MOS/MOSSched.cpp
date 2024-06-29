@@ -143,7 +143,7 @@ void MOSSched::buildDAGs() {
         DAG.BackwardAvail.push_back(&N);
     }
 
-    dbgs() << "MBB: " << MBB.getName() << '\n';
+    dbgs() << "\n\nMBB: " << MBB.getName() << '\n';
     for (const Node &N : DAG.Nodes) {
       dbgs() << "Node " << N.Idx << ":\n";
       for (MachineInstr *MI : N.MIs)
