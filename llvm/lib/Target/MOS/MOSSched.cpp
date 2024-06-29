@@ -145,29 +145,35 @@ void MOSSched::buildDAGs() {
 
     dbgs() << "\n\nMBB: " << MBB.getName() << '\n';
     for (const Node &N : DAG.Nodes) {
-      dbgs() << "Node " << N.Idx << ":\n";
+      dbgs() << "\nNode " << N.Idx << ":\n";
       for (MachineInstr *MI : N.MIs)
         dbgs() << *MI;
       if (!N.Predecessors.empty()) {
         dbgs() << "Predecessors:";
         for (Node *P : N.Predecessors)
           dbgs() << ' ' << P->Idx;
+        dbgs() << '\n';
+      }
+      if (!N.Successors.empty()) {
         dbgs() << "Successors:";
         for (Node *P : N.Successors)
           dbgs() << ' ' << P->Idx;
         dbgs() << '\n';
       }
-      dbgs() << '\n';
     }
 
-    dbgs() << "Forward Avail:";
-    for (const Node *N : DAG.ForwardAvail)
-      dbgs() << ' ' << N->Idx;
-    dbgs() << '\n';
-    dbgs() << "Backward Avail:";
-    for (const Node *N : DAG.BackwardAvail)
-      dbgs() << ' ' << N->Idx;
-    dbgs() << '\n';
+    if (!DAG.ForwardAvail.empty()) {
+      dbgs() << "\nForward Avail:";
+      for (const Node *N : DAG.ForwardAvail)
+        dbgs() << ' ' << N->Idx;
+      dbgs() << '\n';
+    }
+    if (!DAG.BackwardAvail.empty()) {
+      dbgs() << "\nBackward Avail:";
+      for (const Node *N : DAG.BackwardAvail)
+        dbgs() << ' ' << N->Idx;
+      dbgs() << '\n';
+    }
   }
 }
 
