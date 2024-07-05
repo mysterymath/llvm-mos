@@ -42,19 +42,22 @@ struct Node {
   SmallSet<Node *, 4> Successors;
 };
 
+struct Frontier {
+  // Position to which nodes may be scheduled.
+  MachineBasicBlock::iterator Pos;
+
+  // Nodes that can be safely scheduled.
+  SmallVector<Node *, 4> Avail;
+};
+
 struct SchedulingDAG {
-  SmallVector<Node, 0> Nodes;
+  SmallVector<std::unique_ptr<Node>, 0> Nodes;
   unsigned NextIdx;
 
   DenseMap<const MachineInstr *, Node *> MINodes;
 
-  // Nodes that can be safely scheduled after the forward frontier (starting
-  // from BB entry).
-  SmallVector<Node *, 4> ForwardAvail;
-
-  // Nodes that can be safely scheduled before the backwards frontier (starting
-  // from BB exit).
-  SmallVector<Node *, 4> BackwardAvail;
+  Frontier ForwardFrontier;
+  Frontier BackwardFrontier;
 };
 
 class MOSSched : public MachineFunctionPass {
@@ -69,6 +72,10 @@ public:
 
   bool runOnMachineFunction(MachineFunction &MF) override;
   void buildDAGs();
+  void scheduleTrivialNodes();
+  void scheduleNode(Node *N, Frontier &F, SchedulingDAG &DAG,
+                    MachineBasicBlock &MBB);
+  void dump();
 
   MachineFunction *MF;
   DenseMap<MachineBasicBlock *, SchedulingDAG> DAGs;
@@ -85,7 +92,19 @@ bool MOSSched::runOnMachineFunction(MachineFunction &MF) {
   getAnalysis<MachineLoopInfo>().getBase().print(dbgs());
   this->MF = &MF;
   buildDAGs();
+  dump();
+  scheduleTrivialNodes();
+  dump();
   return true;
+}
+
+template <typename T> void dumpNodes(StringRef Name, const T &Nodes) {
+  if (Nodes.empty())
+    return;
+  dbgs() << Name << ':';
+  for (Node *N : Nodes)
+    dbgs() << ' ' << N->Idx;
+  dbgs() << '\n';
 }
 
 void MOSSched::buildDAGs() {
@@ -96,18 +115,15 @@ void MOSSched::buildDAGs() {
     for (MachineInstr &MI : MBB) {
       if (MI.isPHI() || MI.isTerminator())
         continue;
-      DAG.Nodes.push_back(Node{DAG.NextIdx++, {&MI}, {}, {}});
+      DAG.Nodes.push_back(
+          std::make_unique<Node>(Node{DAG.NextIdx++, {&MI}, {}, {}}));
+      DAG.MINodes.try_emplace(&MI, DAG.Nodes.back().get());
     }
-
-    // Build map from MI to node.
-    for (Node &N : DAG.Nodes)
-      for (MachineInstr *MI : N.MIs)
-        DAG.MINodes.try_emplace(MI, &N);
 
     // Find predecessors.
     const MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
-    for (Node &N : DAG.Nodes) {
-      for (MachineInstr *MI : N.MIs) {
+    for (const auto &N : DAG.Nodes) {
+      for (MachineInstr *MI : N->MIs) {
         for (MachineOperand &MO : MI->explicit_uses()) {
           if (!MO.isReg() || !MO.getReg().isVirtual())
             continue;
@@ -117,7 +133,7 @@ void MOSSched::buildDAGs() {
           auto It = DAG.MINodes.find(Def);
           if (It == DAG.MINodes.end())
             continue;
-          N.addPredecessor(It->second);
+          N->addPredecessor(It->second);
         }
 
         if ((MI->isCopy() && MI->getOperand(0).getReg().isPhysical()) ||
@@ -125,55 +141,55 @@ void MOSSched::buildDAGs() {
           for (MachineInstr &Succ : llvm::make_range(
                    std::next(MachineBasicBlock::iterator(MI)), MBB.end()))
             if (Succ.isCall())
-              DAG.MINodes.find(&Succ)->second->addPredecessor(&N);
+              DAG.MINodes.find(&Succ)->second->addPredecessor(N.get());
 
         if (MI->getOpcode() == MOS::ADJCALLSTACKUP)
           for (MachineInstr &Pred :
                llvm::make_range(MBB.begin(), MachineBasicBlock::iterator(MI)))
             if (Pred.isCall())
-              N.addPredecessor(DAG.MINodes.find(&Pred)->second);
+              N->addPredecessor(DAG.MINodes.find(&Pred)->second);
       }
     }
 
     // Find available nodes.
-    for (Node &N : DAG.Nodes) {
-      if (N.Predecessors.empty())
-        DAG.ForwardAvail.push_back(&N);
-      if (N.Successors.empty())
-        DAG.BackwardAvail.push_back(&N);
+    for (const auto &N : DAG.Nodes) {
+      if (N->Predecessors.empty())
+        DAG.ForwardFrontier.Avail.push_back(N.get());
+      if (N->Successors.empty())
+        DAG.BackwardFrontier.Avail.push_back(N.get());
     }
+  }
+}
 
-    dbgs() << "\n\nMBB: " << MBB.getName() << '\n';
-    for (const Node &N : DAG.Nodes) {
-      dbgs() << "\nNode " << N.Idx << ":\n";
-      for (MachineInstr *MI : N.MIs)
+void MOSSched::scheduleTrivialNodes() {
+  for (auto &[MBB, DAG] : DAGs) {
+    if (DAG.ForwardFrontier.Avail.size() == 1)
+      scheduleNode(DAG.ForwardFrontier.Avail.front(), DAG.ForwardFrontier, DAG,
+                   *MBB);
+    else if (DAG.BackwardFrontier.Avail.size() == 1)
+      scheduleNode(DAG.BackwardFrontier.Avail.front(), DAG.BackwardFrontier,
+                   DAG, *MBB);
+  }
+}
+
+void MOSSched::scheduleNode(Node *N, Frontier &F, SchedulingDAG &DAG,
+                            MachineBasicBlock &MBB) {
+  // TODO
+}
+
+void MOSSched::dump() {
+  for (const auto &[MBB, DAG] : DAGs) {
+    dbgs() << "\n\nMBB: " << MBB->getName() << '\n';
+    for (const auto &N : DAG.Nodes) {
+      dbgs() << "\nNode " << N->Idx << ":\n";
+      for (MachineInstr *MI : N->MIs)
         dbgs() << *MI;
-      if (!N.Predecessors.empty()) {
-        dbgs() << "Predecessors:";
-        for (Node *P : N.Predecessors)
-          dbgs() << ' ' << P->Idx;
-        dbgs() << '\n';
-      }
-      if (!N.Successors.empty()) {
-        dbgs() << "Successors:";
-        for (Node *P : N.Successors)
-          dbgs() << ' ' << P->Idx;
-        dbgs() << '\n';
-      }
+      dumpNodes("Predecessors", N->Predecessors);
+      dumpNodes("Successors", N->Successors);
     }
 
-    if (!DAG.ForwardAvail.empty()) {
-      dbgs() << "\nForward Avail:";
-      for (const Node *N : DAG.ForwardAvail)
-        dbgs() << ' ' << N->Idx;
-      dbgs() << '\n';
-    }
-    if (!DAG.BackwardAvail.empty()) {
-      dbgs() << "\nBackward Avail:";
-      for (const Node *N : DAG.BackwardAvail)
-        dbgs() << ' ' << N->Idx;
-      dbgs() << '\n';
-    }
+    dumpNodes("Forward Avail", DAG.ForwardFrontier.Avail);
+    dumpNodes("Backward Avail", DAG.ForwardFrontier.Avail);
   }
 }
 
