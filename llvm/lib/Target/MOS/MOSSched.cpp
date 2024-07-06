@@ -32,11 +32,12 @@ using namespace llvm;
 
 namespace {
 
-struct Node {
+struct Node : public ilist_node<Node> {
+  Node(unsigned Idx, ArrayRef<MachineInstr *> MIs);
   unsigned Idx;
   SmallVector<MachineInstr *, 0> MIs;
 
-  void addPredecessor(Node *N);
+  void addPredecessor(Node &N);
 
   SmallSet<Node *, 4> Predecessors;
   SmallSet<Node *, 4> Successors;
@@ -51,7 +52,7 @@ struct Frontier {
 };
 
 struct SchedulingDAG {
-  SmallVector<std::unique_ptr<Node>, 0> Nodes;
+  ilist<Node> Nodes;
   unsigned NextIdx;
 
   DenseMap<const MachineInstr *, Node *> MINodes;
@@ -115,15 +116,14 @@ void MOSSched::buildDAGs() {
     for (MachineInstr &MI : MBB) {
       if (MI.isPHI() || MI.isTerminator())
         continue;
-      DAG.Nodes.push_back(
-          std::make_unique<Node>(Node{DAG.NextIdx++, {&MI}, {}, {}}));
-      DAG.MINodes.try_emplace(&MI, DAG.Nodes.back().get());
+      DAG.Nodes.push_back(new Node(DAG.NextIdx++, {&MI}));
+      DAG.MINodes.try_emplace(&MI, &DAG.Nodes.back());
     }
 
     // Find predecessors.
     const MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
-    for (const auto &N : DAG.Nodes) {
-      for (MachineInstr *MI : N->MIs) {
+    for (Node &N : DAG.Nodes) {
+      for (MachineInstr *MI : N.MIs) {
         for (MachineOperand &MO : MI->explicit_uses()) {
           if (!MO.isReg() || !MO.getReg().isVirtual())
             continue;
@@ -133,7 +133,7 @@ void MOSSched::buildDAGs() {
           auto It = DAG.MINodes.find(Def);
           if (It == DAG.MINodes.end())
             continue;
-          N->addPredecessor(It->second);
+          N.addPredecessor(*It->second);
         }
 
         if ((MI->isCopy() && MI->getOperand(0).getReg().isPhysical()) ||
@@ -141,22 +141,22 @@ void MOSSched::buildDAGs() {
           for (MachineInstr &Succ : llvm::make_range(
                    std::next(MachineBasicBlock::iterator(MI)), MBB.end()))
             if (Succ.isCall())
-              DAG.MINodes.find(&Succ)->second->addPredecessor(N.get());
+              DAG.MINodes.find(&Succ)->second->addPredecessor(N);
 
         if (MI->getOpcode() == MOS::ADJCALLSTACKUP)
           for (MachineInstr &Pred :
                llvm::make_range(MBB.begin(), MachineBasicBlock::iterator(MI)))
             if (Pred.isCall())
-              N->addPredecessor(DAG.MINodes.find(&Pred)->second);
+              N.addPredecessor(*DAG.MINodes.find(&Pred)->second);
       }
     }
 
     // Find available nodes.
-    for (const auto &N : DAG.Nodes) {
-      if (N->Predecessors.empty())
-        DAG.ForwardFrontier.Avail.push_back(N.get());
-      if (N->Successors.empty())
-        DAG.BackwardFrontier.Avail.push_back(N.get());
+    for (auto &N : DAG.Nodes) {
+      if (N.Predecessors.empty())
+        DAG.ForwardFrontier.Avail.push_back(&N);
+      if (N.Successors.empty())
+        DAG.BackwardFrontier.Avail.push_back(&N);
     }
   }
 }
@@ -181,11 +181,11 @@ void MOSSched::dump() {
   for (const auto &[MBB, DAG] : DAGs) {
     dbgs() << "\n\nMBB: " << MBB->getName() << '\n';
     for (const auto &N : DAG.Nodes) {
-      dbgs() << "\nNode " << N->Idx << ":\n";
-      for (MachineInstr *MI : N->MIs)
+      dbgs() << "\nNode " << N.Idx << ":\n";
+      for (MachineInstr *MI : N.MIs)
         dbgs() << *MI;
-      dumpNodes("Predecessors", N->Predecessors);
-      dumpNodes("Successors", N->Successors);
+      dumpNodes("Predecessors", N.Predecessors);
+      dumpNodes("Successors", N.Successors);
     }
 
     dumpNodes("Forward Avail", DAG.ForwardFrontier.Avail);
@@ -193,9 +193,11 @@ void MOSSched::dump() {
   }
 }
 
-void Node::addPredecessor(Node *N) {
-  Predecessors.insert(N);
-  N->Successors.insert(this);
+Node::Node(unsigned Idx, ArrayRef<MachineInstr *> MIs) : Idx(Idx), MIs(MIs) {}
+
+void Node::addPredecessor(Node &N) {
+  Predecessors.insert(&N);
+  N.Successors.insert(this);
 }
 
 } // namespace
