@@ -120,6 +120,10 @@ void MOSSched::buildDAGs() {
       DAG.MINodes.try_emplace(&MI, &DAG.Nodes.back());
     }
 
+    // Set initial frontier positions.
+    DAG.ForwardFrontier.Pos = MBB.getFirstNonPHI();
+    DAG.BackwardFrontier.Pos = MBB.getFirstTerminator();
+
     // Find predecessors.
     const MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
     for (Node &N : DAG.Nodes) {
