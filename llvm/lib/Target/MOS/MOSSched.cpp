@@ -185,10 +185,14 @@ void MOSSched::scheduleNode(Node &N, Frontier &F, SchedulingDAG &DAG,
   dbgs() << "Scheduling Node " << N.Idx << '\n';
 
   // Move MIs to frontier position and advance it.
+  bool UpdateBothPos = DAG.ForwardFrontier.Pos == DAG.BackwardFrontier.Pos;
   for (MachineInstr *MI : N.MIs)
     MBB.insert(F.Pos, MI->removeFromParent());
-  if (&F == &DAG.BackwardFrontier)
+  if (&F == &DAG.BackwardFrontier) {
     F.Pos = N.MIs.front();
+    if (UpdateBothPos)
+      DAG.ForwardFrontier.Pos = F.Pos;
+  }
 
   // Remove the node from containing sets, update Avail, and erase the node.
   for (Node *P : N.Predecessors) {
@@ -208,7 +212,7 @@ void MOSSched::scheduleNode(Node &N, Frontier &F, SchedulingDAG &DAG,
 
 void MOSSched::dump() {
   for (const auto &[MBB, DAG] : DAGs) {
-    dbgs() << "\n%bb.: " << MBB->getNumber() << '\n';
+    dbgs() << "\n%bb." << MBB->getNumber() << '\n';
     for (const auto &N : DAG.Nodes) {
       dbgs() << "\nNode " << N.Idx << ":\n";
       for (MachineInstr *MI : N.MIs)
