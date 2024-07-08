@@ -43,22 +43,15 @@ struct Node : public ilist_node<Node> {
   SmallSet<Node *, 4> Successors;
 };
 
-struct Frontier {
-  // Position to which nodes may be scheduled.
-  MachineBasicBlock::iterator Pos;
-
-  // Nodes that can be safely scheduled.
-  SmallSetVector<Node *, 4> Avail;
-};
-
 struct SchedulingDAG {
   ilist<Node> Nodes;
   unsigned NextIdx;
 
   DenseMap<const MachineInstr *, Node *> MINodes;
 
-  Frontier ForwardFrontier;
-  Frontier BackwardFrontier;
+  MachineBasicBlock::iterator FrontierPos;
+  SmallSetVector<Node *, 4> ForwardAvail;
+  SmallSetVector<Node *, 4> BackwardAvail;
 };
 
 class MOSSched : public MachineFunctionPass {
@@ -74,7 +67,7 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override;
   void buildDAGs();
   void scheduleTrivialNodes();
-  void scheduleNode(Node &N, Frontier &F, SchedulingDAG &DAG,
+  void scheduleNode(Node &N, bool Forward, SchedulingDAG &DAG,
                     MachineBasicBlock &MBB);
   void dump();
 
@@ -96,6 +89,7 @@ bool MOSSched::runOnMachineFunction(MachineFunction &MF) {
   dump();
   scheduleTrivialNodes();
   dump();
+  MF.dump();
   return true;
 }
 
@@ -120,9 +114,8 @@ void MOSSched::buildDAGs() {
       DAG.MINodes.try_emplace(&MI, &DAG.Nodes.back());
     }
 
-    // Set initial frontier positions.
-    DAG.ForwardFrontier.Pos = MBB.getFirstNonPHI();
-    DAG.BackwardFrontier.Pos = MBB.getFirstTerminator();
+    // Set initial frontier position.
+    DAG.FrontierPos = MBB.getFirstTerminator();
 
     // Find predecessors.
     const MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
@@ -158,9 +151,9 @@ void MOSSched::buildDAGs() {
     // Find available nodes.
     for (auto &N : DAG.Nodes) {
       if (N.Predecessors.empty())
-        DAG.ForwardFrontier.Avail.insert(&N);
+        DAG.ForwardAvail.insert(&N);
       if (N.Successors.empty())
-        DAG.BackwardFrontier.Avail.insert(&N);
+        DAG.BackwardAvail.insert(&N);
     }
   }
 }
@@ -168,45 +161,41 @@ void MOSSched::buildDAGs() {
 void MOSSched::scheduleTrivialNodes() {
   for (auto &[MBB, DAG] : DAGs) {
     dbgs() << "Trivial scheduling for %bb." << MBB->getNumber() << '\n';
-    while (DAG.ForwardFrontier.Avail.size() == 1 ||
-           DAG.BackwardFrontier.Avail.size() == 1) {
-      if (DAG.ForwardFrontier.Avail.size() == 1)
-        scheduleNode(*DAG.ForwardFrontier.Avail.front(), DAG.ForwardFrontier,
-                     DAG, *MBB);
-      else if (DAG.BackwardFrontier.Avail.size() == 1)
-        scheduleNode(*DAG.BackwardFrontier.Avail.front(), DAG.BackwardFrontier,
-                     DAG, *MBB);
+    while (DAG.ForwardAvail.size() == 1 || DAG.BackwardAvail.size() == 1) {
+      if (DAG.ForwardAvail.size() == 1)
+        scheduleNode(*DAG.ForwardAvail.front(), /*Forward=*/true, DAG, *MBB);
+      else if (DAG.BackwardAvail.size() == 1)
+        scheduleNode(*DAG.BackwardAvail.front(), /*Forward=*/false, DAG, *MBB);
     }
   }
 }
 
-void MOSSched::scheduleNode(Node &N, Frontier &F, SchedulingDAG &DAG,
+void MOSSched::scheduleNode(Node &N, bool Forward, SchedulingDAG &DAG,
                             MachineBasicBlock &MBB) {
-  dbgs() << "Scheduling Node " << N.Idx << '\n';
+  dbgs() << "Scheduling Node " << N.Idx
+         << (Forward ? " forward\n" : " backward\n");
 
-  // Move MIs to frontier position and advance it.
-  bool UpdateBothPos = DAG.ForwardFrontier.Pos == DAG.BackwardFrontier.Pos;
-  for (MachineInstr *MI : N.MIs)
-    MBB.insert(F.Pos, MI->removeFromParent());
-  if (&F == &DAG.BackwardFrontier) {
-    F.Pos = N.MIs.front();
-    if (UpdateBothPos)
-      DAG.ForwardFrontier.Pos = F.Pos;
+  // Move MIs to frontier position and update it.
+  for (MachineInstr *MI : N.MIs) {
+    dbgs() << *MI;
+    MBB.insert(DAG.FrontierPos, MI->removeFromParent());
   }
+  if (!Forward)
+    DAG.FrontierPos = N.MIs.front();
 
   // Remove the node from containing sets, update Avail, and erase the node.
   for (Node *P : N.Predecessors) {
     P->Successors.erase(&N);
     if (P->Successors.empty())
-      DAG.BackwardFrontier.Avail.insert(P);
+      DAG.BackwardAvail.insert(P);
   }
   for (Node *S : N.Successors) {
     S->Predecessors.erase(&N);
     if (S->Predecessors.empty())
-      DAG.ForwardFrontier.Avail.insert(S);
+      DAG.ForwardAvail.insert(S);
   }
-  DAG.ForwardFrontier.Avail.remove(&N);
-  DAG.BackwardFrontier.Avail.remove(&N);
+  DAG.ForwardAvail.remove(&N);
+  DAG.BackwardAvail.remove(&N);
   DAG.Nodes.erase(&N);
 }
 
@@ -221,8 +210,8 @@ void MOSSched::dump() {
       dumpNodes("Successors", N.Successors);
     }
 
-    dumpNodes("Forward Avail", DAG.ForwardFrontier.Avail);
-    dumpNodes("Backward Avail", DAG.ForwardFrontier.Avail);
+    dumpNodes("Forward Avail", DAG.ForwardAvail);
+    dumpNodes("Backward Avail", DAG.BackwardAvail);
   }
 }
 
