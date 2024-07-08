@@ -167,6 +167,7 @@ void MOSSched::buildDAGs() {
 
 void MOSSched::scheduleTrivialNodes() {
   for (auto &[MBB, DAG] : DAGs) {
+    dbgs() << "Trivial scheduling for %bb." << MBB->getNumber() << '\n';
     while (DAG.ForwardFrontier.Avail.size() == 1 ||
            DAG.BackwardFrontier.Avail.size() == 1) {
       if (DAG.ForwardFrontier.Avail.size() == 1)
@@ -181,6 +182,8 @@ void MOSSched::scheduleTrivialNodes() {
 
 void MOSSched::scheduleNode(Node &N, Frontier &F, SchedulingDAG &DAG,
                             MachineBasicBlock &MBB) {
+  dbgs() << "Scheduling Node " << N.Idx << '\n';
+
   // Move MIs to frontier position and advance it.
   for (MachineInstr *MI : N.MIs)
     MBB.insert(F.Pos, MI->removeFromParent());
@@ -205,7 +208,7 @@ void MOSSched::scheduleNode(Node &N, Frontier &F, SchedulingDAG &DAG,
 
 void MOSSched::dump() {
   for (const auto &[MBB, DAG] : DAGs) {
-    dbgs() << "\n\nMBB: " << MBB->getName() << '\n';
+    dbgs() << "\n%bb.: " << MBB->getNumber() << '\n';
     for (const auto &N : DAG.Nodes) {
       dbgs() << "\nNode " << N.Idx << ":\n";
       for (MachineInstr *MI : N.MIs)
