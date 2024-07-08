@@ -163,12 +163,15 @@ void MOSSched::buildDAGs() {
 
 void MOSSched::scheduleTrivialNodes() {
   for (auto &[MBB, DAG] : DAGs) {
-    if (DAG.ForwardFrontier.Avail.size() == 1)
-      scheduleNode(DAG.ForwardFrontier.Avail.front(), DAG.ForwardFrontier, DAG,
-                   *MBB);
-    else if (DAG.BackwardFrontier.Avail.size() == 1)
-      scheduleNode(DAG.BackwardFrontier.Avail.front(), DAG.BackwardFrontier,
-                   DAG, *MBB);
+    while (DAG.ForwardFrontier.Avail.size() == 1 ||
+           DAG.BackwardFrontier.Avail.size() == 1) {
+      if (DAG.ForwardFrontier.Avail.size() == 1)
+        scheduleNode(DAG.ForwardFrontier.Avail.front(), DAG.ForwardFrontier,
+                     DAG, *MBB);
+      else if (DAG.BackwardFrontier.Avail.size() == 1)
+        scheduleNode(DAG.BackwardFrontier.Avail.front(), DAG.BackwardFrontier,
+                     DAG, *MBB);
+    }
   }
 }
 
