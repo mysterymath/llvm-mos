@@ -181,6 +181,17 @@ void MOSSched::scheduleTrivialNodes() {
 
 void MOSSched::scheduleNode(Node &N, Frontier &F, SchedulingDAG &DAG,
                             MachineBasicBlock &MBB) {
+  // Move MIs to frontier position and advance it.
+  for (MachineInstr *MI : N.MIs)
+    MBB.insert(F.Pos, MI->removeFromParent());
+  if (&F == &DAG.BackwardFrontier)
+    F.Pos = N.MIs.front();
+
+  // Remove the node from containing lists and sets.
+  for (Node *P : N.Predecessors)
+    P->Successors.erase(&N);
+  for (Node *S : N.Successors)
+    S->Predecessors.erase(&N);
   DAG.ForwardFrontier.Avail.remove(&N);
   DAG.BackwardFrontier.Avail.remove(&N);
   DAG.Nodes.erase(&N);
