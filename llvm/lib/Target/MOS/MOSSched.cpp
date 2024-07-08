@@ -74,7 +74,7 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override;
   void buildDAGs();
   void scheduleTrivialNodes();
-  void scheduleNode(Node *N, Frontier &F, SchedulingDAG &DAG,
+  void scheduleNode(Node &N, Frontier &F, SchedulingDAG &DAG,
                     MachineBasicBlock &MBB);
   void dump();
 
@@ -166,18 +166,20 @@ void MOSSched::scheduleTrivialNodes() {
     while (DAG.ForwardFrontier.Avail.size() == 1 ||
            DAG.BackwardFrontier.Avail.size() == 1) {
       if (DAG.ForwardFrontier.Avail.size() == 1)
-        scheduleNode(DAG.ForwardFrontier.Avail.front(), DAG.ForwardFrontier,
+        scheduleNode(*DAG.ForwardFrontier.Avail.front(), DAG.ForwardFrontier,
                      DAG, *MBB);
       else if (DAG.BackwardFrontier.Avail.size() == 1)
-        scheduleNode(DAG.BackwardFrontier.Avail.front(), DAG.BackwardFrontier,
+        scheduleNode(*DAG.BackwardFrontier.Avail.front(), DAG.BackwardFrontier,
                      DAG, *MBB);
     }
   }
 }
 
-void MOSSched::scheduleNode(Node *N, Frontier &F, SchedulingDAG &DAG,
+void MOSSched::scheduleNode(Node &N, Frontier &F, SchedulingDAG &DAG,
                             MachineBasicBlock &MBB) {
-  // TODO
+  DAG.ForwardFrontier.Avail.remove(&N);
+  DAG.BackwardFrontier.Avail.remove(&N);
+  DAG.Nodes.erase(&N);
 }
 
 void MOSSched::dump() {
