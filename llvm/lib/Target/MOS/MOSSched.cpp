@@ -206,6 +206,9 @@ void MOSSched::dump() {
     if (DAG.Nodes.empty())
       continue;
     dbgs() << "\n%bb." << MBB->getNumber() << '\n';
+    dumpNodes("Forward Avail", DAG.ForwardAvail);
+    dumpNodes("Backward Avail", DAG.BackwardAvail);
+
     for (const auto &N : DAG.Nodes) {
       dbgs() << "\nNode " << N.Idx << ":\n";
       for (MachineInstr *MI : N.MIs)
@@ -213,9 +216,6 @@ void MOSSched::dump() {
       dumpNodes("Predecessors", N.Predecessors);
       dumpNodes("Successors", N.Successors);
     }
-
-    dumpNodes("Forward Avail", DAG.ForwardAvail);
-    dumpNodes("Backward Avail", DAG.BackwardAvail);
   }
 }
 
