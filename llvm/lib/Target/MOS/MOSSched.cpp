@@ -48,7 +48,7 @@ struct Frontier {
   MachineBasicBlock::iterator Pos;
 
   // Nodes that can be safely scheduled.
-  SmallVector<Node *, 4> Avail;
+  SmallSetVector<Node *, 4> Avail;
 };
 
 struct SchedulingDAG {
@@ -154,9 +154,9 @@ void MOSSched::buildDAGs() {
     // Find available nodes.
     for (auto &N : DAG.Nodes) {
       if (N.Predecessors.empty())
-        DAG.ForwardFrontier.Avail.push_back(&N);
+        DAG.ForwardFrontier.Avail.insert(&N);
       if (N.Successors.empty())
-        DAG.BackwardFrontier.Avail.push_back(&N);
+        DAG.BackwardFrontier.Avail.insert(&N);
     }
   }
 }
