@@ -187,11 +187,17 @@ void MOSSched::scheduleNode(Node &N, Frontier &F, SchedulingDAG &DAG,
   if (&F == &DAG.BackwardFrontier)
     F.Pos = N.MIs.front();
 
-  // Remove the node from containing lists and sets.
-  for (Node *P : N.Predecessors)
+  // Remove the node from containing sets, update Avail, and erase the node.
+  for (Node *P : N.Predecessors) {
     P->Successors.erase(&N);
-  for (Node *S : N.Successors)
+    if (P->Successors.empty())
+      DAG.BackwardFrontier.Avail.insert(P);
+  }
+  for (Node *S : N.Successors) {
     S->Predecessors.erase(&N);
+    if (S->Predecessors.empty())
+      DAG.ForwardFrontier.Avail.insert(S);
+  }
   DAG.ForwardFrontier.Avail.remove(&N);
   DAG.BackwardFrontier.Avail.remove(&N);
   DAG.Nodes.erase(&N);
