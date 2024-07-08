@@ -160,19 +160,21 @@ void MOSSched::buildDAGs() {
 
 void MOSSched::scheduleTrivialNodes() {
   for (auto &[MBB, DAG] : DAGs) {
-    dbgs() << "Trivial scheduling for %bb." << MBB->getNumber() << '\n';
-    while (DAG.ForwardAvail.size() == 1 || DAG.BackwardAvail.size() == 1) {
+    if (DAG.ForwardAvail.size() != 1 && DAG.BackwardAvail.size() != 1)
+      continue;
+    do {
+      dbgs() << "\nTrivial scheduling for %bb." << MBB->getNumber() << '\n';
       if (DAG.ForwardAvail.size() == 1)
         scheduleNode(*DAG.ForwardAvail.front(), /*Forward=*/true, DAG, *MBB);
       else if (DAG.BackwardAvail.size() == 1)
         scheduleNode(*DAG.BackwardAvail.front(), /*Forward=*/false, DAG, *MBB);
-    }
+    } while (DAG.ForwardAvail.size() == 1 || DAG.BackwardAvail.size() == 1);
   }
 }
 
 void MOSSched::scheduleNode(Node &N, bool Forward, SchedulingDAG &DAG,
                             MachineBasicBlock &MBB) {
-  dbgs() << "Scheduling Node " << N.Idx
+  dbgs() << "\nScheduling Node " << N.Idx
          << (Forward ? " forward\n" : " backward\n");
 
   // Move MIs to frontier position and update it.
@@ -201,6 +203,8 @@ void MOSSched::scheduleNode(Node &N, bool Forward, SchedulingDAG &DAG,
 
 void MOSSched::dump() {
   for (const auto &[MBB, DAG] : DAGs) {
+    if (DAG.Nodes.empty())
+      continue;
     dbgs() << "\n%bb." << MBB->getNumber() << '\n';
     for (const auto &N : DAG.Nodes) {
       dbgs() << "\nNode " << N.Idx << ":\n";
