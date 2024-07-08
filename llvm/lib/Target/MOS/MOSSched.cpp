@@ -162,8 +162,8 @@ void MOSSched::scheduleTrivialNodes() {
   for (auto &[MBB, DAG] : DAGs) {
     if (DAG.ForwardAvail.size() != 1 && DAG.BackwardAvail.size() != 1)
       continue;
+    dbgs() << "\nTrivial scheduling for %bb." << MBB->getNumber() << '\n';
     do {
-      dbgs() << "\nTrivial scheduling for %bb." << MBB->getNumber() << '\n';
       if (DAG.ForwardAvail.size() == 1)
         scheduleNode(*DAG.ForwardAvail.front(), /*Forward=*/true, DAG, *MBB);
       else if (DAG.BackwardAvail.size() == 1)
