@@ -77,13 +77,13 @@ public:
 
 void MOSSched::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<MachineDominatorTreeWrapperPass>();
-  AU.addRequired<MachineLoopInfo>();
+  AU.addRequired<MachineLoopInfoWrapperPass>();
   MachineFunctionPass::getAnalysisUsage(AU);
 }
 
 bool MOSSched::runOnMachineFunction(MachineFunction &MF) {
   getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree().print(dbgs());
-  getAnalysis<MachineLoopInfo>().getBase().print(dbgs());
+  getAnalysis<MachineLoopInfoWrapperPass>().getLI().print(dbgs());
   this->MF = &MF;
   buildDAGs();
   dump();
