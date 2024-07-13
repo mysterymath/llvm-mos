@@ -160,6 +160,8 @@ void MOSSched::widenRCs() {
   // Replace uses with the carrying register, inserting copies to resolve RC.
   for (MachineBasicBlock &MBB : *MF) {
     for (MachineInstr &MI : MBB) {
+      if (MI.isCopy())
+        continue;
       for (MachineOperand &MO : MI.uses()) {
         if (!MO.isReg() || !MO.getReg().isVirtual())
           continue;
@@ -183,12 +185,25 @@ void MOSSched::buildDAGs() {
   for (MachineBasicBlock &MBB : *MF) {
     // Build nodes.
     SchedulingDAG &DAG = DAGs[&MBB];
+    SmallVector<MachineInstr*> UseCopies;
     for (MachineInstr &MI : MBB) {
       if (MI.isPHI() || MI.isTerminator())
         continue;
-      DAG.Nodes.push_back(new Node(DAG.NextIdx++, {&MI}));
-      DAG.MINodes.try_emplace(&MI, &DAG.Nodes.back());
+      if (MI.isCopy() && MI.getOperand(0).getReg().isVirtual()) {
+        const TargetRegisterClass *RC = MRI->getRegClass(MI.getOperand(0).getReg());
+        if (RC != TRI->getLargestLegalSuperClass(RC, *MF))
+          UseCopies.push_back(&MI);
+        else
+          DAG.Nodes.back().MIs.push_back(&MI);
+        continue;
+      }
+      DAG.Nodes.push_back(new Node(DAG.NextIdx++, UseCopies));
+      UseCopies.clear();
+      DAG.Nodes.back().MIs.push_back(&MI);
     }
+    for (Node &N : DAG.Nodes)
+      for (MachineInstr *MI : N.MIs)
+        DAG.MINodes[MI] = &N;
 
     // Set initial frontier position.
     DAG.FrontierPos = MBB.getFirstTerminator();
@@ -203,7 +218,7 @@ void MOSSched::buildDAGs() {
           if (Def->getParent() != &MBB)
             continue;
           auto It = DAG.MINodes.find(Def);
-          if (It == DAG.MINodes.end())
+          if (It == DAG.MINodes.end() || It->second == &N)
             continue;
           N.addPredecessor(*It->second);
         }
