@@ -17,8 +17,12 @@
 
 #include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
+#include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/iterator_range.h"
+#include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
+#include "llvm/CodeGen/ISDOpcodes.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
@@ -65,6 +69,7 @@ public:
   void getAnalysisUsage(AnalysisUsage &AU) const override;
 
   bool runOnMachineFunction(MachineFunction &MF) override;
+  void widenRCs();
   void buildDAGs();
   void scheduleTrivialNodes();
   void scheduleNode(Node &N, bool Forward, SchedulingDAG &DAG,
@@ -72,6 +77,9 @@ public:
   void dump();
 
   MachineFunction *MF;
+  MachineRegisterInfo *MRI;
+  const TargetRegisterInfo *TRI;
+  const TargetInstrInfo *TII;
   DenseMap<MachineBasicBlock *, SchedulingDAG> DAGs;
 };
 
@@ -85,6 +93,12 @@ bool MOSSched::runOnMachineFunction(MachineFunction &MF) {
   getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree().print(dbgs());
   getAnalysis<MachineLoopInfoWrapperPass>().getLI().print(dbgs());
   this->MF = &MF;
+  MRI = &MF.getRegInfo();
+  TRI = MF.getSubtarget().getRegisterInfo();
+  TII = MF.getSubtarget().getInstrInfo();
+  MF.dump();
+  widenRCs();
+  MF.dump();
   buildDAGs();
   dump();
   scheduleTrivialNodes();
@@ -100,6 +114,68 @@ template <typename T> void dumpNodes(StringRef Name, const T &Nodes) {
   for (Node *N : Nodes)
     dbgs() << ' ' << N->Idx;
   dbgs() << '\n';
+}
+
+void MOSSched::widenRCs() {
+  dbgs() << "Inserting copies to fully widen RCs.\n";
+
+  DenseMap<Register, Register> CarryingRegister;
+
+  // Establish a maximal RC carrying register for each def.
+  for (MachineBasicBlock &MBB : *MF) {
+    for (MachineInstr &MI : make_early_inc_range(MBB)) {
+      // Trivially forward copies.
+      if (MI.isCopy() && MI.getOperand(0).getReg().isVirtual()) {
+        MRI->replaceRegWith(MI.getOperand(0).getReg(),
+                            MI.getOperand(1).getReg());
+        MI.eraseFromParent();
+        continue;
+      }
+      for (MachineOperand &MO : MI.defs()) {
+        if (!MO.isReg() || !MO.getReg().isVirtual())
+          continue;
+        Register R = MO.getReg();
+        const TargetRegisterClass *RC = MRI->getRegClass(R);
+        const TargetRegisterClass *NewRC =
+            TRI->getLargestLegalSuperClass(RC, *MF);
+        if (NewRC == RC) {
+          CarryingRegister[R] = R;
+          continue;
+        }
+        Register New = MRI->createVirtualRegister(NewRC);
+        const TargetRegisterClass *Constraint =
+            TII->getRegClass(MI.getDesc(), MO.getOperandNo(), TRI, *MF);
+        if (Constraint && Constraint != NewRC) {
+          MachineIRBuilder Builder(MBB,
+                                   std::next(MachineBasicBlock::iterator(MI)));
+          Builder.buildCopy(New, R);
+        } else {
+          MO.setReg(New);
+        }
+        CarryingRegister[R] = New;
+      }
+    }
+  }
+
+  // Replace uses with the carrying register, inserting copies to resolve RC.
+  for (MachineBasicBlock &MBB : *MF) {
+    for (MachineInstr &MI : MBB) {
+      for (MachineOperand &MO : MI.uses()) {
+        if (!MO.isReg() || !MO.getReg().isVirtual())
+          continue;
+        Register New = CarryingRegister[MO.getReg()];
+        const TargetRegisterClass *RC =
+            TII->getRegClass(MI.getDesc(), MO.getOperandNo(), TRI, *MF);
+        if (RC && RC != MRI->getRegClass(New)) {
+          Register CopyReg = MRI->createVirtualRegister(RC);
+          MachineIRBuilder Builder(MBB, MI);
+          Builder.buildCopy(CopyReg, New);
+          New = CopyReg;
+        }
+        MO.setReg(New);
+      }
+    }
+  }
 }
 
 void MOSSched::buildDAGs() {
@@ -118,13 +194,12 @@ void MOSSched::buildDAGs() {
     DAG.FrontierPos = MBB.getFirstTerminator();
 
     // Find predecessors.
-    const MachineRegisterInfo &MRI = MBB.getParent()->getRegInfo();
     for (Node &N : DAG.Nodes) {
       for (MachineInstr *MI : N.MIs) {
         for (MachineOperand &MO : MI->explicit_uses()) {
           if (!MO.isReg() || !MO.getReg().isVirtual())
             continue;
-          MachineInstr *Def = MRI.getUniqueVRegDef(MO.getReg());
+          MachineInstr *Def = MRI->getUniqueVRegDef(MO.getReg());
           if (Def->getParent() != &MBB)
             continue;
           auto It = DAG.MINodes.find(Def);
