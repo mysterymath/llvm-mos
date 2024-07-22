@@ -39,6 +39,10 @@ struct Node : public ilist_node<Node> {
 
   void addPredecessor(Node &N);
 
+  // Returns whether this node is superior to another node as a candidate for
+  // scheduling in the given direction.
+  bool compare(const Node &Other, bool Forward) const;
+
   SmallSet<Node *, 4> Predecessors;
   SmallSet<Node *, 4> Successors;
 };
@@ -66,7 +70,7 @@ public:
 
   bool runOnMachineFunction(MachineFunction &MF) override;
   void buildDAGs();
-  void scheduleTrivialNodes();
+  void scheduleNodes();
   void scheduleNode(Node &N, bool Forward, SchedulingDAG &DAG,
                     MachineBasicBlock &MBB);
   void dump();
@@ -87,7 +91,7 @@ bool MOSSched::runOnMachineFunction(MachineFunction &MF) {
   this->MF = &MF;
   buildDAGs();
   dump();
-  scheduleTrivialNodes();
+  scheduleNodes();
   dump();
   MF.dump();
   return true;
@@ -158,18 +162,56 @@ void MOSSched::buildDAGs() {
   }
 }
 
-void MOSSched::scheduleTrivialNodes() {
+void MOSSched::scheduleNodes() {
   for (MachineBasicBlock &MBB : *MF) {
     SchedulingDAG &DAG = DAGs[&MBB];
-    if (DAG.ForwardAvail.size() != 1 && DAG.BackwardAvail.size() != 1)
-      continue;
-    dbgs() << "\nTrivial scheduling for %bb." << MBB.getNumber() << '\n';
-    do {
-      if (DAG.ForwardAvail.size() == 1)
+    dbgs() << "\nScheduling for %bb." << MBB.getNumber() << '\n';
+    bool ScheduledNode = true;
+    while (ScheduledNode &&
+           (!DAG.ForwardAvail.empty() || !DAG.BackwardAvail.empty())) {
+      dumpNodes("Forward Avail", DAG.ForwardAvail);
+      dumpNodes("Backward Avail", DAG.BackwardAvail);
+      ScheduledNode = false;
+      if (DAG.ForwardAvail.size() == 1) {
         scheduleNode(*DAG.ForwardAvail.front(), /*Forward=*/true, DAG, MBB);
-      else if (DAG.BackwardAvail.size() == 1)
+        ScheduledNode = true;
+        continue;
+      }
+      if (DAG.BackwardAvail.size() == 1) {
         scheduleNode(*DAG.BackwardAvail.front(), /*Forward=*/false, DAG, MBB);
-    } while (DAG.ForwardAvail.size() == 1 || DAG.BackwardAvail.size() == 1);
+        ScheduledNode = true;
+        continue;
+      }
+
+      const auto ScheduleBest = [&](SmallSetVector<Node *, 4> &Avail) {
+        if (Avail.empty())
+          return false;
+        bool Forward = &Avail == &DAG.ForwardAvail;
+        bool Unique = true;
+        Node *Best = Avail.front();
+        for (Node *N : DAG.ForwardAvail.getArrayRef().drop_front()) {
+          if (N->compare(*Best, Forward)) {
+            Best = N;
+            Unique = true;
+          } else if (Unique && !Best->compare(*N, Forward)) {
+            Unique = false;
+          }
+        }
+        if (!Unique)
+          return false;
+        scheduleNode(*Best, Forward, DAG, MBB);
+        return true;
+      };
+
+      if (ScheduleBest(DAG.ForwardAvail)) {
+        ScheduledNode = true;
+        continue;
+      }
+      if (ScheduleBest(DAG.BackwardAvail)) {
+        ScheduledNode = true;
+        continue;
+      }
+    };
   }
 }
 
@@ -227,6 +269,8 @@ void Node::addPredecessor(Node &N) {
   Predecessors.insert(&N);
   N.Successors.insert(this);
 }
+
+bool Node::compare(const Node &Other, bool Forward) const { return false; }
 
 } // namespace
 
