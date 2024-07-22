@@ -17,6 +17,7 @@
 
 #include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
+#include "MOSRegisterInfo.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/iterator_range.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
@@ -42,6 +43,9 @@ struct Node : public ilist_node<Node> {
   // Returns whether this node is superior to another node as a candidate for
   // scheduling in the given direction.
   bool compare(const Node &Other, bool Forward) const;
+
+  bool definesPhysRegInRC(const TargetRegisterClass *RC) const;
+  bool definesPhysReg() const;
 
   SmallSet<Node *, 4> Predecessors;
   SmallSet<Node *, 4> Successors;
@@ -189,11 +193,14 @@ void MOSSched::scheduleNodes() {
         bool Forward = &Avail == &DAG.ForwardAvail;
         bool Unique = true;
         Node *Best = Avail.front();
-        for (Node *N : DAG.ForwardAvail.getArrayRef().drop_front()) {
+        dbgs() << "Current best: " << Best->Idx << "\n";
+        for (Node *N : Avail.getArrayRef().drop_front()) {
           if (N->compare(*Best, Forward)) {
             Best = N;
             Unique = true;
+            dbgs() << "New best: " << Best->Idx << "\n";
           } else if (Unique && !Best->compare(*N, Forward)) {
+            dbgs() << "Best is not unique\n";
             Unique = false;
           }
         }
@@ -270,7 +277,50 @@ void Node::addPredecessor(Node &N) {
   N.Successors.insert(this);
 }
 
-bool Node::compare(const Node &Other, bool Forward) const { return false; }
+bool Node::compare(const Node &Other, bool Forward) const {
+  dbgs() << "Comparing " << Idx << " to " << Other.Idx
+         << (Forward ? " forward\n" : " backward\n");
+
+  if (!Forward) {
+    if (definesPhysRegInRC(&MOS::AcRegClass) &&
+        !Other.definesPhysRegInRC(&MOS::AcRegClass)) {
+      dbgs() << "Better on basis of defining $a\n";
+      return true;
+    }
+    if ((definesPhysRegInRC(&MOS::GPRRegClass) ||
+         definesPhysRegInRC(&MOS::GPR_LSBRegClass)) &&
+        !(Other.definesPhysRegInRC(&MOS::GPRRegClass) ||
+          Other.definesPhysRegInRC(&MOS::GPR_LSBRegClass))) {
+      dbgs() << "Better on basis of defining GPR\n";
+      return true;
+    }
+    if (definesPhysReg() && !Other.definesPhysReg()) {
+      dbgs() << "Better on basis of defining physical register\n";
+      return true;
+    }
+  }
+  return false;
+}
+
+bool Node::definesPhysRegInRC(const TargetRegisterClass *RC) const {
+  for (const MachineInstr *MI : MIs) {
+    for (const MachineOperand &MO : MI->defs()) {
+      if (!MO.isReg() || !MO.getReg().isPhysical())
+        continue;
+      if (RC->contains(MO.getReg()))
+        return true;
+    }
+  }
+  return false;
+}
+
+bool Node::definesPhysReg() const {
+  for (const MachineInstr *MI : MIs)
+    for (const MachineOperand &MO : MI->defs())
+      if (MO.isReg() && MO.getReg().isPhysical())
+        return true;
+  return false;
+}
 
 } // namespace
 
