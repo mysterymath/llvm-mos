@@ -83,6 +83,20 @@ public:
   DenseMap<MachineBasicBlock *, SchedulingDAG> DAGs;
 };
 
+class PressureSet {
+  SmallSetVector<Register, 16> LiveRegs;
+
+  const TargetRegisterInfo *TRI;
+  const MachineRegisterInfo *MRI;
+
+public:
+  int countSpills() const;
+
+private:
+  bool classesOverlap(const TargetRegisterClass *C1,
+                      const TargetRegisterClass *C2) const;
+};
+
 void MOSSched::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<MachineDominatorTreeWrapperPass>();
   AU.addRequired<MachineLoopInfoWrapperPass>();
@@ -320,6 +334,53 @@ bool Node::definesPhysReg() const {
       if (MO.isReg() && MO.getReg().isPhysical())
         return true;
   return false;
+}
+
+bool PressureSet::classesOverlap(const TargetRegisterClass *C1,
+                                 const TargetRegisterClass *C2) {
+  SmallSet<MCRegUnit, 16> Units;
+  for (Register R : C1->getRegisters()) {
+    auto RegUnits = TRI->regunits(R);
+    Units.insert(RegUnits.begin(), RegUnits.end());
+  }
+  for (Register R : C2->getRegisters())
+    if (llvm::any_of(TRI->regunits(R),
+                     [&](MCRegUnit U) { return Units.contains(U); }))
+      return true;
+  return false;
+}
+
+int PressureSet::countSpills() const {
+  SmallSetVector<Register, 16> Remaining = LiveRegs;
+  unsigned SpillCount = 0;
+  while (!Remaining.empty()) {
+    Register RegToSpill;
+    unsigned HighestConflictCount = 0;
+    Register RegToRemove;
+    for (Register R : Remaining) {
+      const TargetRegisterClass *RC = MRI->getRegClass(R);
+      unsigned ConflictCount =
+          llvm::count_if(Remaining, [&](Register OtherReg) {
+            if (OtherReg == R)
+              return false;
+            return classesOverlap(RC, MRI->getRegClass(OtherReg));
+          });
+      if (ConflictCount <= range_size(RC->getRegisters())) {
+        RegToRemove = R;
+        break;
+      }
+      if (ConflictCount > HighestConflictCount) {
+        HighestConflictCount = ConflictCount;
+        RegToSpill = R;
+      }
+    }
+    if (!RegToRemove) {
+      ++SpillCount;
+      RegToRemove = RegToSpill;
+    }
+    Remaining.remove(RegToRemove);
+  }
+  return SpillCount;
 }
 
 } // namespace
