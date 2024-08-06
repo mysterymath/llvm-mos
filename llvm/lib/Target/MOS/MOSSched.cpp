@@ -20,6 +20,7 @@
 #include "MOSRegisterInfo.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/iterator_range.h"
+#include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineLoopInfo.h"
@@ -98,12 +99,14 @@ public:
 void MOSSched::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<MachineDominatorTreeWrapperPass>();
   AU.addRequired<MachineLoopInfoWrapperPass>();
+  AU.addRequired<LiveVariablesWrapperPass>();
   MachineFunctionPass::getAnalysisUsage(AU);
 }
 
 bool MOSSched::runOnMachineFunction(MachineFunction &MF) {
   getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree().print(dbgs());
   getAnalysis<MachineLoopInfoWrapperPass>().getLI().print(dbgs());
+  getAnalysis<LiveVariablesWrapperPass>().getLV().print(dbgs());
   this->MF = &MF;
   buildDAGs();
   dump();
