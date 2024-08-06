@@ -83,18 +83,16 @@ public:
   DenseMap<MachineBasicBlock *, SchedulingDAG> DAGs;
 };
 
+struct Context {
+  const TargetRegisterInfo *TRI;
+  const MachineRegisterInfo *MRI;
+};
+
 class PressureSet {
   SmallSetVector<Register, 16> LiveRegs;
 
-  const TargetRegisterInfo *TRI;
-  const MachineRegisterInfo *MRI;
-
 public:
-  int countSpills() const;
-
-private:
-  bool classesOverlap(const TargetRegisterClass *C1,
-                      const TargetRegisterClass *C2) const;
+  int countSpills(const Context &Ctx) const;
 };
 
 void MOSSched::getAnalysisUsage(AnalysisUsage &AU) const {
@@ -336,21 +334,21 @@ bool Node::definesPhysReg() const {
   return false;
 }
 
-bool PressureSet::classesOverlap(const TargetRegisterClass *C1,
-                                 const TargetRegisterClass *C2) {
+static bool classesOverlap(const TargetRegisterClass *C1,
+                           const TargetRegisterClass *C2, const Context &Ctx) {
   SmallSet<MCRegUnit, 16> Units;
   for (Register R : C1->getRegisters()) {
-    auto RegUnits = TRI->regunits(R);
+    auto RegUnits = Ctx.TRI->regunits(R);
     Units.insert(RegUnits.begin(), RegUnits.end());
   }
   for (Register R : C2->getRegisters())
-    if (llvm::any_of(TRI->regunits(R),
+    if (llvm::any_of(Ctx.TRI->regunits(R),
                      [&](MCRegUnit U) { return Units.contains(U); }))
       return true;
   return false;
 }
 
-int PressureSet::countSpills() const {
+int PressureSet::countSpills(const Context &Ctx) const {
   SmallSetVector<Register, 16> Remaining = LiveRegs;
   unsigned SpillCount = 0;
   while (!Remaining.empty()) {
@@ -358,12 +356,12 @@ int PressureSet::countSpills() const {
     unsigned HighestConflictCount = 0;
     Register RegToRemove;
     for (Register R : Remaining) {
-      const TargetRegisterClass *RC = MRI->getRegClass(R);
+      const TargetRegisterClass *RC = Ctx.MRI->getRegClass(R);
       unsigned ConflictCount =
           llvm::count_if(Remaining, [&](Register OtherReg) {
             if (OtherReg == R)
               return false;
-            return classesOverlap(RC, MRI->getRegClass(OtherReg));
+            return classesOverlap(RC, Ctx.MRI->getRegClass(OtherReg), Ctx);
           });
       if (ConflictCount <= range_size(RC->getRegisters())) {
         RegToRemove = R;
