@@ -93,6 +93,7 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override;
 
   void decomposeToTree();
+  void dumpPositions();
   void dumpTree(Node *Root = nullptr, unsigned Indent = 0);
 
 private:
@@ -109,6 +110,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
   LLVM_DEBUG(dbgs() << "Producing tree decomposition of basic block graph.\n");
   decomposeToTree();
+  dumpPositions();
   dumpTree();
 
   return false;
@@ -395,12 +397,30 @@ void MOSRegAlloc::decomposeToTree() {
   }
 }
 
+void MOSRegAlloc::dumpPositions() {
+  for (MachineBasicBlock &MBB : *MF) {
+    dbgs() << MBB.getName() << ":\n";
+    for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(),
+                                     E = MBB.getFirstTerminator();
+         ; ++I) {
+      dbgs() << PositionIndices[{&MBB, I}] << ": ";
+      if (I == E) {
+        dbgs() << "<end>\n";
+        break;
+      }
+      dbgs() << *I;
+    }
+    dbgs() << '\n';
+  }
+}
+
 void MOSRegAlloc::dumpTree(Node *Root, unsigned Indent) {
   if (!Root)
     Root = &Tree[0];
   for (unsigned I = 0; I < Indent; ++I)
     dbgs() << ' ';
   dbgs() << Root - &Tree[0];
+  /*
   switch (Root->getType()) {
   case Node::Type::Forget:
     dbgs() << 'F';
@@ -412,13 +432,13 @@ void MOSRegAlloc::dumpTree(Node *Root, unsigned Indent) {
     dbgs() << 'J';
     break;
   }
+  */
   dbgs() << ": ";
-  for (Position P : Root->Positions) {
+  for (Position P : Root->Positions)
     dbgs() << PositionIndices[P] << ' ';
-  }
   dbgs() << '\n';
   for (Node *C : Root->Children)
-    dumpTree(C, Indent + 2);
+    dumpTree(C, Indent + 1);
 }
 
 char MOSRegAlloc::ID = 0;
