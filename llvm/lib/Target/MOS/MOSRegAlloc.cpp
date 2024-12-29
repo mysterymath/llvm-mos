@@ -53,11 +53,19 @@ template <> struct DenseMapInfo<Position> {
 
 namespace {
 
+// Generalized register class
+struct GenRC {};
+
+// For each position, for each register, a collection of register classes.
+// If the optional isn't set, then any allocation suffices for that position.
+using AllocTy = SmallVector<std::optional<DenseMap<unsigned, GenRC>>>;
+
 struct Node {
   enum class Type { Intro, Forget, Join };
 
   SmallVector<Position> Positions;
   SmallVector<Node *> Children;
+  AllocTy Alloc;
 
   Type getType() const {
     if (Children.empty())
