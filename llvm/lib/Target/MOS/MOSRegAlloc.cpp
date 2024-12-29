@@ -119,7 +119,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 namespace {
 
 SmallVector<Position> positionSuccessors(Position Pos) {
-  if (Pos.Pos != Pos.MBB->getFirstTerminator())
+  if (Pos.Pos != Pos.MBB->end())
     return {{Pos.MBB, std::next(Pos.Pos)}};
   SmallVector<Position> Successors;
   for (MachineBasicBlock *Succ : Pos.MBB->successors())
@@ -132,7 +132,7 @@ SmallVector<Position> positionPredecessors(Position Pos) {
     return {{Pos.MBB, std::prev(Pos.Pos)}};
   SmallVector<Position> Predecessors;
   for (MachineBasicBlock *Pred : Pos.MBB->predecessors())
-    Predecessors.push_back({Pred, Pred->getFirstTerminator()});
+    Predecessors.push_back({Pred, Pred->end()});
   return Predecessors;
 }
 
@@ -165,9 +165,8 @@ void MOSRegAlloc::decomposeToTree() {
   SmallVector<Position> Positions;
   PositionIndices.clear();
   for (MachineBasicBlock &MBB : *MF) {
-    for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(),
-                                     E = MBB.getFirstTerminator();
-         ; ++I) {
+    for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(), E = MBB.end();;
+         ++I) {
       Positions.push_back({&MBB, I});
       PositionIndices[Positions.back()] = Positions.size() - 1;
       if (I == E)
@@ -178,7 +177,7 @@ void MOSRegAlloc::decomposeToTree() {
   DenseMap<unsigned, unsigned> MaxJJump;
   DenseMap<unsigned, unsigned> MaxSJump;
   for (MachineBasicBlock &MBB : *MF) {
-    Position From = {&MBB, MBB.getFirstTerminator()};
+    Position From = {&MBB, MBB.end()};
     unsigned I = PositionIndices[From];
 
     for (MachineBasicBlock *Succ : MBB.successors()) {
@@ -400,9 +399,8 @@ void MOSRegAlloc::decomposeToTree() {
 void MOSRegAlloc::dumpPositions() {
   for (MachineBasicBlock &MBB : *MF) {
     dbgs() << MBB.getName() << ":\n";
-    for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(),
-                                     E = MBB.getFirstTerminator();
-         ; ++I) {
+    for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(), E = MBB.end();;
+         ++I) {
       dbgs() << PositionIndices[{&MBB, I}] << ": ";
       if (I == E) {
         dbgs() << "<end>\n";
