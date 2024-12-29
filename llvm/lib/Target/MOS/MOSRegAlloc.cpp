@@ -15,6 +15,7 @@
 #include "MOS.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
 
 #define DEBUG_TYPE "mos-reg-alloc"
@@ -56,16 +57,15 @@ namespace {
 // Generalized register class
 struct GenRC {};
 
-// For each position, for each register, a collection of register classes.
-// If the optional isn't set, then any allocation suffices for that position.
-using AllocTy = SmallVector<std::optional<DenseMap<unsigned, GenRC>>>;
-
 struct Node {
   enum class Type { Intro, Forget, Join };
 
   SmallVector<Position> Positions;
   SmallVector<Node *> Children;
-  AllocTy Alloc;
+
+  // For each position, for each register, a collection of register classes.
+  // If the optional isn't set, then any allocation suffices for that position.
+  SmallVector<std::optional<DenseMap<unsigned, GenRC>>> Alloc;
 
   Type getType() const {
     if (Children.empty())
@@ -466,6 +466,15 @@ void MOSRegAlloc::solveTree(Node *Root) {
     llvm_unreachable("TODO: Join");
     break;
   }
+  dbgs() << Root - &Tree[0];
+  dbgs() << ": ";
+  for (const auto &[I, A] : llvm::enumerate(Root->Alloc)) {
+    if (A)
+      llvm_unreachable("TODO: Print present alloc entry");
+    else
+      llvm::dbgs() << "I { * } ";
+  }
+  dbgs() << '\n';
 }
 
 char MOSRegAlloc::ID = 0;
