@@ -418,7 +418,6 @@ void MOSRegAlloc::dumpTree(Node *Root, unsigned Indent) {
   for (unsigned I = 0; I < Indent; ++I)
     dbgs() << ' ';
   dbgs() << Root - &Tree[0];
-  /*
   switch (Root->getType()) {
   case Node::Type::Forget:
     dbgs() << 'F';
@@ -430,7 +429,6 @@ void MOSRegAlloc::dumpTree(Node *Root, unsigned Indent) {
     dbgs() << 'J';
     break;
   }
-  */
   dbgs() << ": ";
   for (Position P : Root->Positions)
     dbgs() << PositionIndices[P] << ' ';
