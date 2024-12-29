@@ -464,13 +464,12 @@ void MOSRegAlloc::solveTree(Node *Root) {
     } else {
       Node *Child = Root->Children.front();
       solveTree(Child);
-      for (unsigned I = 0, J = 0;
-           I < Root->Alloc.size() && J < Child->Alloc.size(); I++, J++) {
-        if (Root->Positions[I] != Child->Positions[J]) {
-          Root->Alloc.push_back(std::nullopt);
-          ++I;
+      for (unsigned I = 0, J = 0; I < Root->Positions.size(); ++I) {
+        if (J < Child->Positions.size() &&
+            Root->Positions[I] == Child->Positions[J]) {
+          Root->Alloc.push_back(Child->Alloc[J++]);
         } else {
-          Root->Alloc.push_back(Child->Alloc[J]);
+          Root->Alloc.push_back(std::nullopt);
         }
       }
     }
@@ -487,7 +486,7 @@ void MOSRegAlloc::solveTree(Node *Root) {
     if (A)
       llvm_unreachable("TODO: Print present alloc entry");
     else
-      llvm::dbgs() << I << " { * } ";
+      llvm::dbgs() << PositionIndices[Root->Positions[I]] << " { * } ";
   }
   dbgs() << '\n';
 }
