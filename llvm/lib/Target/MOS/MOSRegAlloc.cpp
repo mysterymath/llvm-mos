@@ -31,6 +31,7 @@ struct Position {
   bool operator==(Position Other) const {
     return MBB == Other.MBB && Pos == Other.Pos;
   }
+  bool operator!=(Position Other) const { return !(*this == Other); }
 };
 
 } // namespace
@@ -461,8 +462,17 @@ void MOSRegAlloc::solveTree(Node *Root) {
              "leaves must have only one position");
       Root->Alloc.push_back(std::nullopt);
     } else {
-      solveTree(Root->Children.front());
-      llvm_unreachable("TODO: Intro");
+      Node *Child = Root->Children.front();
+      solveTree(Child);
+      for (unsigned I = 0, J = 0;
+           I < Root->Alloc.size() && J < Child->Alloc.size(); I++, J++) {
+        if (Root->Positions[I] != Child->Positions[J]) {
+          Root->Alloc.push_back(std::nullopt);
+          ++I;
+        } else {
+          Root->Alloc.push_back(Child->Alloc[J]);
+        }
+      }
     }
     break;
   case Node::Type::Join:
