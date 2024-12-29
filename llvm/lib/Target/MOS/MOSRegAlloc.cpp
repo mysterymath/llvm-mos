@@ -452,10 +452,18 @@ void MOSRegAlloc::solveTree(Node *Root) {
   if (!Root)
     Root = &Tree[0];
   switch (Root->getType()) {
-  case Node::Type::Forget:
-    solveTree(Root->Children.front());
+  case Node::Type::Forget: {
+    Node *Child = Root->Children.front();
+    solveTree(Child);
+    Position Forgotten;
+    for (unsigned I = 0; I < Child->Positions.size(); ++I)
+      if (I >= Root->Positions.size() ||
+          Root->Positions[I] != Child->Positions[I])
+        Forgotten = Child->Positions[I];
+    dbgs() << "Forget " << PositionIndices[Forgotten] << '\n';
     llvm_unreachable("TODO: Forget");
     break;
+  }
   case Node::Type::Intro:
     if (Root->Children.empty()) {
       assert(Root->Positions.size() == 1 &&
