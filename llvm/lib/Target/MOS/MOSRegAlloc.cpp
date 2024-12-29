@@ -456,9 +456,14 @@ void MOSRegAlloc::solveTree(Node *Root) {
     llvm_unreachable("TODO: Forget");
     break;
   case Node::Type::Intro:
-    if (!Root->Children.empty())
+    if (Root->Children.empty()) {
+      assert(Root->Positions.size() == 1 &&
+             "leaves must have only one position");
+      Root->Alloc.push_back(std::nullopt);
+    } else {
       solveTree(Root->Children.front());
-    llvm_unreachable("TODO: Intro");
+      llvm_unreachable("TODO: Intro");
+    }
     break;
   case Node::Type::Join:
     for (Node *Child : Root->Children)
@@ -472,7 +477,7 @@ void MOSRegAlloc::solveTree(Node *Root) {
     if (A)
       llvm_unreachable("TODO: Print present alloc entry");
     else
-      llvm::dbgs() << "I { * } ";
+      llvm::dbgs() << I << " { * } ";
   }
   dbgs() << '\n';
 }
