@@ -95,6 +95,7 @@ public:
   void decomposeToTree();
   void dumpPositions();
   void dumpTree(Node *Root = nullptr, unsigned Indent = 0);
+  void solveTree(Node *Root = nullptr);
 
 private:
   MachineFunction *MF;
@@ -112,6 +113,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   decomposeToTree();
   dumpPositions();
   dumpTree();
+  solveTree();
 
   return false;
 }
@@ -435,6 +437,27 @@ void MOSRegAlloc::dumpTree(Node *Root, unsigned Indent) {
   dbgs() << '\n';
   for (Node *C : Root->Children)
     dumpTree(C, Indent + 1);
+}
+
+void MOSRegAlloc::solveTree(Node *Root) {
+  if (!Root)
+    Root = &Tree[0];
+  switch (Root->getType()) {
+  case Node::Type::Forget:
+    solveTree(Root->Children.front());
+    llvm_unreachable("TODO: Forget");
+    break;
+  case Node::Type::Intro:
+    if (!Root->Children.empty())
+      solveTree(Root->Children.front());
+    llvm_unreachable("TODO: Intro");
+    break;
+  case Node::Type::Join:
+    for (Node *Child : Root->Children)
+      solveTree(Child);
+    llvm_unreachable("TODO: Join");
+    break;
+  }
 }
 
 char MOSRegAlloc::ID = 0;
