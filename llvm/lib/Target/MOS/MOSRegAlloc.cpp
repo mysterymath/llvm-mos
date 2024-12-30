@@ -466,6 +466,21 @@ void MOSRegAlloc::solveTree(Node *Root) {
           Root->Positions[I] != Child->Positions[I])
         Forgotten = Child->Positions[I];
     dbgs() << "Forget " << PositionIndices[Forgotten] << '\n';
+
+    SmallVector<Position> Preds;
+    for (Position P : positionPredecessors(Forgotten))
+      if (llvm::is_contained(Root->Positions, P))
+        Preds.push_back(P);
+    SmallVector<Position> Succs;
+    for (Position P : positionSuccessors(Forgotten))
+      if (llvm::is_contained(Root->Positions, P))
+        Succs.push_back(P);
+
+    for (Position P : Preds)
+      dbgs() << "Predecessor " << PositionIndices[P] << '\n';
+    for (Position P : Succs)
+      dbgs() << "Successor " << PositionIndices[P] << '\n';
+
     llvm_unreachable("TODO: Forget");
     break;
   }
