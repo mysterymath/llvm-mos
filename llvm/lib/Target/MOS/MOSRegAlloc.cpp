@@ -58,15 +58,20 @@ namespace {
 // Generalized register class
 struct GenRC {};
 
+typedef std::optional<DenseMap<Register, GenRC>> PosAlloc;
+
+struct Alloc {
+  SmallVector<PosAlloc> PosAllocs;
+  unsigned Cost;
+};
+
 struct Node {
   enum class Type { Intro, Forget, Join };
 
   SmallVector<Position> Positions;
   SmallVector<Node *> Children;
 
-  // For each position, for each register, a collection of register classes.
-  // If the optional isn't set, then any allocation suffices for that position.
-  SmallVector<std::optional<DenseMap<unsigned, GenRC>>> Alloc;
+  SmallVector<Alloc> Allocs;
 
   Type getType() const {
     if (Children.empty())
@@ -468,16 +473,21 @@ void MOSRegAlloc::solveTree(Node *Root) {
     if (Root->Children.empty()) {
       assert(Root->Positions.size() == 1 &&
              "leaves must have only one position");
-      Root->Alloc.push_back(std::nullopt);
+      Root->Allocs.push_back({{std::nullopt}, 0});
     } else {
       Node *Child = Root->Children.front();
       solveTree(Child);
-      for (unsigned I = 0, J = 0; I < Root->Positions.size(); ++I) {
-        if (J < Child->Positions.size() &&
-            Root->Positions[I] == Child->Positions[J]) {
-          Root->Alloc.push_back(Child->Alloc[J++]);
-        } else {
-          Root->Alloc.push_back(std::nullopt);
+      for (const Alloc &ChildAlloc : Child->Allocs) {
+        Root->Allocs.emplace_back();
+        Alloc &A = Root->Allocs.back();
+        A.Cost = ChildAlloc.Cost;
+        for (unsigned I = 0, J = 0; I < Root->Positions.size(); ++I) {
+          if (J < Child->Positions.size() &&
+              Root->Positions[I] == Child->Positions[J]) {
+            A.PosAllocs.push_back(ChildAlloc.PosAllocs[J++]);
+          } else {
+            A.PosAllocs.push_back(std::nullopt);
+          }
         }
       }
     }
@@ -489,14 +499,18 @@ void MOSRegAlloc::solveTree(Node *Root) {
     break;
   }
   dbgs() << Root - &Tree[0];
-  dbgs() << ": ";
-  for (const auto &[I, A] : llvm::enumerate(Root->Alloc)) {
-    if (A)
-      llvm_unreachable("TODO: Print present alloc entry");
-    else
-      llvm::dbgs() << PositionIndices[Root->Positions[I]] << " { * } ";
+  dbgs() << ":\n";
+  for (Alloc &A : Root->Allocs) {
+    dbgs() << A.Cost << "{\n";
+    for (const auto &[I, PA] : llvm::enumerate(A.PosAllocs)) {
+      if (PA)
+        llvm_unreachable("TODO: Print present posalloc entry");
+      else
+        llvm::dbgs() << "  " << PositionIndices[Root->Positions[I]]
+                     << " { * } ";
+    }
+    dbgs() << "\n}\n";
   }
-  dbgs() << '\n';
 }
 
 char MOSRegAlloc::ID = 0;
