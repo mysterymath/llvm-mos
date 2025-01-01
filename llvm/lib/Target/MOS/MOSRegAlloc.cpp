@@ -16,6 +16,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/CodeGen/LiveVariables.h"
+#include "llvm/CodeGen/MachineBlockFrequencyInfo.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -109,6 +110,8 @@ public:
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     MachineFunctionPass::getAnalysisUsage(AU);
     AU.addRequired<LiveVariablesWrapperPass>();
+    AU.addRequired<MachineBlockFrequencyInfoWrapperPass>();
+    AU.addPreserved<MachineBlockFrequencyInfoWrapperPass>();
   }
 
   bool runOnMachineFunction(MachineFunction &MF) override;
@@ -123,6 +126,7 @@ public:
 private:
   MachineFunction *MF;
   LiveVariables *LV;
+  MachineBlockFrequencyInfo *MBFI;
 
   DenseMap<Position, unsigned> PositionIndices;
   SmallVector<Node, 0> Tree;
@@ -133,6 +137,7 @@ private:
 bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   this->MF = &MF;
   LV = &getAnalysis<LiveVariablesWrapperPass>().getLV();
+  MBFI = &getAnalysis<MachineBlockFrequencyInfoWrapperPass>().getMBFI();
 
   LLVM_DEBUG(dbgs() << "Producing tree decomposition of basic block graph.\n");
   decomposeToTree();
@@ -425,7 +430,8 @@ void MOSRegAlloc::decomposeToTree() {
 
 void MOSRegAlloc::dumpPositions() {
   for (MachineBasicBlock &MBB : *MF) {
-    dbgs() << printMBBReference(MBB) << ":\n";
+    dbgs() << printMBBReference(MBB) << ": "
+           << MBFI->getBlockFreq(&MBB).getFrequency() << '\n';
     for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(), E = MBB.end();;
          ++I) {
       dbgs() << PositionIndices[{&MBB, I}] << ": ";
