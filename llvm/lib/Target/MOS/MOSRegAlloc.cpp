@@ -16,6 +16,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/CodeGen/LiveVariables.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
 
@@ -116,6 +117,8 @@ public:
   void dumpPositions();
   void dumpTree(Node *Root = nullptr, unsigned Indent = 0);
   void solveTree(Node *Root = nullptr);
+
+  SmallVector<Register> getLiveRegs(Position P);
 
 private:
   MachineFunction *MF;
@@ -422,7 +425,7 @@ void MOSRegAlloc::decomposeToTree() {
 
 void MOSRegAlloc::dumpPositions() {
   for (MachineBasicBlock &MBB : *MF) {
-    dbgs() << MBB.getName() << ":\n";
+    dbgs() << printMBBReference(MBB) << ":\n";
     for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(), E = MBB.end();;
          ++I) {
       dbgs() << PositionIndices[{&MBB, I}] << ": ";
@@ -489,6 +492,10 @@ void MOSRegAlloc::solveTree(Node *Root) {
     for (Position P : Succs)
       dbgs() << "Successor " << PositionIndices[P] << '\n';
 
+    SmallVector<Register> LiveRegs = getLiveRegs(Forgotten);
+    for (Register R : LiveRegs)
+      dbgs() << "Live reg " << printReg(R) << '\n';
+
     llvm_unreachable("TODO: Forget");
     break;
   }
@@ -534,6 +541,17 @@ void MOSRegAlloc::solveTree(Node *Root) {
     }
     dbgs() << "\n}\n";
   }
+}
+
+SmallVector<Register> MOSRegAlloc::getLiveRegs(Position P) {
+  SmallVector<Register> LiveRegs;
+  for (unsigned I = 0, E = MF->getRegInfo().getNumVirtRegs(); I != E; ++I) {
+    Register R = Register::index2VirtReg(I);
+    if (!LV->isLiveIn(R, *P.MBB))
+      continue;
+    LiveRegs.push_back(R);
+  }
+  return LiveRegs;
 }
 
 char MOSRegAlloc::ID = 0;
