@@ -15,6 +15,7 @@
 #include "MOS.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallSet.h"
+#include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
 
@@ -104,6 +105,11 @@ public:
         MachineFunctionProperties::Property::NoPHIs);
   }
 
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    MachineFunctionPass::getAnalysisUsage(AU);
+    AU.addRequired<LiveVariablesWrapperPass>();
+  }
+
   bool runOnMachineFunction(MachineFunction &MF) override;
 
   void decomposeToTree();
@@ -113,6 +119,7 @@ public:
 
 private:
   MachineFunction *MF;
+  LiveVariables *LV;
 
   DenseMap<Position, unsigned> PositionIndices;
   SmallVector<Node, 0> Tree;
@@ -122,6 +129,7 @@ private:
 
 bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   this->MF = &MF;
+  LV = &getAnalysis<LiveVariablesWrapperPass>().getLV();
 
   LLVM_DEBUG(dbgs() << "Producing tree decomposition of basic block graph.\n");
   decomposeToTree();
