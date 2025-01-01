@@ -61,7 +61,7 @@ namespace {
 // Generalized register class
 struct GenRC {};
 
-typedef std::optional<DenseMap<Register, GenRC>> PosAlloc;
+typedef DenseMap<Register, GenRC> PosAlloc;
 
 struct Alloc {
   SmallVector<PosAlloc> PosAllocs;
@@ -509,7 +509,7 @@ void MOSRegAlloc::solveTree(Node *Root) {
     if (Root->Children.empty()) {
       assert(Root->Positions.size() == 1 &&
              "leaves must have only one position");
-      Root->Allocs.push_back({{std::nullopt}, 0});
+      Root->Allocs.push_back({{DenseMap<Register, GenRC>{}}, 0});
     } else {
       Node *Child = Root->Children.front();
       solveTree(Child);
@@ -522,7 +522,7 @@ void MOSRegAlloc::solveTree(Node *Root) {
               Root->Positions[I] == Child->Positions[J]) {
             A.PosAllocs.push_back(ChildAlloc.PosAllocs[J++]);
           } else {
-            A.PosAllocs.push_back(std::nullopt);
+            A.PosAllocs.push_back(DenseMap<Register, GenRC>{});
           }
         }
       }
@@ -539,11 +539,11 @@ void MOSRegAlloc::solveTree(Node *Root) {
   for (Alloc &A : Root->Allocs) {
     dbgs() << A.Cost << "{\n";
     for (const auto &[I, PA] : llvm::enumerate(A.PosAllocs)) {
-      if (PA)
+      if (PA.empty()) {
+        llvm::dbgs() << "  " << PositionIndices[Root->Positions[I]] << " { } ";
+      } else {
         llvm_unreachable("TODO: Print present posalloc entry");
-      else
-        llvm::dbgs() << "  " << PositionIndices[Root->Positions[I]]
-                     << " { * } ";
+      }
     }
     dbgs() << "\n}\n";
   }
