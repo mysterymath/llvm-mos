@@ -249,7 +249,8 @@ void MOSRegAlloc::decomposeToTree() {
   for (const auto &[I, J] : MaximalSChainsByEnd)
     dbgs() << formatv("({0}, {1})\n", I, J);
 
-  // Algorithm D given by Thorup, for finding a good listing.
+  // Algorithm D given by Thorup, for finding a good listing. A listing is the
+  // permuted index for each position.
   std::vector<int> Listing(Positions.size(), -1);
   unsigned I = 0;
   for (int J = Positions.size() - 1; J >= 0; --J) {
@@ -265,25 +266,19 @@ void MOSRegAlloc::decomposeToTree() {
       Listing[It->second] = I++;
   }
 
-  // Permute blocks into Thorup listing order.
-  {
-    SmallVector<Position> OrderedPositions(Positions.size());
-    for (const auto &[I, L] : llvm::enumerate(Listing))
-      OrderedPositions[L] = Positions[I];
-
-    Positions.swap(OrderedPositions);
-    for (const auto &[I, Pos] : llvm::enumerate(Positions))
-      PositionIndices[Pos] = I;
-  }
+  // Compute the inverse listing (the original index for each permuted index).
+  SmallVector<unsigned> InvListing(Positions.size());
+  for (const auto &[I, L] : llvm::enumerate(Listing))
+    InvListing[L] = I;
 
   // Compute the minimum separators for each block. (Thorup Algorithm A).
   SmallVector<SmallSet<unsigned, 5>> Separators(Positions.size());
   SmallVector<SmallSet<unsigned, 5>> InvSeparators(Positions.size());
   DenseSet<unsigned> DSet;
   for (int I = Positions.size() - 1; I >= 0; --I) {
-    Position Pos = Positions[I];
+    Position Pos = Positions[InvListing[I]];
     for (Position Succ : positionSuccessors(Pos)) {
-      unsigned H = PositionIndices[Succ];
+      unsigned H = Listing[PositionIndices[Succ]];
       if (H >= (unsigned)I)
         continue;
       Separators[I].insert(H);
@@ -291,7 +286,7 @@ void MOSRegAlloc::decomposeToTree() {
     }
     // Note that the graph is considered undirected here.
     for (Position Pred : positionPredecessors(Pos)) {
-      unsigned H = PositionIndices[Pred];
+      unsigned H = Listing[PositionIndices[Pred]];
       if (H >= (unsigned)I)
         continue;
       Separators[I].insert(H);
@@ -312,23 +307,23 @@ void MOSRegAlloc::decomposeToTree() {
   dbgs() << "Separators:\n";
   for (unsigned I = 0; I < Positions.size(); ++I) {
     dbgs() << I << ": ";
-    for (unsigned J : Separators[I]) {
-      dbgs() << J << ' ';
-    }
+    for (unsigned J : Separators[Listing[I]])
+      dbgs() << InvListing[J] << ' ';
     dbgs() << '\n';
   }
 
   // Thorup, Lemma 12.
   SmallVector<SmallSet<unsigned, 5>> NodePositions(Positions.size());
   SmallVector<SmallSet<unsigned, 5>> NodeChildren(Positions.size());
-  NodePositions[0].insert(0);
+  NodePositions[0].insert(InvListing[0]);
   for (unsigned I = 1; I < Positions.size(); ++I) {
     unsigned H = 0;
     for (unsigned S : Separators[I])
       H = std::max(H, S);
     NodeChildren[H].insert(I);
-    NodePositions[I] = Separators[I];
-    NodePositions[I].insert(I);
+    for (unsigned S : Separators[I])
+      NodePositions[I].insert(InvListing[S]);
+    NodePositions[I].insert(InvListing[I]);
   }
 
   // Produce a "nice" tree decomposition, where the position set differs by at
@@ -409,6 +404,7 @@ void MOSRegAlloc::decomposeToTree() {
     for (unsigned C : NodeChildren[Root])
       MakeSubTreeNice(C);
   };
+
   MakeSubTreeNice(0);
   // Make the root node have no positions
   unsigned RootCopy = NodePositions.size();
