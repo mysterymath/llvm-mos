@@ -13,12 +13,18 @@
 #include "MOSRegAlloc.h"
 
 #include "MOS.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
 
 #define DEBUG_TYPE "mos-reg-alloc"
 
 using namespace llvm;
 
 namespace {
+
+struct RegFamily {
+  DenseSet<Register> Regs;
+};
 
 class MOSRegAlloc : public MachineFunctionPass {
 public:
@@ -39,11 +45,33 @@ public:
   }
 
   bool runOnMachineFunction(MachineFunction &MF) override;
+
+  void buildRegFamilies();
+
+private:
+  MachineFunction *MF;
+
+  SmallVector<std::unique_ptr<RegFamily>> RegFamilies;
+  DenseMap<Register, RegFamily*> FamilyForReg;
 };
 
 } // namespace
 
-bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) { return false; }
+bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
+  this->MF = &MF;
+  buildRegFamilies();
+  return false;
+}
+
+void MOSRegAlloc::buildRegFamilies() {
+  MachineRegisterInfo &MRI = MF->getRegInfo();
+
+  for (unsigned I = 0, E = MRI.getNumVirtRegs(); I != E; ++I) {
+    Register R = Register::index2VirtReg(I);
+    if (MRI.reg_nodbg_empty(R))
+      continue;
+  }
+}
 
 char MOSRegAlloc::ID = 0;
 
