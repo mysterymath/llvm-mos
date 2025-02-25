@@ -63,7 +63,7 @@ private:
   MachineRegisterInfo *MRI;
 
   // For rewriteSSAValues
-  DenseMap<Register, Register> RewrittenVReg;
+  SmallVector<Register, 0> RewrittenVReg;
 
   // For allocatePhysRegs
   SmallVector<AllocPoint, 0> AllocPoints;
@@ -103,6 +103,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 // Strip out register classes and copies from virtual regs to establish the
 // invariant that each SSA value has exactly one SSA variable.
 void MOSRegAlloc::rewriteSSAValues() {
+  RewrittenVReg.resize(MRI->getNumVirtRegs());
   for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
     Register R = Register::index2VirtReg(I);
     if (!MRI->use_nodbg_empty(R))
@@ -111,9 +112,9 @@ void MOSRegAlloc::rewriteSSAValues() {
 }
 
 Register MOSRegAlloc::rewriteSSAValue(Register R) {
-  auto It = RewrittenVReg.find(R);
-  if (It != RewrittenVReg.end())
-    return It->second;
+  unsigned Idx = Register::virtReg2Index(R);
+  if (RewrittenVReg[Idx])
+    return RewrittenVReg[Idx];
 
   MachineInstr *Def = MRI->getUniqueVRegDef(R);
   Register New;
@@ -122,8 +123,9 @@ Register MOSRegAlloc::rewriteSSAValue(Register R) {
     Def->eraseFromParent();
   } else {
     New = MRI->createGenericVirtualRegister(findRegType(R));
+    RewrittenVReg.emplace_back();
   }
-  RewrittenVReg.try_emplace(R, New);
+  RewrittenVReg[Idx] = Register::virtReg2Index(New);
   MRI->replaceRegWith(R, New);
   return New;
 }
