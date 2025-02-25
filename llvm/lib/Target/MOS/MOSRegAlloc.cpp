@@ -50,6 +50,7 @@ private:
 
   void rewriteSSAValues();
   Register rewriteSSAValue(Register R);
+  LLT findRegType(Register R);
 };
 
 } // namespace
@@ -67,10 +68,9 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 // Strip out register classes and copies from virtual regs to establish the
 // invariant that each SSA value has exactly one SSA variable.
 void MOSRegAlloc::rewriteSSAValues() {
-  MachineRegisterInfo &MRI = MF->getRegInfo();
-  for (unsigned I = 0, E = MRI.getNumVirtRegs(); I != E; ++I) {
+  for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
     Register R = Register::index2VirtReg(I);
-    if (!MRI.use_nodbg_empty(R))
+    if (!MRI->use_nodbg_empty(R))
       rewriteSSAValue(R);
   }
 }
@@ -82,13 +82,23 @@ Register MOSRegAlloc::rewriteSSAValue(Register R) {
 
   MachineInstr *Def = MRI->getUniqueVRegDef(R);
   Register New;
-  if (Def->isCopy())
+  if (Def->isCopy()) {
     New = rewriteSSAValue(Def->getOperand(1).getReg());
-  else
-    New = MRI->createIncompleteVirtualRegister();
+    Def->eraseFromParent();
+  } else {
+    New = MRI->createGenericVirtualRegister(findRegType(R));
+  }
   RewrittenVReg.try_emplace(R, New);
   MRI->replaceRegWith(R, New);
   return New;
+}
+
+LLT MOSRegAlloc::findRegType(Register R) {
+  LLT Ty = MRI->getType(R);
+  if (Ty.isValid())
+    return Ty;
+  const TargetRegisterInfo *TRI = MF->getSubtarget().getRegisterInfo();
+  return LLT::scalar(TRI->getRegSizeInBits(R, *MRI));
 }
 
 char MOSRegAlloc::ID = 0;
