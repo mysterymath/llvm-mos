@@ -13,6 +13,8 @@
 #include "MOSRegAlloc.h"
 
 #include "MOS.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 
 #define DEBUG_TYPE "mos-reg-alloc"
@@ -20,6 +22,21 @@
 using namespace llvm;
 
 namespace {
+
+struct Alloc {
+  Register A, X, Y, C, V;
+
+  bool operator==(const Alloc &Other) const {
+    return A == Other.A && X == Other.X && Y == Other.Y && C == Other.C &&
+           V == Other.V;
+  };
+};
+
+struct AllocPoint {
+  MachineBasicBlock *MBB;
+  MachineBasicBlock::iterator I;
+  DenseMap<Alloc, unsigned> AllocCosts;
+};
 
 class MOSRegAlloc : public MachineFunctionPass {
 public:
@@ -45,15 +62,32 @@ private:
   MachineFunction *MF;
   MachineRegisterInfo *MRI;
 
-  // For rewriteSSAValues().
+  // For rewriteSSAValues
   DenseMap<Register, Register> RewrittenVReg;
+
+  // For allocatePhysRegs
+  SmallVector<AllocPoint, 0> AllocPoints;
 
   void rewriteSSAValues();
   Register rewriteSSAValue(Register R);
   LLT findRegType(Register R);
+
+  void allocatePhysRegs();
 };
 
 } // namespace
+
+template <> struct DenseMapInfo<Alloc> {
+  static inline Alloc getEmptyKey() { return {1000, 0, 0, 0, 0}; }
+  static inline Alloc getTombstoneKey() { return {1001, 0, 0, 0, 0}; }
+
+  static unsigned getHashValue(const Alloc &Val) {
+    auto Tuple = std::make_tuple(Val.A, Val.X, Val.Y, Val.C, Val.V);
+    return DenseMapInfo<decltype(Tuple)>::getHashValue(Tuple);
+  }
+
+  static bool isEqual(const Alloc &LHS, const Alloc &RHS) { return LHS == RHS; }
+};
 
 bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   this->MF = &MF;
@@ -62,6 +96,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   dbgs() << "Rewriting SSA Values.\n";
   rewriteSSAValues();
   MF.dump();
+  allocatePhysRegs();
   return false;
 }
 
@@ -99,6 +134,12 @@ LLT MOSRegAlloc::findRegType(Register R) {
     return Ty;
   const TargetRegisterInfo *TRI = MF->getSubtarget().getRegisterInfo();
   return LLT::scalar(TRI->getRegSizeInBits(R, *MRI));
+}
+
+void MOSRegAlloc::allocatePhysRegs() {
+  for (MachineBasicBlock *MBB : post_order(MF)) {
+    dbgs() << "Assigning MBB:\n" << *MBB << '\n';
+  }
 }
 
 char MOSRegAlloc::ID = 0;
