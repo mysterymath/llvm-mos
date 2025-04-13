@@ -326,20 +326,12 @@ LLT MOSRegAlloc::findRegType(Register R) {
 // allocation.
 void MOSRegAlloc::initAllocPoints() {
   AllocPoints.clear();
-  for (MachineBasicBlock *MBB : MF) {
-    AllocPoints.emplace_back(MBB, MBB->end());
-    for (MachineInstr &MI : *MBB) {
+  for (MachineBasicBlock &MBB : *MF) {
+    MBBStartIdx[&MBB] = AllocPoints.size();
+    for (MachineInstr &MI : MBB)
       if (!MI.isPHI())
-        AllocPoints.emplace_back(MBB, MI);
-    }
-  }
-
-  for (const auto &[I, AP] : enumerate(AllocPoints)) {
-    if (I == 0)
-      continue;
-    const AllocPoint &PrevAP = AllocPoints[I - 1];
-    if (AP.MBB != PrevAP.MBB)
-      MBBStartIdx[AP.MBB] = I;
+        AllocPoints.emplace_back(&MBB, MI);
+    AllocPoints.emplace_back(MBB, MBB.end());
   }
 }
 
