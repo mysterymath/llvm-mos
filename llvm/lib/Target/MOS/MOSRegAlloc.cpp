@@ -232,6 +232,7 @@ private:
   SmallVector<AllocPoint, 0> AllocPoints;
 
   DenseMap<const MachineBasicBlock *, unsigned> MBBStartIdx;
+  DenseMap<const MachineBasicBlock *, unsigned> MBBEndIdx;
   DenseSet<Register> LiveValues;
 
   void rewriteSSAValues();
@@ -328,26 +329,17 @@ void MOSRegAlloc::initAllocPoints() {
   AllocPoints.clear();
   for (MachineBasicBlock &MBB : *MF) {
     MBBStartIdx[&MBB] = AllocPoints.size();
-    for (MachineInstr &MI : MBB)
-      if (!MI.isPHI())
-        AllocPoints.emplace_back(&MBB, MI);
-    AllocPoints.emplace_back(MBB, MBB.end());
+    for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(), E = MBB.end();;
+         ++I) {
+      AllocPoints.emplace_back(&MBB, I);
+      if (I == E)
+        break;
+    }
+    MBBEndIdx[&MBB] = AllocPoints.size() - 1;
   }
 }
 
 void MOSRegAlloc::decomposeToTree() {
-  SmallVector<Position> Positions;
-  PositionIndices.clear();
-  for (MachineBasicBlock &MBB : *MF) {
-    for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(), E = MBB.end();;
-         ++I) {
-      Positions.push_back({&MBB, I});
-      PositionIndices[Positions.back()] = Positions.size() - 1;
-      if (I == E)
-        break;
-    }
-  }
-
   DenseMap<unsigned, unsigned> MaxJJump;
   DenseMap<unsigned, unsigned> MaxSJump;
   for (MachineBasicBlock &MBB : *MF) {
