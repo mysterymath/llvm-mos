@@ -18,6 +18,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
@@ -25,6 +26,7 @@
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/FormatVariadic.h"
 
 #define DEBUG_TYPE "mos-reg-alloc"
 
@@ -240,6 +242,8 @@ private:
   LLT findRegType(Register R);
 
   void initAllocPoints();
+  SmallVector<unsigned> allocPointSuccessors(unsigned APIdx) const;
+  SmallVector<unsigned> allocPointPredecessors(unsigned APIdx) const;
 
   void decomposeToTree();
   void dumpPositions();
@@ -339,16 +343,63 @@ void MOSRegAlloc::initAllocPoints() {
   }
 }
 
+SmallVector<unsigned> MOSRegAlloc::allocPointSuccessors(unsigned APIdx) const {
+  const AllocPoint &AP = AllocPoints[APIdx];
+  SmallVector<unsigned> Successors;
+  if (AP.I == AP.MBB->end())
+    for (MachineBasicBlock *Succ : AP.MBB->successors())
+      Successors.push_back(MBBStartIdx.at(Succ));
+  else
+    Successors.push_back(APIdx + 1);
+  return Successors;
+}
+
+SmallVector<unsigned>
+MOSRegAlloc::allocPointPredecessors(unsigned APIdx) const {
+  const AllocPoint &AP = AllocPoints[APIdx];
+  SmallVector<unsigned> Predecessors;
+  if (AP.I == AP.MBB->getFirstNonPHI())
+    for (MachineBasicBlock *Pred : AP.MBB->predecessors())
+      Predecessors.push_back(MBBEndIdx.at(Pred));
+  else
+    Predecessors.push_back(APIdx - 1);
+  return Predecessors;
+}
+
+namespace {
+
+// Thorup Algorithm E.
+void findMaximalChains(DenseMap<unsigned, unsigned> &MaxChainsByEnd,
+                       DenseMap<unsigned, unsigned> &MaxJump, uint64_t Size) {
+  SmallVector<std::pair<unsigned, unsigned>> Stack = {{0, Size}};
+  for (unsigned I = 0; I < Size; ++I) {
+    const auto It = MaxJump.find(I);
+    if (It == MaxJump.end())
+      continue;
+    unsigned J = It->second;
+
+    while (Stack.back().second <= I) {
+      MaxChainsByEnd[Stack.back().second] = Stack.back().first;
+      Stack.pop_back();
+    }
+    unsigned K = I;
+    while (J >= Stack.back().second && Stack.back().second > K) {
+      K = Stack.back().first;
+      Stack.pop_back();
+    }
+    Stack.push_back({K, J});
+  }
+}
+
+} // namespace
+
 void MOSRegAlloc::decomposeToTree() {
   DenseMap<unsigned, unsigned> MaxJJump;
   DenseMap<unsigned, unsigned> MaxSJump;
   for (MachineBasicBlock &MBB : *MF) {
-    Position From = {&MBB, MBB.end()};
-    unsigned I = PositionIndices[From];
-
+    unsigned I = MBBEndIdx[&MBB];
     for (MachineBasicBlock *Succ : MBB.successors()) {
-      Position To = {Succ, Succ->getFirstNonPHI()};
-      unsigned J = PositionIndices[To];
+      unsigned J = MBBStartIdx[Succ];
       assert(I != J);
       if (I < J) {
         const auto Res = MaxJJump.try_emplace(I, J);
@@ -372,22 +423,22 @@ void MOSRegAlloc::decomposeToTree() {
     dbgs() << formatv("({0}, {1})\n", I, J);
 
   DenseMap<unsigned, unsigned> MaximalJChainsByEnd;
-  findMaximalChains(MaximalJChainsByEnd, MaxJJump, Positions.size());
+  findMaximalChains(MaximalJChainsByEnd, MaxJJump, AllocPoints.size());
   dbgs() << "MaxJChains\n";
   for (const auto &[I, J] : MaximalJChainsByEnd)
     dbgs() << formatv("({0}, {1})\n", I, J);
 
   DenseMap<unsigned, unsigned> MaximalSChainsByEnd;
-  findMaximalChains(MaximalSChainsByEnd, MaxSJump, Positions.size());
+  findMaximalChains(MaximalSChainsByEnd, MaxSJump, AllocPoints.size());
   dbgs() << "MaxSChains\n";
   for (const auto &[I, J] : MaximalSChainsByEnd)
     dbgs() << formatv("({0}, {1})\n", I, J);
 
   // Algorithm D given by Thorup, for finding a good listing. A listing is the
   // permuted index for each position.
-  std::vector<int> Listing(Positions.size(), -1);
+  SmallVector<unsigned> Listing(AllocPoints.size(), -1);
   unsigned I = 0;
-  for (int J = Positions.size() - 1; J >= 0; --J) {
+  for (int J = AllocPoints.size() - 1; J >= 0; --J) {
     if (Listing[J] < 0)
       Listing[J] = I++;
 
@@ -401,15 +452,15 @@ void MOSRegAlloc::decomposeToTree() {
   }
 
   // Compute the inverse listing (the original index for each permuted index).
-  SmallVector<unsigned> InvListing(Positions.size());
+  SmallVector<unsigned> InvListing(AllocPoints.size());
   for (const auto &[I, L] : llvm::enumerate(Listing))
     InvListing[L] = I;
 
   // Compute the minimum separators for each block. (Thorup Algorithm A).
-  SmallVector<SmallSet<unsigned, 5>> Separators(Positions.size());
-  SmallVector<SmallSet<unsigned, 5>> InvSeparators(Positions.size());
+  SmallVector<SmallSet<unsigned, 5>> Separators(AllocPoints.size());
+  SmallVector<SmallSet<unsigned, 5>> InvSeparators(AllocPoints.size());
   DenseSet<unsigned> DSet;
-  for (int I = Positions.size() - 1; I >= 0; --I) {
+  for (int I = AllocPoints.size() - 1; I >= 0; --I) {
     Position Pos = Positions[InvListing[I]];
     for (Position Succ : positionSuccessors(Pos)) {
       unsigned H = Listing[PositionIndices[Succ]];
