@@ -152,12 +152,13 @@ bool operator<(const std::pair<Alloc, AllocImpl> &L,
 struct AllocPoint {
   MachineBasicBlock *MBB;
   MachineBasicBlock::iterator I;
-  DenseMap<Alloc, AllocImpl> AllocImpls;
-  DenseSet<Register> LiveValues; // Only set on MBB start.
+
+  DenseSet<Register> LiveValues;
 
   AllocPoint(MachineBasicBlock *MBB, MachineBasicBlock::iterator I)
       : MBB(MBB), I(I) {}
 
+#if 0
   void dump(const TargetRegisterInfo *TRI) const {
     dbgs() << "Number of allocations: " << AllocImpls.size() << '\n';
     if (!AllocImpls.empty()) {
@@ -178,12 +179,23 @@ struct AllocPoint {
       AI.Next.print(dbgs(), TRI);
     }
   }
+#endif
 
   bool canInsert() const {
     if (I == MBB->begin())
       return true;
     return !std::prev(I)->isTerminator();
   }
+};
+
+struct TreeNode {
+  enum class Type { Intro, Forget, Join } Type;
+  struct APEntry {
+    unsigned APIdx;
+    DenseMap<Alloc, AllocImpl> AllocImpls;
+  };
+  SmallVector<APEntry> APEntries;
+  SmallVector<unsigned> Children;
 };
 
 class MOSRegAlloc : public MachineFunctionPass {
@@ -227,6 +239,10 @@ private:
   LLT findRegType(Register R);
 
   void initAllocPoints();
+
+  void decomposeToTree();
+  void dumpPositions();
+  void dumpTree(TreeNode *Root = nullptr, unsigned Indent = 0);
 
   void allocatePhysRegs();
   void allocateMBBEnd(unsigned APIdx);
@@ -310,16 +326,13 @@ LLT MOSRegAlloc::findRegType(Register R) {
 // allocation.
 void MOSRegAlloc::initAllocPoints() {
   AllocPoints.clear();
-  for (MachineBasicBlock *MBB : post_order(MF)) {
+  for (MachineBasicBlock *MBB : MF) {
     AllocPoints.emplace_back(MBB, MBB->end());
-    for (MachineInstr &MI : reverse(*MBB)) {
-      if (MI.isPHI())
-        break;
-      AllocPoints.emplace_back(MBB, MI);
+    for (MachineInstr &MI : *MBB) {
+      if (!MI.isPHI())
+        AllocPoints.emplace_back(MBB, MI);
     }
   }
-
-  std::reverse(AllocPoints.begin(), AllocPoints.end());
 
   for (const auto &[I, AP] : enumerate(AllocPoints)) {
     if (I == 0)
@@ -330,7 +343,239 @@ void MOSRegAlloc::initAllocPoints() {
   }
 }
 
+void MOSRegAlloc::decomposeToTree() {
+  SmallVector<Position> Positions;
+  PositionIndices.clear();
+  for (MachineBasicBlock &MBB : *MF) {
+    for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(), E = MBB.end();;
+         ++I) {
+      Positions.push_back({&MBB, I});
+      PositionIndices[Positions.back()] = Positions.size() - 1;
+      if (I == E)
+        break;
+    }
+  }
+
+  DenseMap<unsigned, unsigned> MaxJJump;
+  DenseMap<unsigned, unsigned> MaxSJump;
+  for (MachineBasicBlock &MBB : *MF) {
+    Position From = {&MBB, MBB.end()};
+    unsigned I = PositionIndices[From];
+
+    for (MachineBasicBlock *Succ : MBB.successors()) {
+      Position To = {Succ, Succ->getFirstNonPHI()};
+      unsigned J = PositionIndices[To];
+      assert(I != J);
+      if (I < J) {
+        const auto Res = MaxJJump.try_emplace(I, J);
+        if (!Res.second && J > Res.first->second)
+          Res.first->second = J;
+        const auto Res2 = MaxSJump.try_emplace(I, J);
+        if (!Res2.second && J > Res2.first->second)
+          Res2.first->second = J;
+      } else {
+        const auto Res = MaxSJump.try_emplace(J, I);
+        if (!Res.second && I > Res.first->second)
+          Res.first->second = I;
+      }
+    }
+  }
+  dbgs() << "MaxJJump\n";
+  for (const auto &[I, J] : MaxJJump)
+    dbgs() << formatv("({0}, {1})\n", I, J);
+  dbgs() << "MaxSJump\n";
+  for (const auto &[I, J] : MaxSJump)
+    dbgs() << formatv("({0}, {1})\n", I, J);
+
+  DenseMap<unsigned, unsigned> MaximalJChainsByEnd;
+  findMaximalChains(MaximalJChainsByEnd, MaxJJump, Positions.size());
+  dbgs() << "MaxJChains\n";
+  for (const auto &[I, J] : MaximalJChainsByEnd)
+    dbgs() << formatv("({0}, {1})\n", I, J);
+
+  DenseMap<unsigned, unsigned> MaximalSChainsByEnd;
+  findMaximalChains(MaximalSChainsByEnd, MaxSJump, Positions.size());
+  dbgs() << "MaxSChains\n";
+  for (const auto &[I, J] : MaximalSChainsByEnd)
+    dbgs() << formatv("({0}, {1})\n", I, J);
+
+  // Algorithm D given by Thorup, for finding a good listing. A listing is the
+  // permuted index for each position.
+  std::vector<int> Listing(Positions.size(), -1);
+  unsigned I = 0;
+  for (int J = Positions.size() - 1; J >= 0; --J) {
+    if (Listing[J] < 0)
+      Listing[J] = I++;
+
+    auto It = MaximalSChainsByEnd.find(J);
+    if (It != MaximalSChainsByEnd.end() && Listing[It->second] < 0)
+      Listing[It->second] = I++;
+
+    It = MaximalJChainsByEnd.find(J);
+    if (It != MaximalJChainsByEnd.end() && Listing[It->second] < 0)
+      Listing[It->second] = I++;
+  }
+
+  // Compute the inverse listing (the original index for each permuted index).
+  SmallVector<unsigned> InvListing(Positions.size());
+  for (const auto &[I, L] : llvm::enumerate(Listing))
+    InvListing[L] = I;
+
+  // Compute the minimum separators for each block. (Thorup Algorithm A).
+  SmallVector<SmallSet<unsigned, 5>> Separators(Positions.size());
+  SmallVector<SmallSet<unsigned, 5>> InvSeparators(Positions.size());
+  DenseSet<unsigned> DSet;
+  for (int I = Positions.size() - 1; I >= 0; --I) {
+    Position Pos = Positions[InvListing[I]];
+    for (Position Succ : positionSuccessors(Pos)) {
+      unsigned H = Listing[PositionIndices[Succ]];
+      if (H >= (unsigned)I)
+        continue;
+      Separators[I].insert(H);
+      InvSeparators[H].insert(I);
+    }
+    // Note that the graph is considered undirected here.
+    for (Position Pred : positionPredecessors(Pos)) {
+      unsigned H = Listing[PositionIndices[Pred]];
+      if (H >= (unsigned)I)
+        continue;
+      Separators[I].insert(H);
+      InvSeparators[H].insert(I);
+    }
+    for (unsigned W : InvSeparators[I]) {
+      if (!DSet.insert(W).second)
+        continue;
+      for (unsigned H : Separators[W]) {
+        if (H >= (unsigned)I)
+          continue;
+        Separators[I].insert(H);
+        InvSeparators[H].insert(I);
+      }
+    }
+  }
+
+  dbgs() << "Separators:\n";
+  for (unsigned I = 0; I < Positions.size(); ++I) {
+    dbgs() << I << ": ";
+    for (unsigned J : Separators[Listing[I]])
+      dbgs() << InvListing[J] << ' ';
+    dbgs() << '\n';
+  }
+
+  // Thorup, Lemma 12.
+  SmallVector<SmallSet<unsigned, 5>> NodePositions(Positions.size());
+  SmallVector<SmallSet<unsigned, 5>> NodeChildren(Positions.size());
+  NodePositions[0].insert(InvListing[0]);
+  for (unsigned I = 1; I < Positions.size(); ++I) {
+    unsigned H = 0;
+    for (unsigned S : Separators[I])
+      H = std::max(H, S);
+    NodeChildren[H].insert(I);
+    for (unsigned S : Separators[I])
+      NodePositions[I].insert(InvListing[S]);
+    NodePositions[I].insert(InvListing[I]);
+  }
+
+  // Produce a "nice" tree decomposition, where the position set differs by at
+  // most one node between parents and children, and nodes with multiple
+  // children have the same position set as their children.
+  std::function<void(unsigned)> MakeSubTreeNice = [&](unsigned Root) {
+    if (NodeChildren[Root].size() > 1) {
+      SmallSet<unsigned, 5> JoinChildren;
+      while (!NodeChildren[Root].empty()) {
+        unsigned Child = *NodeChildren[Root].begin();
+        NodeChildren[Root].erase(Child);
+        if (NodePositions[Root] != NodePositions[Child]) {
+          unsigned NewChild = NodeChildren.size();
+          NodePositions.emplace_back();
+          NodePositions[NewChild] = NodePositions[Root];
+          NodeChildren.emplace_back();
+          NodeChildren[NewChild].insert(Child);
+          Child = NewChild;
+        }
+        JoinChildren.insert(Child);
+      }
+      NodeChildren[Root] = std::move(JoinChildren);
+      for (unsigned C : NodeChildren[Root])
+        MakeSubTreeNice(C);
+      return;
+    }
+
+    SmallSet<unsigned, 5> ChildPositions;
+    if (NodeChildren[Root].size() == 1) {
+      unsigned Child = *NodeChildren[Root].begin();
+      ChildPositions = NodePositions[Child];
+    }
+    unsigned NumRemoved = 0;
+    unsigned ARemoved;
+    for (unsigned P : NodePositions[Root]) {
+      if (!ChildPositions.contains(P)) {
+        NumRemoved++;
+        ARemoved = P;
+      }
+    }
+    unsigned NumInserted = 0;
+    unsigned AnInserted;
+    for (unsigned P : ChildPositions) {
+      if (!NodePositions[Root].contains(P)) {
+        NumInserted++;
+        AnInserted = P;
+      }
+    }
+
+    if (NumRemoved > 1 || (NumRemoved && NumInserted)) {
+      unsigned NewChild = NodePositions.size();
+      NodePositions.emplace_back();
+      NodePositions[NewChild] = NodePositions[Root];
+      NodePositions[NewChild].erase(ARemoved);
+      NodeChildren.emplace_back();
+      if (NodeChildren[Root].size() == 1)
+        NodeChildren[NewChild].insert(*NodeChildren[Root].begin());
+      NodeChildren[Root].clear();
+      NodeChildren[Root].insert(NewChild);
+      MakeSubTreeNice(NewChild);
+      return;
+    }
+
+    if (NumInserted > 1) {
+      unsigned NewChild = NodePositions.size();
+      NodePositions.emplace_back();
+      NodePositions[NewChild] = NodePositions[Root];
+      NodePositions[NewChild].insert(AnInserted);
+      NodeChildren.emplace_back();
+      if (NodeChildren[Root].size() == 1)
+        NodeChildren[NewChild].insert(*NodeChildren[Root].begin());
+      NodeChildren[Root].clear();
+      NodeChildren[Root].insert(NewChild);
+      MakeSubTreeNice(NewChild);
+      return;
+    }
+
+    for (unsigned C : NodeChildren[Root])
+      MakeSubTreeNice(C);
+  };
+
+  MakeSubTreeNice(0);
+  // Make the root node have no positions
+  unsigned RootCopy = NodePositions.size();
+  NodePositions.push_back(NodePositions[0]);
+  NodeChildren.push_back(NodeChildren[0]);
+  NodePositions[0].clear();
+  NodeChildren[0].clear();
+  NodeChildren[0].insert(RootCopy);
+
+  Tree.clear();
+  Tree.resize(NodePositions.size());
+  for (unsigned I = 0, E = NodePositions.size(); I != E; ++I) {
+    for (unsigned P : NodePositions[I])
+      Tree[I].Positions.push_back(Positions[P]);
+    for (unsigned C : NodeChildren[I])
+      Tree[I].Children.push_back(&Tree[C]);
+  }
+}
+
 void MOSRegAlloc::allocatePhysRegs() {
+#if 0
   for (intptr_t I = AllocPoints.size() - 1; I >= 0; --I) {
     AllocPoint &AP = AllocPoints[I];
     MachineBasicBlock &MBB = *AP.MBB;
@@ -348,9 +593,11 @@ void MOSRegAlloc::allocatePhysRegs() {
       AP.dump(TRI);
     }
   }
+#endif
 }
 
 void MOSRegAlloc::allocateMBBEnd(unsigned APIdx) {
+#if 0
   AllocPoint &AP = AllocPoints[APIdx];
   MachineBasicBlock &MBB = *AP.MBB;
   assert(AP.I == MBB.end());
@@ -375,9 +622,11 @@ void MOSRegAlloc::allocateMBBEnd(unsigned APIdx) {
         AP.AllocImpls.try_emplace(A, AllocImpl{AI.Cost, false, A});
     }
   }
+#endif
 }
 
 void MOSRegAlloc::allocateMI(unsigned APIdx) {
+#if 0
   AllocPoint &AP = AllocPoints[APIdx];
   assert(AP.I != AP.MBB->end());
   dbgs() << "Allocating MI: " << *AP.I;
@@ -402,9 +651,11 @@ void MOSRegAlloc::allocateMI(unsigned APIdx) {
   for (const MachineOperand &MO : AP.I->operands())
     if (MO.isReg() && MO.isUse())
       allocateMO(AP, MO);
+#endif
 }
 
 void MOSRegAlloc::allocateMO(AllocPoint &AP, const MachineOperand &MO) {
+#if 0
   const MachineInstr &MI = *AP.I;
   Register Val = MO.getReg();
 
@@ -473,6 +724,7 @@ void MOSRegAlloc::allocateMO(AllocPoint &AP, const MachineOperand &MO) {
 
   if (MO.isUse())
     LiveValues.insert(Val);
+#endif
 }
 
 static bool recordAI(DenseMap<Alloc, AllocImpl> &AIs, const Alloc &A,
@@ -490,6 +742,7 @@ static bool recordAI(DenseMap<Alloc, AllocImpl> &AIs, const Alloc &A,
 // After all defs have been allocated, they must be freed before the uses are
 // handled.
 void MOSRegAlloc::freeDef(AllocPoint &AP, const MachineOperand &MO) {
+#if 0
   DenseMap<Alloc, AllocImpl> NewAIs;
   Register Val = MO.getReg();
   for (const auto &[A, AI] : AP.AllocImpls) {
@@ -501,11 +754,13 @@ void MOSRegAlloc::freeDef(AllocPoint &AP, const MachineOperand &MO) {
   }
   AP.AllocImpls = std::move(NewAIs);
   LiveValues.erase(Val);
+#endif
 }
 
 // Find all transitively reachable allocs by spilling, restoring, and copying
 // registers.
 void MOSRegAlloc::shuffleAllocs(AllocPoint &AP) {
+#if 0
   assert(AP.canInsert());
   SetVector<Alloc> WorkList;
   for (const auto &[A, _] : AP.AllocImpls)
@@ -565,6 +820,7 @@ void MOSRegAlloc::shuffleAllocs(AllocPoint &AP) {
              {AI.Cost + (CanCopy(A, R, Val) ? 2 : 3), /*IsShuffle=*/true, A});
     }
   }
+#endif
 }
 
 void MOSRegAlloc::dumpLiveValues() const {
@@ -576,6 +832,7 @@ void MOSRegAlloc::dumpLiveValues() const {
 
 // Apply the best found allocation implementation.
 void MOSRegAlloc::applyBestAlloc() {
+#if 0
   const auto Best = min_element(AllocPoints.front().AllocImpls);
   std::pair<Alloc, AllocImpl> Cur = *Best;
   const Alloc &A = Cur.first;
@@ -628,6 +885,7 @@ void MOSRegAlloc::applyBestAlloc() {
     }
     Cur = {AI.Next, AllocPoints[I].AllocImpls.at(AI.Next)};
   }
+#endif
 }
 
 void MOSRegAlloc::eliminateTrivialCopies() {
