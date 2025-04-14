@@ -246,7 +246,7 @@ private:
   SmallVector<unsigned> allocPointPredecessors(unsigned APIdx) const;
 
   void decomposeToTree();
-  void dumpPositions();
+  void dumpAllocPoints();
   void dumpTree(TreeNode *Root = nullptr, unsigned Indent = 0);
 
   void allocatePhysRegs();
@@ -461,17 +461,17 @@ void MOSRegAlloc::decomposeToTree() {
   SmallVector<SmallSet<unsigned, 5>> InvSeparators(AllocPoints.size());
   DenseSet<unsigned> DSet;
   for (int I = AllocPoints.size() - 1; I >= 0; --I) {
-    Position Pos = Positions[InvListing[I]];
-    for (Position Succ : positionSuccessors(Pos)) {
-      unsigned H = Listing[PositionIndices[Succ]];
+    unsigned P = InvListing[I];
+    for (unsigned Succ : allocPointSuccessors(P)) {
+      unsigned H = Listing[Succ];
       if (H >= (unsigned)I)
         continue;
       Separators[I].insert(H);
       InvSeparators[H].insert(I);
     }
     // Note that the graph is considered undirected here.
-    for (Position Pred : positionPredecessors(Pos)) {
-      unsigned H = Listing[PositionIndices[Pred]];
+    for (unsigned Pred : allocPointPredecessors(P)) {
+      unsigned H = Listing[Pred];
       if (H >= (unsigned)I)
         continue;
       Separators[I].insert(H);
@@ -490,7 +490,7 @@ void MOSRegAlloc::decomposeToTree() {
   }
 
   dbgs() << "Separators:\n";
-  for (unsigned I = 0; I < Positions.size(); ++I) {
+  for (unsigned I = 0; I < AllocPoints.size(); ++I) {
     dbgs() << I << ": ";
     for (unsigned J : Separators[Listing[I]])
       dbgs() << InvListing[J] << ' ';
@@ -498,17 +498,17 @@ void MOSRegAlloc::decomposeToTree() {
   }
 
   // Thorup, Lemma 12.
-  SmallVector<SmallSet<unsigned, 5>> NodePositions(Positions.size());
-  SmallVector<SmallSet<unsigned, 5>> NodeChildren(Positions.size());
-  NodePositions[0].insert(InvListing[0]);
-  for (unsigned I = 1; I < Positions.size(); ++I) {
+  SmallVector<SmallSet<unsigned, 5>> NodeAllocPoints(AllocPoints.size());
+  SmallVector<SmallSet<unsigned, 5>> NodeChildren(AllocPoints.size());
+  NodeAllocPoints[0].insert(InvListing[0]);
+  for (unsigned I = 1; I < AllocPoints.size(); ++I) {
     unsigned H = 0;
     for (unsigned S : Separators[I])
       H = std::max(H, S);
     NodeChildren[H].insert(I);
     for (unsigned S : Separators[I])
-      NodePositions[I].insert(InvListing[S]);
-    NodePositions[I].insert(InvListing[I]);
+      NodeAllocPoints[I].insert(InvListing[S]);
+    NodeAllocPoints[I].insert(InvListing[I]);
   }
 
   // Produce a "nice" tree decomposition, where the position set differs by at
@@ -520,10 +520,10 @@ void MOSRegAlloc::decomposeToTree() {
       while (!NodeChildren[Root].empty()) {
         unsigned Child = *NodeChildren[Root].begin();
         NodeChildren[Root].erase(Child);
-        if (NodePositions[Root] != NodePositions[Child]) {
+        if (NodeAllocPoints[Root] != NodeAllocPoints[Child]) {
           unsigned NewChild = NodeChildren.size();
-          NodePositions.emplace_back();
-          NodePositions[NewChild] = NodePositions[Root];
+          NodeAllocPoints.emplace_back();
+          NodeAllocPoints[NewChild] = NodeAllocPoints[Root];
           NodeChildren.emplace_back();
           NodeChildren[NewChild].insert(Child);
           Child = NewChild;
@@ -536,33 +536,33 @@ void MOSRegAlloc::decomposeToTree() {
       return;
     }
 
-    SmallSet<unsigned, 5> ChildPositions;
+    SmallSet<unsigned, 5> ChildAllocPoints;
     if (NodeChildren[Root].size() == 1) {
       unsigned Child = *NodeChildren[Root].begin();
-      ChildPositions = NodePositions[Child];
+      ChildAllocPoints = NodeAllocPoints[Child];
     }
     unsigned NumRemoved = 0;
     unsigned ARemoved;
-    for (unsigned P : NodePositions[Root]) {
-      if (!ChildPositions.contains(P)) {
+    for (unsigned P : NodeAllocPoints[Root]) {
+      if (!ChildAllocPoints.contains(P)) {
         NumRemoved++;
         ARemoved = P;
       }
     }
     unsigned NumInserted = 0;
     unsigned AnInserted;
-    for (unsigned P : ChildPositions) {
-      if (!NodePositions[Root].contains(P)) {
+    for (unsigned P : ChildAllocPoints) {
+      if (!NodeAllocPoints[Root].contains(P)) {
         NumInserted++;
         AnInserted = P;
       }
     }
 
     if (NumRemoved > 1 || (NumRemoved && NumInserted)) {
-      unsigned NewChild = NodePositions.size();
-      NodePositions.emplace_back();
-      NodePositions[NewChild] = NodePositions[Root];
-      NodePositions[NewChild].erase(ARemoved);
+      unsigned NewChild = NodeAllocPoints.size();
+      NodeAllocPoints.emplace_back();
+      NodeAllocPoints[NewChild] = NodeAllocPoints[Root];
+      NodeAllocPoints[NewChild].erase(ARemoved);
       NodeChildren.emplace_back();
       if (NodeChildren[Root].size() == 1)
         NodeChildren[NewChild].insert(*NodeChildren[Root].begin());
@@ -573,10 +573,10 @@ void MOSRegAlloc::decomposeToTree() {
     }
 
     if (NumInserted > 1) {
-      unsigned NewChild = NodePositions.size();
-      NodePositions.emplace_back();
-      NodePositions[NewChild] = NodePositions[Root];
-      NodePositions[NewChild].insert(AnInserted);
+      unsigned NewChild = NodeAllocPoints.size();
+      NodeAllocPoints.emplace_back();
+      NodeAllocPoints[NewChild] = NodeAllocPoints[Root];
+      NodeAllocPoints[NewChild].insert(AnInserted);
       NodeChildren.emplace_back();
       if (NodeChildren[Root].size() == 1)
         NodeChildren[NewChild].insert(*NodeChildren[Root].begin());
@@ -592,18 +592,18 @@ void MOSRegAlloc::decomposeToTree() {
 
   MakeSubTreeNice(0);
   // Make the root node have no positions
-  unsigned RootCopy = NodePositions.size();
-  NodePositions.push_back(NodePositions[0]);
+  unsigned RootCopy = NodeAllocPoints.size();
+  NodeAllocPoints.push_back(NodeAllocPoints[0]);
   NodeChildren.push_back(NodeChildren[0]);
-  NodePositions[0].clear();
+  NodeAllocPoints[0].clear();
   NodeChildren[0].clear();
   NodeChildren[0].insert(RootCopy);
 
   Tree.clear();
-  Tree.resize(NodePositions.size());
-  for (unsigned I = 0, E = NodePositions.size(); I != E; ++I) {
-    for (unsigned P : NodePositions[I])
-      Tree[I].Positions.push_back(Positions[P]);
+  Tree.resize(NodeAllocPoints.size());
+  for (unsigned I = 0, E = NodeAllocPoints.size(); I != E; ++I) {
+    for (unsigned P : NodeAllocPoints[I])
+      Tree[I].AllocPoints.push_back(AllocPoints[P]);
     for (unsigned C : NodeChildren[I])
       Tree[I].Children.push_back(&Tree[C]);
   }
