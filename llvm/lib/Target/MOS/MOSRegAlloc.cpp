@@ -134,6 +134,7 @@ template <> struct DenseMapInfo<Alloc> {
 
 namespace {
 
+#if 0
 // A chain of allocations that can be followed from the current allocation.
 struct AllocImpl {
   // Cost of using this impl.
@@ -149,6 +150,7 @@ bool operator<(const std::pair<Alloc, AllocImpl> &L,
                const std::pair<Alloc, AllocImpl> &R) {
   return L.second.Cost < R.second.Cost;
 }
+#endif
 
 // A point within the program that can have a tracked allocation.
 struct AllocPoint {
@@ -192,11 +194,6 @@ struct AllocPoint {
 
 struct TreeNode {
   enum class Type { Intro, Forget, Join } Type;
-  struct APEntry {
-    unsigned APIdx;
-    DenseMap<Alloc, AllocImpl> AllocImpls;
-  };
-  SmallVector<APEntry> APEntries;
   SmallVector<unsigned> Children;
 };
 
