@@ -194,6 +194,7 @@ struct AllocPoint {
 
 struct TreeNode {
   enum class Type { Intro, Forget, Join } Type;
+  SmallVector<unsigned> AllocPoints;
   SmallVector<unsigned> Children;
 };
 
@@ -232,7 +233,8 @@ private:
 
   DenseMap<const MachineBasicBlock *, unsigned> MBBStartIdx;
   DenseMap<const MachineBasicBlock *, unsigned> MBBEndIdx;
-  DenseSet<Register> LiveValues;
+
+  SmallVector<TreeNode, 0> Tree;
 
   void rewriteSSAValues();
   Register rewriteSSAValue(Register R);
@@ -252,7 +254,6 @@ private:
   void allocateMO(AllocPoint &AP, const MachineOperand &MO);
   void freeDef(AllocPoint &AP, const MachineOperand &MO);
   void shuffleAllocs(AllocPoint &AP);
-  void dumpLiveValues() const;
 
   void applyBestAlloc();
   void eliminateTrivialCopies();
@@ -600,9 +601,9 @@ void MOSRegAlloc::decomposeToTree() {
   Tree.resize(NodeAllocPoints.size());
   for (unsigned I = 0, E = NodeAllocPoints.size(); I != E; ++I) {
     for (unsigned P : NodeAllocPoints[I])
-      Tree[I].AllocPoints.push_back(AllocPoints[P]);
+      Tree[I].AllocPoints.push_back(P);
     for (unsigned C : NodeChildren[I])
-      Tree[I].Children.push_back(&Tree[C]);
+      Tree[I].Children.push_back(C);
   }
 }
 
@@ -759,6 +760,7 @@ void MOSRegAlloc::allocateMO(AllocPoint &AP, const MachineOperand &MO) {
 #endif
 }
 
+#if 0
 static bool recordAI(DenseMap<Alloc, AllocImpl> &AIs, const Alloc &A,
                      const AllocImpl &AI) {
   auto Result = AIs.try_emplace(A, AI);
@@ -770,6 +772,7 @@ static bool recordAI(DenseMap<Alloc, AllocImpl> &AIs, const Alloc &A,
   }
   return false;
 }
+#endif
 
 // After all defs have been allocated, they must be freed before the uses are
 // handled.
@@ -855,12 +858,14 @@ void MOSRegAlloc::shuffleAllocs(AllocPoint &AP) {
 #endif
 }
 
+#if 0
 void MOSRegAlloc::dumpLiveValues() const {
   dbgs() << "Live values: ";
   for (Register R : LiveValues)
     dbgs() << printReg(R, TRI) << ' ';
   dbgs() << '\n';
 }
+#endif
 
 // Apply the best found allocation implementation.
 void MOSRegAlloc::applyBestAlloc() {
