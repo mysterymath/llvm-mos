@@ -271,6 +271,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   rewriteSSAValues();
   MF.dump();
   initAllocPoints();
+  decomposeToTree();
   allocatePhysRegs();
   applyBestAlloc();
   MF.dump();
@@ -434,7 +435,7 @@ void MOSRegAlloc::decomposeToTree() {
 
   // Algorithm D given by Thorup, for finding a good listing. A listing is the
   // permuted index for each position.
-  SmallVector<unsigned> Listing(AllocPoints.size(), -1);
+  SmallVector<int> Listing(AllocPoints.size(), -1);
   unsigned I = 0;
   for (int J = AllocPoints.size() - 1; J >= 0; --J) {
     if (Listing[J] < 0)
