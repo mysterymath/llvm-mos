@@ -252,8 +252,8 @@ private:
   SmallVector<unsigned> allocPointPredecessors(unsigned APIdx) const;
 
   void decomposeToTree();
-  void dumpAllocPoints();
-  void dumpTree(TreeNode *Root = nullptr, unsigned Indent = 0);
+  void dumpAllocPoints() const;
+  void dumpTree(unsigned RootIdx = 0, unsigned Indent = 0) const;
 
   void allocatePhysRegs();
   void allocateMBBEnd(unsigned APIdx);
@@ -288,7 +288,6 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   TRI = MF.getSubtarget().getRegisterInfo();
   MF.dump();
   rewriteSSAValues();
-  MF.dump();
 
   initAllocPoints();
   decomposeToTree();
@@ -633,30 +632,29 @@ void MOSRegAlloc::decomposeToTree() {
   }
 }
 
-void MOSRegAlloc::dumpAllocPoints() {
+void MOSRegAlloc::dumpAllocPoints() const {
   for (MachineBasicBlock &MBB : *MF) {
     dbgs() << printMBBReference(MBB) << ": "
-           << MBFI->getBlockFreq(&MBB).getFrequency() << '\n';
-    for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(), E = MBB.end();;
-         ++I) {
-      dbgs() << PositionIndices[{&MBB, I}] << ": ";
+        //<< MBFI->getBlockFreq(&MBB).getFrequency() << '\n'
+        ;
+    for (unsigned I = MBBStartIdx.at(&MBB), E = MBBEndIdx.at(&MBB);; ++I) {
+      dbgs() << I << ": ";
       if (I == E) {
         dbgs() << "<end>\n";
         break;
       }
-      dbgs() << *I;
+      dbgs() << *AllocPoints[I].I;
     }
     dbgs() << '\n';
   }
 }
 
-void MOSRegAlloc::dumpTree(TreeNode *Root, unsigned Indent) {
-  if (!Root)
-    Root = &Tree[0];
+void MOSRegAlloc::dumpTree(unsigned RootIdx, unsigned Indent) const {
   for (unsigned I = 0; I < Indent; ++I)
     dbgs() << ' ';
-  dbgs() << Root - &Tree[0];
-  switch (Root->getType(*this)) {
+  dbgs() << RootIdx;
+  const TreeNode &Root = Tree[RootIdx];
+  switch (Root.getType(*this)) {
   case TreeNode::Type::Forget:
     dbgs() << 'F';
     break;
@@ -668,10 +666,10 @@ void MOSRegAlloc::dumpTree(TreeNode *Root, unsigned Indent) {
     break;
   }
   dbgs() << ": ";
-  for (Position P : Root->Positions)
-    dbgs() << PositionIndices[P] << ' ';
+  for (unsigned P : Root.AllocPoints)
+    dbgs() << P << ' ';
   dbgs() << '\n';
-  for (Node *C : Root->Children)
+  for (unsigned C : Root.Children)
     dumpTree(C, Indent + 1);
 }
 
