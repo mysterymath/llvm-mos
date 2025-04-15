@@ -192,10 +192,15 @@ struct AllocPoint {
   }
 };
 
+class MOSRegAlloc;
+
 struct TreeNode {
-  enum class Type { Intro, Forget, Join } Type;
+  enum class Type { Intro, Forget, Join };
+
   SmallVector<unsigned> AllocPoints;
   SmallVector<unsigned> Children;
+
+  Type getType(const MOSRegAlloc &Ctx) const;
 };
 
 class MOSRegAlloc : public MachineFunctionPass {
@@ -219,6 +224,8 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override;
 
 private:
+  friend struct TreeNode;
+
   MachineFunction *MF;
   MachineRegisterInfo *MRI;
   const TargetInstrInfo *TII;
@@ -260,6 +267,18 @@ private:
   void computeLiveIns();
 };
 
+TreeNode::Type TreeNode::getType(const MOSRegAlloc &Ctx) const {
+  if (Children.empty())
+    return Type::Intro;
+  if (Children.size() > 1)
+    return Type::Join;
+  const TreeNode &Child = Ctx.Tree[Children[0]];
+  assert(Child.AllocPoints.size() != AllocPoints.size() &&
+         "Node must be either introduce or forget.");
+  return Child.AllocPoints.size() > AllocPoints.size() ? Type::Forget
+                                                       : Type::Intro;
+}
+
 } // namespace
 
 bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
@@ -270,8 +289,12 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   MF.dump();
   rewriteSSAValues();
   MF.dump();
+
   initAllocPoints();
   decomposeToTree();
+  dumpAllocPoints();
+  dumpTree();
+
   allocatePhysRegs();
   applyBestAlloc();
   MF.dump();
@@ -608,6 +631,48 @@ void MOSRegAlloc::decomposeToTree() {
       Tree[I].Children.push_back(C);
     llvm::sort(Tree[I].Children);
   }
+}
+
+void MOSRegAlloc::dumpAllocPoints() {
+  for (MachineBasicBlock &MBB : *MF) {
+    dbgs() << printMBBReference(MBB) << ": "
+           << MBFI->getBlockFreq(&MBB).getFrequency() << '\n';
+    for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(), E = MBB.end();;
+         ++I) {
+      dbgs() << PositionIndices[{&MBB, I}] << ": ";
+      if (I == E) {
+        dbgs() << "<end>\n";
+        break;
+      }
+      dbgs() << *I;
+    }
+    dbgs() << '\n';
+  }
+}
+
+void MOSRegAlloc::dumpTree(TreeNode *Root, unsigned Indent) {
+  if (!Root)
+    Root = &Tree[0];
+  for (unsigned I = 0; I < Indent; ++I)
+    dbgs() << ' ';
+  dbgs() << Root - &Tree[0];
+  switch (Root->getType(*this)) {
+  case TreeNode::Type::Forget:
+    dbgs() << 'F';
+    break;
+  case TreeNode::Type::Intro:
+    dbgs() << 'I';
+    break;
+  case TreeNode::Type::Join:
+    dbgs() << 'J';
+    break;
+  }
+  dbgs() << ": ";
+  for (Position P : Root->Positions)
+    dbgs() << PositionIndices[P] << ' ';
+  dbgs() << '\n';
+  for (Node *C : Root->Children)
+    dumpTree(C, Indent + 1);
 }
 
 void MOSRegAlloc::allocatePhysRegs() {
