@@ -602,8 +602,10 @@ void MOSRegAlloc::decomposeToTree() {
   for (unsigned I = 0, E = NodeAllocPoints.size(); I != E; ++I) {
     for (unsigned P : NodeAllocPoints[I])
       Tree[I].AllocPoints.push_back(P);
+    llvm::sort(Tree[I].AllocPoints);
     for (unsigned C : NodeChildren[I])
       Tree[I].Children.push_back(C);
+    llvm::sort(Tree[I].Children);
   }
 }
 
