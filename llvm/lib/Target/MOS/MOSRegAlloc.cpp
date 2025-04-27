@@ -318,7 +318,7 @@ void MOSRegAlloc::rewriteSSAValues() {
 }
 
 Register MOSRegAlloc::rewriteSSAValue(Register R) {
-  unsigned Idx = Register::virtReg2Index(R);
+  unsigned Idx = R.virtRegIndex();
   if (RewrittenVReg[Idx])
     return RewrittenVReg[Idx];
 
@@ -336,7 +336,7 @@ Register MOSRegAlloc::rewriteSSAValue(Register R) {
     RewrittenVReg.emplace_back();
   }
 
-  RewrittenVReg[Idx] = Register::virtReg2Index(New);
+  RewrittenVReg[Idx] = New.virtRegIndex();
   MRI->replaceRegWith(R, New);
   return New;
 }
