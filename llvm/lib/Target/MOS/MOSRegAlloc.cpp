@@ -152,6 +152,7 @@ bool operator<(const std::pair<Alloc, AllocImpl> &L,
 }
 #endif
 
+#if 0
 // A point within the program that can have a tracked allocation.
 struct AllocPoint {
   MachineBasicBlock *MBB;
@@ -191,9 +192,11 @@ struct AllocPoint {
     return !std::prev(I)->isTerminator();
   }
 };
+#endif
 
 class MOSRegAlloc;
 
+#if 0
 struct TreeNode {
   enum class Type { Intro, Forget, Join };
 
@@ -202,6 +205,8 @@ struct TreeNode {
 
   Type getType(const MOSRegAlloc &Ctx) const;
 };
+
+#endif
 
 class MOSRegAlloc : public MachineFunctionPass {
 public:
@@ -236,37 +241,38 @@ private:
   // Allocation points for each instruction. These are ordered such that defs
   // always appear before uses. Block predecessors appear before block
   // successors, except for back edges.
-  SmallVector<AllocPoint, 0> AllocPoints;
+  //SmallVector<AllocPoint, 0> AllocPoints;
 
-  DenseMap<const MachineBasicBlock *, unsigned> MBBStartIdx;
-  DenseMap<const MachineBasicBlock *, unsigned> MBBEndIdx;
+  //DenseMap<const MachineBasicBlock *, unsigned> MBBStartIdx;
+  //DenseMap<const MachineBasicBlock *, unsigned> MBBEndIdx;
 
-  SmallVector<TreeNode, 0> Tree;
+  //SmallVector<TreeNode, 0> Tree;
 
   void rewriteSSAValues();
   Register rewriteSSAValue(Register R);
   LLT findRegType(Register R);
 
-  void initAllocPoints();
-  SmallVector<unsigned> allocPointSuccessors(unsigned APIdx) const;
-  SmallVector<unsigned> allocPointPredecessors(unsigned APIdx) const;
+  //void initAllocPoints();
+  //SmallVector<unsigned> allocPointSuccessors(unsigned APIdx) const;
+  //SmallVector<unsigned> allocPointPredecessors(unsigned APIdx) const;
 
-  void decomposeToTree();
-  void dumpAllocPoints() const;
-  void dumpTree(unsigned RootIdx = 0, unsigned Indent = 0) const;
+  //void decomposeToTree();
+  //void dumpAllocPoints() const;
+  //void dumpTree(unsigned RootIdx = 0, unsigned Indent = 0) const;
 
-  void allocatePhysRegs();
-  void allocateMBBEnd(unsigned APIdx);
-  void allocateMI(unsigned APIdx);
-  void allocateMO(AllocPoint &AP, const MachineOperand &MO);
-  void freeDef(AllocPoint &AP, const MachineOperand &MO);
-  void shuffleAllocs(AllocPoint &AP);
+  //void allocatePhysRegs();
+  //void allocateMBBEnd(unsigned APIdx);
+  //void allocateMI(unsigned APIdx);
+  //void allocateMO(AllocPoint &AP, const MachineOperand &MO);
+  //void freeDef(AllocPoint &AP, const MachineOperand &MO);
+  //void shuffleAllocs(AllocPoint &AP);
 
-  void applyBestAlloc();
+  //void applyBestAlloc();
   void eliminateTrivialCopies();
   void computeLiveIns();
 };
 
+#if 0
 TreeNode::Type TreeNode::getType(const MOSRegAlloc &Ctx) const {
   if (Children.empty())
     return Type::Intro;
@@ -278,6 +284,7 @@ TreeNode::Type TreeNode::getType(const MOSRegAlloc &Ctx) const {
   return Child.AllocPoints.size() > AllocPoints.size() ? Type::Forget
                                                        : Type::Intro;
 }
+#endif
 
 } // namespace
 
@@ -289,6 +296,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   MF.dump();
   rewriteSSAValues();
 
+#if 0
   initAllocPoints();
   decomposeToTree();
   dumpAllocPoints();
@@ -298,6 +306,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   applyBestAlloc();
   MF.dump();
   // TODO: Return to SSA form for duplicate imagreg defs.
+#endif
   eliminateTrivialCopies();
   computeLiveIns();
   MF.dump();
@@ -348,6 +357,7 @@ LLT MOSRegAlloc::findRegType(Register R) {
   return LLT::scalar(TRI->getRegSizeInBits(R, *MRI));
 }
 
+#if 0
 // Create an allocation point for each machine instruction in the order of
 // allocation.
 void MOSRegAlloc::initAllocPoints() {
@@ -634,9 +644,10 @@ void MOSRegAlloc::decomposeToTree() {
 
 void MOSRegAlloc::dumpAllocPoints() const {
   for (MachineBasicBlock &MBB : *MF) {
-    dbgs() << printMBBReference(MBB) << ": "
-        //<< MBFI->getBlockFreq(&MBB).getFrequency() << '\n'
-        ;
+    dbgs() << printMBBReference(MBB)
+           << ": "
+           //<< MBFI->getBlockFreq(&MBB).getFrequency()
+           << '\n';
     for (unsigned I = MBBStartIdx.at(&MBB), E = MBBEndIdx.at(&MBB);; ++I) {
       dbgs() << I << ": ";
       if (I == E) {
@@ -672,9 +683,10 @@ void MOSRegAlloc::dumpTree(unsigned RootIdx, unsigned Indent) const {
   for (unsigned C : Root.Children)
     dumpTree(C, Indent + 1);
 }
+#endif
 
-void MOSRegAlloc::allocatePhysRegs() {
 #if 0
+void MOSRegAlloc::allocatePhysRegs() {
   for (intptr_t I = AllocPoints.size() - 1; I >= 0; --I) {
     AllocPoint &AP = AllocPoints[I];
     MachineBasicBlock &MBB = *AP.MBB;
@@ -692,11 +704,9 @@ void MOSRegAlloc::allocatePhysRegs() {
       AP.dump(TRI);
     }
   }
-#endif
 }
 
 void MOSRegAlloc::allocateMBBEnd(unsigned APIdx) {
-#if 0
   AllocPoint &AP = AllocPoints[APIdx];
   MachineBasicBlock &MBB = *AP.MBB;
   assert(AP.I == MBB.end());
@@ -721,11 +731,9 @@ void MOSRegAlloc::allocateMBBEnd(unsigned APIdx) {
         AP.AllocImpls.try_emplace(A, AllocImpl{AI.Cost, false, A});
     }
   }
-#endif
 }
 
 void MOSRegAlloc::allocateMI(unsigned APIdx) {
-#if 0
   AllocPoint &AP = AllocPoints[APIdx];
   assert(AP.I != AP.MBB->end());
   dbgs() << "Allocating MI: " << *AP.I;
@@ -750,11 +758,9 @@ void MOSRegAlloc::allocateMI(unsigned APIdx) {
   for (const MachineOperand &MO : AP.I->operands())
     if (MO.isReg() && MO.isUse())
       allocateMO(AP, MO);
-#endif
 }
 
 void MOSRegAlloc::allocateMO(AllocPoint &AP, const MachineOperand &MO) {
-#if 0
   const MachineInstr &MI = *AP.I;
   Register Val = MO.getReg();
 
@@ -823,10 +829,8 @@ void MOSRegAlloc::allocateMO(AllocPoint &AP, const MachineOperand &MO) {
 
   if (MO.isUse())
     LiveValues.insert(Val);
-#endif
 }
 
-#if 0
 static bool recordAI(DenseMap<Alloc, AllocImpl> &AIs, const Alloc &A,
                      const AllocImpl &AI) {
   auto Result = AIs.try_emplace(A, AI);
@@ -838,12 +842,10 @@ static bool recordAI(DenseMap<Alloc, AllocImpl> &AIs, const Alloc &A,
   }
   return false;
 }
-#endif
 
 // After all defs have been allocated, they must be freed before the uses are
 // handled.
 void MOSRegAlloc::freeDef(AllocPoint &AP, const MachineOperand &MO) {
-#if 0
   DenseMap<Alloc, AllocImpl> NewAIs;
   Register Val = MO.getReg();
   for (const auto &[A, AI] : AP.AllocImpls) {
@@ -855,13 +857,11 @@ void MOSRegAlloc::freeDef(AllocPoint &AP, const MachineOperand &MO) {
   }
   AP.AllocImpls = std::move(NewAIs);
   LiveValues.erase(Val);
-#endif
 }
 
 // Find all transitively reachable allocs by spilling, restoring, and copying
 // registers.
 void MOSRegAlloc::shuffleAllocs(AllocPoint &AP) {
-#if 0
   assert(AP.canInsert());
   SetVector<Alloc> WorkList;
   for (const auto &[A, _] : AP.AllocImpls)
@@ -921,21 +921,17 @@ void MOSRegAlloc::shuffleAllocs(AllocPoint &AP) {
              {AI.Cost + (CanCopy(A, R, Val) ? 2 : 3), /*IsShuffle=*/true, A});
     }
   }
-#endif
 }
 
-#if 0
 void MOSRegAlloc::dumpLiveValues() const {
   dbgs() << "Live values: ";
   for (Register R : LiveValues)
     dbgs() << printReg(R, TRI) << ' ';
   dbgs() << '\n';
 }
-#endif
 
 // Apply the best found allocation implementation.
 void MOSRegAlloc::applyBestAlloc() {
-#if 0
   const auto Best = min_element(AllocPoints.front().AllocImpls);
   std::pair<Alloc, AllocImpl> Cur = *Best;
   const Alloc &A = Cur.first;
@@ -988,8 +984,8 @@ void MOSRegAlloc::applyBestAlloc() {
     }
     Cur = {AI.Next, AllocPoints[I].AllocImpls.at(AI.Next)};
   }
-#endif
 }
+#endif
 
 void MOSRegAlloc::eliminateTrivialCopies() {
   for (MachineBasicBlock &MBB : *MF)
