@@ -22,6 +22,8 @@
 #include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
@@ -226,6 +228,7 @@ public:
         MachineFunctionProperties::Property::NoPHIs);
   }
 
+  void getAnalysisUsage(AnalysisUsage &AU) const override;
   bool runOnMachineFunction(MachineFunction &MF) override;
 
 private:
@@ -235,39 +238,43 @@ private:
   MachineRegisterInfo *MRI;
   const TargetInstrInfo *TII;
   const TargetRegisterInfo *TRI;
+  const MachineDominatorTree *MDT;
 
   SmallVector<Register, 0> RewrittenVReg;
 
   // Allocation points for each instruction. These are ordered such that defs
   // always appear before uses. Block predecessors appear before block
   // successors, except for back edges.
-  //SmallVector<AllocPoint, 0> AllocPoints;
+  // SmallVector<AllocPoint, 0> AllocPoints;
 
-  //DenseMap<const MachineBasicBlock *, unsigned> MBBStartIdx;
-  //DenseMap<const MachineBasicBlock *, unsigned> MBBEndIdx;
+  // DenseMap<const MachineBasicBlock *, unsigned> MBBStartIdx;
+  // DenseMap<const MachineBasicBlock *, unsigned> MBBEndIdx;
 
-  //SmallVector<TreeNode, 0> Tree;
+  // SmallVector<TreeNode, 0> Tree;
 
   void rewriteSSAValues();
   Register rewriteSSAValue(Register R);
   LLT findRegType(Register R);
 
-  //void initAllocPoints();
-  //SmallVector<unsigned> allocPointSuccessors(unsigned APIdx) const;
-  //SmallVector<unsigned> allocPointPredecessors(unsigned APIdx) const;
+  void allocateMBBs();
+  void allocateMDTSubtree(const DomTreeNodeBase<MachineBasicBlock> &Root);
 
-  //void decomposeToTree();
-  //void dumpAllocPoints() const;
-  //void dumpTree(unsigned RootIdx = 0, unsigned Indent = 0) const;
+  // void initAllocPoints();
+  // SmallVector<unsigned> allocPointSuccessors(unsigned APIdx) const;
+  // SmallVector<unsigned> allocPointPredecessors(unsigned APIdx) const;
 
-  //void allocatePhysRegs();
-  //void allocateMBBEnd(unsigned APIdx);
-  //void allocateMI(unsigned APIdx);
-  //void allocateMO(AllocPoint &AP, const MachineOperand &MO);
-  //void freeDef(AllocPoint &AP, const MachineOperand &MO);
-  //void shuffleAllocs(AllocPoint &AP);
+  // void decomposeToTree();
+  // void dumpAllocPoints() const;
+  // void dumpTree(unsigned RootIdx = 0, unsigned Indent = 0) const;
 
-  //void applyBestAlloc();
+  // void allocatePhysRegs();
+  // void allocateMBBEnd(unsigned APIdx);
+  // void allocateMI(unsigned APIdx);
+  // void allocateMO(AllocPoint &AP, const MachineOperand &MO);
+  // void freeDef(AllocPoint &AP, const MachineOperand &MO);
+  // void shuffleAllocs(AllocPoint &AP);
+
+  // void applyBestAlloc();
   void eliminateTrivialCopies();
   void computeLiveIns();
 };
@@ -288,11 +295,18 @@ TreeNode::Type TreeNode::getType(const MOSRegAlloc &Ctx) const {
 
 } // namespace
 
+void MOSRegAlloc::getAnalysisUsage(AnalysisUsage &AU) const {
+  MachineFunctionPass::getAnalysisUsage(AU);
+  AU.addRequired<MachineDominatorTreeWrapperPass>();
+  AU.addPreserved<MachineDominatorTreeWrapperPass>();
+}
+
 bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   this->MF = &MF;
   MRI = &MF.getRegInfo();
   TII = MF.getSubtarget().getInstrInfo();
   TRI = MF.getSubtarget().getRegisterInfo();
+  MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   MF.dump();
   rewriteSSAValues();
 
@@ -355,6 +369,16 @@ LLT MOSRegAlloc::findRegType(Register R) {
   if (Ty.isValid())
     return Ty;
   return LLT::scalar(TRI->getRegSizeInBits(R, *MRI));
+}
+
+void MOSRegAlloc::allocateMBBs() {
+  const auto *RootNode = MDT->getRootNode();
+  allocateMDTSubtree(*RootNode);
+}
+
+void MOSRegAlloc::allocateMDTSubtree(const DomTreeNodeBase<MachineBasicBlock> &Root) {
+  for (const auto *Child : Root.children())
+    allocateMDTSubtree(*Child);
 }
 
 #if 0
@@ -439,7 +463,7 @@ void MOSRegAlloc::decomposeToTree() {
         const auto Res2 = MaxSJump.try_emplace(I, J);
         if (!Res2.second && J > Res2.first->second)
           Res2.first->second = J;
-      } else {
+      } else const {
         const auto Res = MaxSJump.try_emplace(J, I);
         if (!Res.second && I > Res.first->second)
           Res.first->second = I;
