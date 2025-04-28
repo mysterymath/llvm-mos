@@ -312,6 +312,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   MF.dump();
   rewriteSSAValues();
   LV = std::make_unique<LiveVariables>(MF);
+  MF.dump();
+  allocateMBBs();
 
 #if 0
   initAllocPoints();
