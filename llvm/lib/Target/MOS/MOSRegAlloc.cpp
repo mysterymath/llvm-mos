@@ -385,6 +385,18 @@ void MOSRegAlloc::allocateMBBs() {
 void MOSRegAlloc::allocateMDTSubtree(
     const DomTreeNodeBase<MachineBasicBlock> &Root,
     SmallSet<Register, 6> LiveValues) {
+  const MachineBasicBlock &MBB = *Root.getBlock();
+  for (const MachineInstr &MI : MBB) {
+    for (const MachineOperand &MO : MI.operands()) {
+      if (!MO.isReg())
+        continue;
+      Register R = MO.getReg();
+      if (MO.isKill())
+        LiveValues.erase(R);
+      else if (MO.isDef())
+        LiveValues.insert(R);
+    }
+  }
   for (const auto *Child : Root.children())
     allocateMDTSubtree(*Child, LiveValues);
 }
