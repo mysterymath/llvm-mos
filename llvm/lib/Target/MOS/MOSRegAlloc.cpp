@@ -261,6 +261,8 @@ private:
   void allocateMBBs();
   void allocateMDTSubtree(const DomTreeNodeBase<MachineBasicBlock> &Root,
                           SmallSet<Register, 6> LiveValues);
+  void eraseValuesNotLiveIn(SmallSet<Register, 6> &LiveValues,
+                            const MachineBasicBlock &MBB);
 
   // void initAllocPoints();
   // SmallVector<unsigned> allocPointSuccessors(unsigned APIdx) const;
@@ -386,11 +388,22 @@ void MOSRegAlloc::allocateMDTSubtree(
     const DomTreeNodeBase<MachineBasicBlock> &Root,
     SmallSet<Register, 6> LiveValues) {
   const MachineBasicBlock &MBB = *Root.getBlock();
+  dbgs() << "\nAllocating MBB:\n" << MBB << '\n';
+
+  // Compute new live-in values.
+  eraseValuesNotLiveIn(LiveValues, MBB);
+  dbgs() << "Live-in Values:";
+  for (Register V : LiveValues)
+    dbgs() << ' ' << printReg(V, TRI);
+  dbgs() << '\n';
+
   for (const MachineInstr &MI : MBB) {
     for (const MachineOperand &MO : MI.operands()) {
       if (!MO.isReg())
         continue;
       Register R = MO.getReg();
+
+      // Update live-in values.
       if (MO.isKill())
         LiveValues.erase(R);
       else if (MO.isDef())
@@ -399,6 +412,18 @@ void MOSRegAlloc::allocateMDTSubtree(
   }
   for (const auto *Child : Root.children())
     allocateMDTSubtree(*Child, LiveValues);
+}
+
+void MOSRegAlloc::eraseValuesNotLiveIn(SmallSet<Register, 6> &LiveValues,
+                                       const MachineBasicBlock &MBB) {
+  SmallVector<Register> ToKill;
+  for (Register V : LiveValues) {
+    // Unnamed physical register values cannot be live across basic blocks.
+    if (V.isPhysical() || !LV->isLiveIn(V, MBB))
+      ToKill.push_back(V);
+  }
+  for (Register V : ToKill)
+    LiveValues.erase(V);
 }
 
 #if 0
