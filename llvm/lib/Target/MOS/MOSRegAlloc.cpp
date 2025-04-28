@@ -259,7 +259,8 @@ private:
   LLT findRegType(Register R);
 
   void allocateMBBs();
-  void allocateMDTSubtree(const DomTreeNodeBase<MachineBasicBlock> &Root);
+  void allocateMDTSubtree(const DomTreeNodeBase<MachineBasicBlock> &Root,
+                          SmallSet<Register, 6> LiveValues);
 
   // void initAllocPoints();
   // SmallVector<unsigned> allocPointSuccessors(unsigned APIdx) const;
@@ -378,12 +379,14 @@ LLT MOSRegAlloc::findRegType(Register R) {
 
 void MOSRegAlloc::allocateMBBs() {
   const auto *RootNode = MDT->getRootNode();
-  allocateMDTSubtree(*RootNode);
+  allocateMDTSubtree(*RootNode, {});
 }
 
-void MOSRegAlloc::allocateMDTSubtree(const DomTreeNodeBase<MachineBasicBlock> &Root) {
+void MOSRegAlloc::allocateMDTSubtree(
+    const DomTreeNodeBase<MachineBasicBlock> &Root,
+    SmallSet<Register, 6> LiveValues) {
   for (const auto *Child : Root.children())
-    allocateMDTSubtree(*Child);
+    allocateMDTSubtree(*Child, LiveValues);
 }
 
 #if 0
