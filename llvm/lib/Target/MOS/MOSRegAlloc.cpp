@@ -21,6 +21,7 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
+#include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -239,6 +240,7 @@ private:
   const TargetInstrInfo *TII;
   const TargetRegisterInfo *TRI;
   const MachineDominatorTree *MDT;
+  std::unique_ptr<LiveVariables> LV;
 
   SmallVector<Register, 0> RewrittenVReg;
 
@@ -309,6 +311,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   MF.dump();
   rewriteSSAValues();
+  LV = std::make_unique<LiveVariables>(MF);
 
 #if 0
   initAllocPoints();
