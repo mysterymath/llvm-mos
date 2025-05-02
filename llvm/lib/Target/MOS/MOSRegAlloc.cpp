@@ -262,7 +262,8 @@ private:
   void allocateMDTSubtree(const DomTreeNodeBase<MachineBasicBlock> &Root,
                           SmallSet<Register, 6> LiveValues);
   void eraseValuesNotLiveIn(SmallSet<Register, 6> &LiveValues,
-                            const MachineBasicBlock &MBB);
+                            const MachineBasicBlock &MBB) const;
+  SmallVector<Alloc> getAllAllocs(SmallSet<Register, 6> &LiveValues) const;
 
   // void initAllocPoints();
   // SmallVector<unsigned> allocPointSuccessors(unsigned APIdx) const;
@@ -397,6 +398,9 @@ void MOSRegAlloc::allocateMDTSubtree(
     dbgs() << ' ' << printReg(V, TRI);
   dbgs() << '\n';
 
+  SmallVector<Alloc> Allocs = getAllAllocs(LiveValues);
+  dbgs() << "Num possible allocs: " << Allocs.size() << '\n';
+
   for (const MachineInstr &MI : MBB) {
     for (const MachineOperand &MO : MI.operands()) {
       if (!MO.isReg())
@@ -415,7 +419,7 @@ void MOSRegAlloc::allocateMDTSubtree(
 }
 
 void MOSRegAlloc::eraseValuesNotLiveIn(SmallSet<Register, 6> &LiveValues,
-                                       const MachineBasicBlock &MBB) {
+                                       const MachineBasicBlock &MBB) const {
   SmallVector<Register> ToKill;
   for (Register V : LiveValues) {
     // Unnamed physical register values cannot be live across basic blocks.
@@ -424,6 +428,26 @@ void MOSRegAlloc::eraseValuesNotLiveIn(SmallSet<Register, 6> &LiveValues,
   }
   for (Register V : ToKill)
     LiveValues.erase(V);
+}
+
+SmallVector<Alloc>
+MOSRegAlloc::getAllAllocs(SmallSet<Register, 6> &LiveValues) const {
+  SmallVector<Alloc> Allocs = {{}};
+  SmallVector<Alloc> NextAllocs;
+  for (Register P : Alloc::Regs) {
+    TypeSize Size = TRI->getRegSizeInBits(P, *MRI);
+    for (Alloc A : Allocs) {
+      for (Register R : LiveValues) {
+        if (Size != MRI->getType(R).getSizeInBits())
+          continue;
+        Alloc New = A;
+        New[P] = R;
+        NextAllocs.push_back(New);
+      }
+    }
+    Allocs.swap(NextAllocs);
+  }
+  return Allocs;
 }
 
 #if 0
