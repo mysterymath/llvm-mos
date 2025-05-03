@@ -16,6 +16,7 @@
 #include "MOS.h"
 #include "MOSRegisterInfo.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallSet.h"
@@ -132,20 +133,41 @@ template <> struct DenseMapInfo<Alloc> {
   static bool isEqual(const Alloc &LHS, const Alloc &RHS) { return LHS == RHS; }
 };
 
+template <> struct DenseMapInfo<SmallVector<Alloc>> {
+  static inline SmallVector<Alloc> getEmptyKey() {
+    return {DenseMapInfo<Alloc>::getEmptyKey()};
+  }
+  static inline SmallVector<Alloc> getTombstoneKey() {
+    return {DenseMapInfo<Alloc>::getTombstoneKey()};
+  }
+
+  static unsigned getHashValue(const SmallVector<Alloc> &Val) {
+    unsigned Hash = 0;
+    for (Alloc A : Val)
+      Hash =
+          detail::combineHashValue(Hash, DenseMapInfo<Alloc>::getHashValue(A));
+    return Hash;
+  }
+
+  static bool isEqual(const SmallVector<Alloc> &LHS,
+                      const SmallVector<Alloc> &RHS) {
+    return LHS == RHS;
+  }
+};
+
 namespace {
 
-#if 0
 // A chain of allocations that can be followed from the current allocation.
 struct AllocImpl {
   // Cost of using this impl.
   unsigned Cost;
 
-  // True if the next alloc is in this alloc point rather than the next.
-  bool IsShuffle;
-
-  Alloc Next;
+  // Reference to next allocation.
+  unsigned NextAPIdx;
+  Alloc NextAlloc;
 };
 
+#if 0
 bool operator<(const std::pair<Alloc, AllocImpl> &L,
                const std::pair<Alloc, AllocImpl> &R) {
   return L.second.Cost < R.second.Cost;
@@ -199,6 +221,8 @@ struct TreeNode {
 
   SmallVector<unsigned> AllocPoints;
   SmallVector<unsigned> Children;
+
+  DenseMap<SmallVector<Alloc>, AllocImpl> AllocImpls;
 
   Type getType(const MOSRegAlloc &Ctx) const;
 };
