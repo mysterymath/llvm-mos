@@ -22,7 +22,9 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
+#include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/CodeGen/MachineBasicBlock.h"
+#include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
@@ -178,7 +180,6 @@ bool operator<(const std::pair<Alloc, AllocImpl> &L,
 struct AllocPoint {
   MachineBasicBlock *MBB;
   MachineBasicBlock::iterator I;
-
   DenseSet<Register> LiveValues;
 
   AllocPoint(MachineBasicBlock *MBB, MachineBasicBlock::iterator I)
@@ -245,6 +246,12 @@ public:
         MachineFunctionProperties::Property::NoPHIs);
   }
 
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    MachineFunctionPass::getAnalysisUsage(AU);
+    AU.addRequired<MachineDominatorTreeWrapperPass>();
+    AU.addPreserved<MachineDominatorTreeWrapperPass>();
+  }
+
   bool runOnMachineFunction(MachineFunction &MF) override;
 
 private:
@@ -254,6 +261,7 @@ private:
   MachineRegisterInfo *MRI;
   const TargetInstrInfo *TII;
   const TargetRegisterInfo *TRI;
+  const MachineDominatorTree *MDT;
 
   SmallVector<Register, 0> RewrittenVReg;
 
@@ -265,6 +273,8 @@ private:
   DenseMap<const MachineBasicBlock *, unsigned> MBBStartIdx;
   DenseMap<const MachineBasicBlock *, unsigned> MBBEndIdx;
 
+  std::optional<LiveVariables> LV;
+
   SmallVector<TreeNode, 0> Tree;
 
   void rewriteSSAValues();
@@ -272,6 +282,8 @@ private:
   LLT findRegType(Register R);
 
   void initAllocPoints();
+  void initLiveValues(const MachineDomTreeNode *SubTree,
+                      DenseSet<Register> LiveValues);
   SmallVector<unsigned> allocPointSuccessors(unsigned APIdx) const;
   SmallVector<unsigned> allocPointPredecessors(unsigned APIdx) const;
 
@@ -305,10 +317,14 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   MRI = &MF.getRegInfo();
   TII = MF.getSubtarget().getInstrInfo();
   TRI = MF.getSubtarget().getRegisterInfo();
-  MF.dump();
+  MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   rewriteSSAValues();
+  LV.emplace(MF);
+  MF.dump();
 
   initAllocPoints();
+  initLiveValues(MDT->getRootNode(), {});
+
   decomposeToTree();
   dumpAllocPoints();
   dumpTree();
@@ -368,8 +384,6 @@ LLT MOSRegAlloc::findRegType(Register R) {
   return LLT::scalar(TRI->getRegSizeInBits(R, *MRI));
 }
 
-// Create an allocation point for each machine instruction in the order of
-// allocation.
 void MOSRegAlloc::initAllocPoints() {
   AllocPoints.clear();
   for (MachineBasicBlock &MBB : *MF) {
@@ -382,6 +396,41 @@ void MOSRegAlloc::initAllocPoints() {
     }
     MBBEndIdx[&MBB] = AllocPoints.size() - 1;
   }
+}
+
+void MOSRegAlloc::initLiveValues(const MachineDomTreeNode *SubTree,
+                                 DenseSet<Register> LiveValues) {
+  MachineBasicBlock &MBB = *SubTree->getBlock();
+  {
+    SmallVector<Register> Dead;
+    for (Register V : LiveValues)
+      if (V.isPhysical() || !LV->isLiveIn(V, MBB))
+        Dead.push_back(V);
+    for (Register V : Dead)
+      LiveValues.erase(V);
+  }
+
+  for (unsigned I = MBBStartIdx[&MBB], E = MBBEndIdx[&MBB];; ++I) {
+    AllocPoints[I].LiveValues = LiveValues;
+    if (I == E)
+      break;
+    MachineInstr &MI = *AllocPoints[I].I;
+    for (MachineOperand &MO : MI.operands()) {
+      if (!MO.isReg())
+        continue;
+      Register V = MO.getReg();
+      if (MO.isUse()) {
+        if (MO.isKill())
+          LiveValues.erase(V);
+      } else {
+        assert(MO.isDef());
+        if (!MO.isDead())
+          LiveValues.insert(V);
+      }
+    }
+  }
+  for (const auto *Child : SubTree->children())
+    initLiveValues(Child, LiveValues);
 }
 
 SmallVector<unsigned> MOSRegAlloc::allocPointSuccessors(unsigned APIdx) const {
