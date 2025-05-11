@@ -164,9 +164,11 @@ struct AllocImpl {
   // Cost of using this impl.
   unsigned Cost;
 
-  // Reference to next allocation.
-  unsigned NextAPIdx;
-  Alloc NextAlloc;
+  // Whether the next alloc is in this alloc point or the children.
+  bool IsCopy;
+
+  // Prev allocations from the children.
+  SmallVector<Alloc> PrevAllocs;
 };
 
 #if 0
@@ -226,6 +228,7 @@ struct TreeNode {
   DenseMap<SmallVector<Alloc>, AllocImpl> AllocImpls;
 
   Type getType(const MOSRegAlloc &Ctx) const;
+  unsigned getIntroducedIdx(MOSRegAlloc &Ctx) const;
 };
 
 class MOSRegAlloc : public MachineFunctionPass {
@@ -291,7 +294,8 @@ private:
   void dumpAllocPoints() const;
   void dumpTree(unsigned RootIdx = 0, unsigned Indent = 0) const;
 
-  void allocatePhysRegs();
+  void allocatePhysRegs(unsigned SubTreeIdx = 0);
+  SmallVector<Alloc> collectAllAllocs(AllocPoint &AP) const;
 
   void applyBestAlloc();
   void eliminateTrivialCopies();
@@ -308,6 +312,17 @@ TreeNode::Type TreeNode::getType(const MOSRegAlloc &Ctx) const {
          "Node must be either introduce or forget.");
   return Child.AllocPoints.size() > AllocPoints.size() ? Type::Forget
                                                        : Type::Intro;
+}
+
+unsigned TreeNode::getIntroducedIdx(MOSRegAlloc &Ctx) const {
+  SmallSet<unsigned, 6> ChildAllocPoints;
+  if (!Children.empty())
+    for (unsigned I : Ctx.Tree[Children.back()].AllocPoints)
+      ChildAllocPoints.insert(I);
+  for (unsigned I : AllocPoints)
+    if (!ChildAllocPoints.contains(I))
+      return I;
+  llvm_unreachable("no alloc point was introduced");
 }
 
 } // namespace
@@ -743,26 +758,71 @@ void MOSRegAlloc::dumpTree(unsigned RootIdx, unsigned Indent) const {
     dumpTree(C, Indent + 1);
 }
 
-void MOSRegAlloc::allocatePhysRegs() {
-#if 0
-  for (intptr_t I = AllocPoints.size() - 1; I >= 0; --I) {
-    AllocPoint &AP = AllocPoints[I];
-    MachineBasicBlock &MBB = *AP.MBB;
-    dumpLiveValues();
-    if (AP.I == MBB.end())
-      allocateMBBEnd(I);
-    else
-      allocateMI(I);
-    if (AP.AllocImpls.empty())
-      report_fatal_error("physical register allocation failed");
-    AP.dump(TRI);
-    if (AP.canInsert()) {
-      dbgs() << "Shuffling allocations.\n";
-      shuffleAllocs(AP);
-      AP.dump(TRI);
+void MOSRegAlloc::allocatePhysRegs(unsigned SubTreeIdx) {
+  TreeNode &SubTree = Tree[SubTreeIdx];
+  for (unsigned ChildIdx : SubTree.Children)
+    allocatePhysRegs(ChildIdx);
+  dbgs() << "Allocating node: " << SubTreeIdx << ':';
+  for (unsigned I : SubTree.AllocPoints)
+    dbgs() << ' ' << I;
+  dbgs() << '\n';
+  switch (SubTree.getType(*this)) {
+  case TreeNode::Type::Intro: {
+    unsigned IntroducedIdx = SubTree.getIntroducedIdx(*this);
+    SmallVector<Alloc> IntroducedAllocs =
+        collectAllAllocs(AllocPoints[IntroducedIdx]);
+    assert(SubTree.Children.size() <= 1);
+    TreeNode *Child =
+        !SubTree.Children.empty() ? &Tree[SubTree.Children.back()] : nullptr;
+    DenseMap<SmallVector<Alloc>, AllocImpl> EmptyAllocImpls;
+    DenseMap<SmallVector<Alloc>, AllocImpl> *ChildAllocImpls;
+    if (Child) {
+      ChildAllocImpls = &Child->AllocImpls;
+    } else {
+      ChildAllocImpls = &EmptyAllocImpls;
+      EmptyAllocImpls[{}] = {/*Cost=*/0, /*IsCopy=*/false, /*PrevAllocs=*/{}};
     }
+    for (const auto &[ChildAllocs, ChildImpl] : *ChildAllocImpls) {
+      for (const Alloc &IntroducedAlloc : IntroducedAllocs) {
+        SmallVector<Alloc> NewAllocs;
+        unsigned J = 0;
+        for (unsigned I : SubTree.AllocPoints)
+          if (I == IntroducedIdx)
+            NewAllocs.push_back(IntroducedAlloc);
+          else {
+            NewAllocs.push_back(ChildAllocs[J]);
+            J++;
+          }
+        SubTree.AllocImpls[NewAllocs] = {/*Cost=*/0, /*IsCopy=*/false,
+                                         ChildAllocs};
+      }
+    }
+    break;
   }
-#endif
+  default:
+    llvm_unreachable("TODO: Non-intro");
+  }
+  dbgs() << "Num allocations: " << SubTree.AllocImpls.size() << '\n';
+}
+
+SmallVector<Alloc> MOSRegAlloc::collectAllAllocs(AllocPoint &AP) const {
+  SmallVector<Alloc> Allocs = {{}};
+  SmallVector<Alloc> NewAllocs;
+  for (Register P : Alloc::Regs) {
+    NewAllocs.clear();
+    for (Alloc A : Allocs) {
+      for (Register V : AP.LiveValues) {
+        LLT Ty = MRI->getType(V);
+        if (TRI->getRegSizeInBits(P, *MRI) != Ty.getSizeInBits())
+          continue;
+        Alloc New = A;
+        New[P] = V;
+        NewAllocs.push_back(New);
+      }
+    }
+    Allocs.swap(NewAllocs);
+  }
+  return Allocs;
 }
 
 #if 0
