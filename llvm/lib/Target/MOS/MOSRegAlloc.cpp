@@ -159,6 +159,7 @@ template <> struct DenseMapInfo<SmallVector<Alloc>> {
 
 namespace {
 
+#if 0
 // A chain of allocations that can be followed from the current allocation.
 struct AllocImpl {
   // Cost of using this impl.
@@ -170,6 +171,7 @@ struct AllocImpl {
   // Prev allocations from the children.
   SmallVector<Alloc> PrevAllocs;
 };
+#endif
 
 #if 0
 bool operator<(const std::pair<Alloc, AllocImpl> &L,
@@ -178,6 +180,7 @@ bool operator<(const std::pair<Alloc, AllocImpl> &L,
 }
 #endif
 
+#if 0
 // A point within the program that can have a tracked allocation.
 struct AllocPoint {
   MachineBasicBlock *MBB;
@@ -187,49 +190,29 @@ struct AllocPoint {
   AllocPoint(MachineBasicBlock *MBB, MachineBasicBlock::iterator I)
       : MBB(MBB), I(I) {}
 
-#if 0
-  void dump(const TargetRegisterInfo *TRI) const {
-    dbgs() << "Number of allocations: " << AllocImpls.size() << '\n';
-    if (!AllocImpls.empty()) {
-      const auto Min = min_element(AllocImpls);
-      dbgs() << "Min Cost: " << Min->second.Cost << '\n';
-      dbgs() << "Allocation:\n";
-      Min->first.print(dbgs(), TRI);
-    }
-  }
-
-  void dumpFull(const TargetRegisterInfo *TRI) const {
-    dbgs() << "Allocations:\n";
-    for (const auto &[A, AI] : AllocImpls) {
-      dbgs() << "Alloc:\n";
-      A.print(dbgs(), TRI);
-      dbgs() << "Cost: " << AI.Cost << ", IsShuffle: " << AI.IsShuffle << '\n';
-      dbgs() << "Next:\n";
-      AI.Next.print(dbgs(), TRI);
-    }
-  }
-#endif
-
   bool canInsert() const {
     if (I == MBB->begin())
       return true;
     return !std::prev(I)->isTerminator();
   }
 };
+#endif
 
 class MOSRegAlloc;
 
+#if 0
 struct TreeNode {
   enum class Type { Intro, Forget, Join };
 
   SmallVector<unsigned> AllocPoints;
   SmallVector<unsigned> Children;
 
-  DenseMap<SmallVector<Alloc>, AllocImpl> AllocImpls;
+  //DenseMap<SmallVector<Alloc>, AllocImpl> AllocImpls;
 
   Type getType(const MOSRegAlloc &Ctx) const;
   unsigned getIntroducedIdx(MOSRegAlloc &Ctx) const;
 };
+#endif
 
 class MOSRegAlloc : public MachineFunctionPass {
 public:
@@ -271,19 +254,20 @@ private:
   // Allocation points for each instruction. These are ordered such that defs
   // always appear before uses. Block predecessors appear before block
   // successors, except for back edges.
-  SmallVector<AllocPoint, 0> AllocPoints;
+  //SmallVector<AllocPoint, 0> AllocPoints;
 
-  DenseMap<const MachineBasicBlock *, unsigned> MBBStartIdx;
-  DenseMap<const MachineBasicBlock *, unsigned> MBBEndIdx;
+  //DenseMap<const MachineBasicBlock *, unsigned> MBBStartIdx;
+  //DenseMap<const MachineBasicBlock *, unsigned> MBBEndIdx;
 
   std::optional<LiveVariables> LV;
 
-  SmallVector<TreeNode, 0> Tree;
+  //SmallVector<TreeNode, 0> Tree;
 
   void rewriteSSAValues();
   Register rewriteSSAValue(Register R);
   LLT findRegType(Register R);
 
+#if 0
   void initAllocPoints();
   void initLiveValues(const MachineDomTreeNode *SubTree,
                       DenseSet<Register> LiveValues);
@@ -296,12 +280,14 @@ private:
 
   void allocatePhysRegs(unsigned SubTreeIdx = 0);
   SmallVector<Alloc> collectAllAllocs(AllocPoint &AP) const;
+#endif
 
   void applyBestAlloc();
   void eliminateTrivialCopies();
   void computeLiveIns();
 };
 
+#if 0
 TreeNode::Type TreeNode::getType(const MOSRegAlloc &Ctx) const {
   if (Children.empty())
     return Type::Intro;
@@ -324,6 +310,7 @@ unsigned TreeNode::getIntroducedIdx(MOSRegAlloc &Ctx) const {
       return I;
   llvm_unreachable("no alloc point was introduced");
 }
+#endif
 
 } // namespace
 
@@ -337,6 +324,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   LV.emplace(MF);
   MF.dump();
 
+#if 0
   initAllocPoints();
   initLiveValues(MDT->getRootNode(), {});
 
@@ -345,6 +333,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   dumpTree();
 
   allocatePhysRegs();
+#endif
+
   applyBestAlloc();
   MF.dump();
   // TODO: Return to SSA form for duplicate imagreg defs.
@@ -399,6 +389,7 @@ LLT MOSRegAlloc::findRegType(Register R) {
   return LLT::scalar(TRI->getRegSizeInBits(R, *MRI));
 }
 
+#if 0
 void MOSRegAlloc::initAllocPoints() {
   AllocPoints.clear();
   for (MachineBasicBlock &MBB : *MF) {
@@ -825,7 +816,6 @@ SmallVector<Alloc> MOSRegAlloc::collectAllAllocs(AllocPoint &AP) const {
   return Allocs;
 }
 
-#if 0
 void MOSRegAlloc::allocateMBBEnd(unsigned APIdx) {
   AllocPoint &AP = AllocPoints[APIdx];
   MachineBasicBlock &MBB = *AP.MBB;
