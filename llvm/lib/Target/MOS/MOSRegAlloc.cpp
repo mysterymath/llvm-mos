@@ -159,19 +159,17 @@ template <> struct DenseMapInfo<SmallVector<Alloc>> {
 
 namespace {
 
-#if 0
-// A chain of allocations that can be followed from the current allocation.
+// A chain of allocations that can be followed backwards from the current
+// allocation.
 struct AllocImpl {
   // Cost of using this impl.
   unsigned Cost;
 
-  // Whether the next alloc is in this alloc point or the children.
+  // True if the prev alloc is at this MI rather than the previous.
   bool IsCopy;
 
-  // Prev allocations from the children.
-  SmallVector<Alloc> PrevAllocs;
+  Alloc PrevAlloc;
 };
-#endif
 
 #if 0
 bool operator<(const std::pair<Alloc, AllocImpl> &L,
@@ -214,6 +212,15 @@ struct TreeNode {
 };
 #endif
 
+struct MBBAlloc {
+  // For each machine instruction (plus the end), a map from start alloc then
+  // end alloc to the best implementation.
+  SmallVector<DenseMap<Alloc, DenseMap<Alloc, AllocImpl>>> MIAllocs;
+
+  // For each end alloc, the start alloc with the best implementation.
+  DenseMap<Alloc, Alloc> BestStartAlloc;
+};
+
 class MOSRegAlloc : public MachineFunctionPass {
 public:
   static char ID;
@@ -254,14 +261,16 @@ private:
   // Allocation points for each instruction. These are ordered such that defs
   // always appear before uses. Block predecessors appear before block
   // successors, except for back edges.
-  //SmallVector<AllocPoint, 0> AllocPoints;
+  // SmallVector<AllocPoint, 0> AllocPoints;
 
-  //DenseMap<const MachineBasicBlock *, unsigned> MBBStartIdx;
-  //DenseMap<const MachineBasicBlock *, unsigned> MBBEndIdx;
+  // DenseMap<const MachineBasicBlock *, unsigned> MBBStartIdx;
+  // DenseMap<const MachineBasicBlock *, unsigned> MBBEndIdx;
 
   std::optional<LiveVariables> LV;
 
-  //SmallVector<TreeNode, 0> Tree;
+  IndexedMap<MBBAlloc, MBB2NumberFunctor> MBBAllocs;
+
+  // SmallVector<TreeNode, 0> Tree;
 
   void rewriteSSAValues();
   Register rewriteSSAValue(Register R);
@@ -281,6 +290,9 @@ private:
   void allocatePhysRegs(unsigned SubTreeIdx = 0);
   SmallVector<Alloc> collectAllAllocs(AllocPoint &AP) const;
 #endif
+
+  void allocateMBB(const MachineBasicBlock &MBB);
+  void allocateMI(const MachineInstr &MI);
 
   void applyBestAlloc();
   void eliminateTrivialCopies();
@@ -320,6 +332,9 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   TII = MF.getSubtarget().getInstrInfo();
   TRI = MF.getSubtarget().getRegisterInfo();
   MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
+
+  MF.RenumberBlocks();
+
   rewriteSSAValues();
   LV.emplace(MF);
   MF.dump();
@@ -334,6 +349,10 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
   allocatePhysRegs();
 #endif
+
+  MBBAllocs.resize(MF.getNumBlockIDs());
+  for (MachineBasicBlock &MBB : MF)
+    allocateMBB(MBB);
 
   applyBestAlloc();
   MF.dump();
@@ -815,50 +834,43 @@ SmallVector<Alloc> MOSRegAlloc::collectAllAllocs(AllocPoint &AP) const {
   }
   return Allocs;
 }
+#endif
 
-void MOSRegAlloc::allocateMBBEnd(unsigned APIdx) {
-  AllocPoint &AP = AllocPoints[APIdx];
-  MachineBasicBlock &MBB = *AP.MBB;
-  assert(AP.I == MBB.end());
-  dbgs() << "\nAllocating MBB:\n" << MBB << '\n';
+void MOSRegAlloc::allocateMBB(const MachineBasicBlock &MBB) {
+  MBBAlloc &Alloc = MBBAllocs[&MBB];
+  // TODO: Initialize allocs
 
-  if (APIdx != AllocPoints.size() - 1)
-    AllocPoints[APIdx + 1].LiveValues = std::move(LiveValues);
-  LiveValues.clear();
-  if (MBB.succ_empty()) {
-    AP.AllocImpls.try_emplace(Alloc{}, AllocImpl{0, false, {}});
-  } else {
-    for (const MachineBasicBlock *Succ : MBB.successors()) {
-      const AllocPoint &SuccStartAP = AllocPoints[MBBStartIdx[Succ]];
-
-      assert((Succ->empty() || !Succ->begin()->isPHI()) && "TODO: PHIs");
-      for (Register R : SuccStartAP.LiveValues)
-        LiveValues.insert(R);
-
-      assert((AP.AllocImpls.empty() || SuccStartAP.AllocImpls.empty()) &&
-             "TODO");
-      for (const auto &[A, AI] : SuccStartAP.AllocImpls)
-        AP.AllocImpls.try_emplace(A, AllocImpl{AI.Cost, false, A});
-    }
+  for (MachineBasicBlock::const_iterator I = MBB.getFirstNonPHI(),
+                                         E = MBB.end();
+       ; ++I) {
+    if (I == E)
+      break;
+    allocateMI(*I);
   }
+
+  // TODO: Compute BestStartAlloc
 }
 
-void MOSRegAlloc::allocateMI(unsigned APIdx) {
-  AllocPoint &AP = AllocPoints[APIdx];
-  assert(AP.I != AP.MBB->end());
-  dbgs() << "Allocating MI: " << *AP.I;
-  AllocPoint &NextAP = AllocPoints[APIdx + 1];
-
-  AP.AllocImpls = NextAP.AllocImpls;
-  for (auto &[A, AI] : AP.AllocImpls) {
-    AI.IsShuffle = false;
-
-    // We do not track allocations within an instruction (although at various
-    // 'points' within an instruciton they may differ). Accordingly, the next
-    // allocation is always that of the next allocation point.
-    AI.Next = A;
+void MOSRegAlloc::allocateMI(const MachineInstr &MI) {
+  MBBAlloc &MBBA = MBBAllocs[MI.getParent()];
+  dbgs() << "Allocating MI: " << MI;
+  // Initialize the new alloc table to point back to the previous table's End
+  // allocs.
+  MBBA.MIAllocs.push_back(MBBA.MIAllocs.back());
+  auto &Allocs = MBBA.MIAllocs.back();
+  for (auto &[Start, KV] : Allocs) {
+    for (auto &[End, AI] : KV) {
+      AI.IsCopy = false;
+      AI.PrevAlloc = End;
+    }
   }
+  unsigned NumAllocs = 0;
+  for (const auto &[_, KV] : Allocs)
+    for (const auto &_ : KV)
+      NumAllocs++;
+  dbgs() << "Num allocs: " << NumAllocs << '\n';
 
+#if 0
   for (const MachineOperand &MO : AP.I->operands())
     if (MO.isReg() && MO.isDef())
       allocateMO(AP, MO);
@@ -868,8 +880,10 @@ void MOSRegAlloc::allocateMI(unsigned APIdx) {
   for (const MachineOperand &MO : AP.I->operands())
     if (MO.isReg() && MO.isUse())
       allocateMO(AP, MO);
+#endif
 }
 
+#if 0
 void MOSRegAlloc::allocateMO(AllocPoint &AP, const MachineOperand &MO) {
   const MachineInstr &MI = *AP.I;
   Register Val = MO.getReg();
