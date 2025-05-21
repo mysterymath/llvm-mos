@@ -266,7 +266,7 @@ private:
   // DenseMap<const MachineBasicBlock *, unsigned> MBBStartIdx;
   // DenseMap<const MachineBasicBlock *, unsigned> MBBEndIdx;
 
-  std::optional<LiveVariables> LV;
+  mutable std::optional<LiveVariables> LV;
 
   IndexedMap<MBBAlloc, MBB2NumberFunctor> MBBAllocs;
 
@@ -288,11 +288,12 @@ private:
   void dumpTree(unsigned RootIdx = 0, unsigned Indent = 0) const;
 
   void allocatePhysRegs(unsigned SubTreeIdx = 0);
-  SmallVector<Alloc> collectAllAllocs(AllocPoint &AP) const;
 #endif
 
   void allocateMBB(const MachineBasicBlock &MBB);
+  void allocateMBBStart(const MachineBasicBlock &MBB);
   void allocateMI(const MachineInstr &MI);
+  DenseSet<Register> LiveValues;
 
   void applyBestAlloc();
   void eliminateTrivialCopies();
@@ -815,13 +816,42 @@ void MOSRegAlloc::allocatePhysRegs(unsigned SubTreeIdx) {
   dbgs() << "Num allocations: " << SubTree.AllocImpls.size() << '\n';
 }
 
-SmallVector<Alloc> MOSRegAlloc::collectAllAllocs(AllocPoint &AP) const {
+#endif
+
+void MOSRegAlloc::allocateMBB(const MachineBasicBlock &MBB) {
+  allocateMBBStart(MBB);
+  for (MachineBasicBlock::const_iterator I = MBB.getFirstNonPHI(),
+                                         E = MBB.end();
+       ; ++I) {
+    if (I == E)
+      break;
+    allocateMI(*I);
+  }
+
+  // TODO: Compute BestStartAlloc
+}
+
+void MOSRegAlloc::allocateMBBStart(const MachineBasicBlock &MBB) {
+  LiveValues.clear();
+  for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
+    Register R = Register::index2VirtReg(I);
+    if (LV->isLiveIn(R, MBB))
+      LiveValues.insert(R);
+  }
+  for (const MachineInstr &MI : MBB.phis())
+    LiveValues.insert(MI.getOperand(0).getReg());
+
   SmallVector<Alloc> Allocs = {{}};
   SmallVector<Alloc> NewAllocs;
+  // For each register, add all possible assignments of values to that register
+  // to the existing set of possible allocations.
   for (Register P : Alloc::Regs) {
     NewAllocs.clear();
     for (Alloc A : Allocs) {
-      for (Register V : AP.LiveValues) {
+      // No value for register P.
+      NewAllocs.push_back(A);
+
+      for (Register V : LiveValues) {
         LLT Ty = MRI->getType(V);
         if (TRI->getRegSizeInBits(P, *MRI) != Ty.getSizeInBits())
           continue;
@@ -832,23 +862,11 @@ SmallVector<Alloc> MOSRegAlloc::collectAllAllocs(AllocPoint &AP) const {
     }
     Allocs.swap(NewAllocs);
   }
-  return Allocs;
-}
-#endif
 
-void MOSRegAlloc::allocateMBB(const MachineBasicBlock &MBB) {
-  MBBAlloc &Alloc = MBBAllocs[&MBB];
-  // TODO: Initialize allocs
-
-  for (MachineBasicBlock::const_iterator I = MBB.getFirstNonPHI(),
-                                         E = MBB.end();
-       ; ++I) {
-    if (I == E)
-      break;
-    allocateMI(*I);
-  }
-
-  // TODO: Compute BestStartAlloc
+  MBBAllocs[&MBB].MIAllocs.emplace_back();
+  auto &MIAllocs = MBBAllocs[&MBB].MIAllocs.back();
+  for (Alloc A : Allocs)
+    MIAllocs[A][A] = AllocImpl{/*Cost=*/0, /*IsCopy=*/false, /*PrevAlloc=*/{}};
 }
 
 void MOSRegAlloc::allocateMI(const MachineInstr &MI) {
@@ -1047,12 +1065,6 @@ void MOSRegAlloc::shuffleAllocs(AllocPoint &AP) {
   }
 }
 
-void MOSRegAlloc::dumpLiveValues() const {
-  dbgs() << "Live values: ";
-  for (Register R : LiveValues)
-    dbgs() << printReg(R, TRI) << ' ';
-  dbgs() << '\n';
-}
 #endif
 
 // Apply the best found allocation implementation.
