@@ -293,6 +293,9 @@ private:
   void allocateMBB(const MachineBasicBlock &MBB);
   void allocateMBBStart(const MachineBasicBlock &MBB);
   void allocateMI(const MachineInstr &MI);
+  void newMIAllocs(const MachineBasicBlock &MBB);
+  void shuffleAllocs(const MachineBasicBlock &MBB);
+  void dumpNumAllocs(const MachineBasicBlock &MBB) const;
   DenseSet<Register> LiveValues;
 
   void applyBestAlloc();
@@ -828,6 +831,11 @@ void MOSRegAlloc::allocateMBB(const MachineBasicBlock &MBB) {
     allocateMI(*I);
   }
 
+  if (!MBB.empty() && !std::prev(MBB.end())->isTerminator()) {
+    shuffleAllocs(MBB);
+    dumpNumAllocs(MBB);
+  }
+
   // TODO: Compute BestStartAlloc
 }
 
@@ -870,23 +878,17 @@ void MOSRegAlloc::allocateMBBStart(const MachineBasicBlock &MBB) {
 }
 
 void MOSRegAlloc::allocateMI(const MachineInstr &MI) {
-  MBBAlloc &MBBA = MBBAllocs[MI.getParent()];
+  const MachineBasicBlock &MBB = *MI.getParent();
+
   dbgs() << "Allocating MI: " << MI;
-  // Initialize the new alloc table to point back to the previous table's End
-  // allocs.
-  MBBA.MIAllocs.push_back(MBBA.MIAllocs.back());
-  auto &Allocs = MBBA.MIAllocs.back();
-  for (auto &[Start, KV] : Allocs) {
-    for (auto &[End, AI] : KV) {
-      AI.IsCopy = false;
-      AI.PrevAlloc = End;
-    }
+
+  newMIAllocs(MBB);
+  dumpNumAllocs(MBB);
+
+  if (!MI.isTerminator()) {
+    shuffleAllocs(MBB);
+    dumpNumAllocs(MBB);
   }
-  unsigned NumAllocs = 0;
-  for (const auto &[_, KV] : Allocs)
-    for (const auto &_ : KV)
-      NumAllocs++;
-  dbgs() << "Num allocs: " << NumAllocs << '\n';
 
 #if 0
   for (const MachineOperand &MO : AP.I->operands())
@@ -899,6 +901,20 @@ void MOSRegAlloc::allocateMI(const MachineInstr &MI) {
     if (MO.isReg() && MO.isUse())
       allocateMO(AP, MO);
 #endif
+}
+
+// Initialize a new alloc table to point back to the previous table's End
+// allocs.
+void MOSRegAlloc::newMIAllocs(const MachineBasicBlock &MBB) {
+  MBBAlloc &MBBA = MBBAllocs[&MBB];
+  MBBA.MIAllocs.push_back(MBBA.MIAllocs.back());
+  auto &Allocs = MBBA.MIAllocs.back();
+  for (auto &[Start, KV] : Allocs) {
+    for (auto &[End, AI] : KV) {
+      AI.IsCopy = false;
+      AI.PrevAlloc = End;
+    }
+  }
 }
 
 #if 0
@@ -1001,71 +1017,100 @@ void MOSRegAlloc::freeDef(AllocPoint &AP, const MachineOperand &MO) {
   LiveValues.erase(Val);
 }
 
+#endif
+
 // Find all transitively reachable allocs by spilling, restoring, and copying
 // registers.
-void MOSRegAlloc::shuffleAllocs(AllocPoint &AP) {
-  assert(AP.canInsert());
-  SetVector<Alloc> WorkList;
-  for (const auto &[A, _] : AP.AllocImpls)
-    WorkList.insert(A);
+void MOSRegAlloc::shuffleAllocs(const MachineBasicBlock &MBB) {
+  dbgs() << "Shuffling allocs\n";
+  for (auto &[StartA, AllocImpls] : MBBAllocs[&MBB].MIAllocs.back()) {
+    SmallVector<Alloc> StartAllocs;
+    for (const auto &[A, _] : AllocImpls)
+      StartAllocs.push_back(A);
 
-  // Record an implementation for an allocation if new or superior to the
-  // current implementation.
-  const auto Expand = [&](Alloc A, AllocImpl AI) {
-    if (recordAI(AP.AllocImpls, A, AI))
-      WorkList.insert(A);
-  };
+    // Worklist sorted by cost
+    std::map<unsigned, SmallVector<std::pair<Alloc, AllocImpl>>> WorkList;
 
-  // TODO: Realistic costs
-  // TODO: Realistic constraints
-  while (!WorkList.empty()) {
-    Alloc A = WorkList.pop_back_val();
-    AllocImpl AI = AP.AllocImpls[A];
-    for (Register R : Alloc::Regs) {
-      if (!A[R]) {
-        for (Register V : LiveValues) {
-          if (MRI->getType(V).getScalarSizeInBits() !=
-              TRI->getRegSizeInBits(R, *MRI))
+    // Run Dijkstra's to find the shortest-cost path to each alloc reachable
+    // from a StartAlloc by some shuffle. AllocImpls contains the closed allocs.
+    // TODO: Realistic costs
+    // TODO: Realistic constraints
+    while (!StartAllocs.empty() || !WorkList.empty()) {
+      // Find a lowest-cost alloc in the worklist. Due to the Dijkstra's
+      // invariant, the current path to this alloc will be a shortest path.
+      // Handle each starting alloc first, since the paths to each such alloc
+      // are necessarily the shortest.
+      Alloc A;
+      AllocImpl AI;
+      if (!StartAllocs.empty()) {
+        A = StartAllocs.pop_back_val();
+        AI = AllocImpls[A];
+        // The start allocs are present in AllocImpls, but they are not closed
+        // until StartAllocs empties.
+      } else {
+        // Find a worklist entry of lowest cost.
+        while (!WorkList.empty() && WorkList.begin()->second.empty())
+          WorkList.erase(WorkList.begin());
+        if (WorkList.empty())
+          break;
+        std::tie(A, AI) = WorkList.begin()->second.pop_back_val();
+
+        if (AllocImpls.contains(A))
+          continue;
+        // AI is a shortest path to A.
+        AllocImpls[A] = AI;
+      }
+      for (Register R : Alloc::Regs) {
+        if (!A[R]) {
+          const auto CanCopy = [&](Alloc &A, Register R, Register V) {
+            for (Register Other : Alloc::Regs)
+              if (Other != R && A[Other] == V)
+                return true;
+            return false;
+          };
+
+          for (Register V : LiveValues) {
+            if (MRI->getType(V).getScalarSizeInBits() !=
+                TRI->getRegSizeInBits(R, *MRI))
+              continue;
+
+            // Copy or reload V to R.
+            Alloc NewA = A;
+            NewA[R] = V;
+            if (AllocImpls.contains(NewA))
+              continue;
+            AllocImpl NewAI{AI.Cost + (CanCopy(A, R, V) ? 2 : 3),
+                            /*IsShuffle=*/true, A};
+            WorkList[NewAI.Cost].emplace_back(NewA, NewAI);
+          }
+        } else {
+          Register V = A[R];
+
+          // Don't copy/reload pinned physregs.
+          if (V.isPhysical())
             continue;
 
-          // R may have previously held V, but V was spilled to an imaginary
-          // register or simply forgotten.
+          // Forget V or spill it to an imaginary register.
           Alloc NewA = A;
-          NewA[R] = V;
-          Expand(NewA,
-                 {AI.Cost + (A.getReg(V) ? 0 : 3), /*IsShuffle=*/true, A});
+          NewA[R] = {};
+          if (AllocImpls.contains(NewA))
+            continue;
+          AllocImpl NewAI{AI.Cost + (NewA.getReg(V) ? 0 : 3),
+                          /*IsShuffle=*/true, A};
+          WorkList[NewAI.Cost].emplace_back(NewA, NewAI);
         }
-        continue;
       }
-
-      Register Val = A[R];
-
-      // Don't copy/reload pinned physregs.
-      if (Val.isPhysical())
-        continue;
-
-      const auto CanCopy = [&](Alloc &A, Register R, Register V) {
-        for (Register Other : Alloc::Regs)
-          if (Other != R && A[Other] == V)
-            return true;
-        return false;
-      };
-
-      // TODO: Allow reloading values that are already present. This
-      // will require keeping track of the 2^5=32 cardinality spill statuses
-      // for values presently in registers.
-      //
-      // R may now hold Val because it was copied from another register or
-      // reloaded from an imaginary register.
-      Alloc NewA = A;
-      NewA[R] = {};
-      Expand(NewA,
-             {AI.Cost + (CanCopy(A, R, Val) ? 2 : 3), /*IsShuffle=*/true, A});
     }
   }
 }
 
-#endif
+void MOSRegAlloc::dumpNumAllocs(const MachineBasicBlock &MBB) const {
+  unsigned NumAllocs = 0;
+  for (const auto &[_, KV] : MBBAllocs[&MBB].MIAllocs.back())
+    for (const auto &_ : KV)
+      NumAllocs++;
+  dbgs() << "Num allocs: " << NumAllocs << '\n';
+}
 
 // Apply the best found allocation implementation.
 void MOSRegAlloc::applyBestAlloc() {
