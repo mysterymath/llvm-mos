@@ -28,8 +28,10 @@
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
+#include "llvm/ProfileData/MemProf.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/FormatVariadic.h"
+#include <limits>
 
 #define DEBUG_TYPE "mos-reg-alloc"
 
@@ -183,7 +185,6 @@ bool operator<(const std::pair<Alloc, AllocImpl> &L,
 struct AllocPoint {
   MachineBasicBlock *MBB;
   MachineBasicBlock::iterator I;
-  DenseSet<Register> LiveValues;
 
   AllocPoint(MachineBasicBlock *MBB, MachineBasicBlock::iterator I)
       : MBB(MBB), I(I) {}
@@ -270,16 +271,20 @@ private:
 
   IndexedMap<MBBAlloc, MBB2NumberFunctor> MBBAllocs;
 
+  // Lists of live registers ordered by next use distance
+  IndexedMap<SmallVector<Register>, MBB2NumberFunctor> MBBEndNextUsed;
+  SmallVector<Register> RegCandValues;
+
   // SmallVector<TreeNode, 0> Tree;
 
   void rewriteSSAValues();
   Register rewriteSSAValue(Register R);
   LLT findRegType(Register R);
+  void initMBBEndNextUsed();
+  void dumpMBBEndNextUsed();
 
 #if 0
   void initAllocPoints();
-  void initLiveValues(const MachineDomTreeNode *SubTree,
-                      DenseSet<Register> LiveValues);
   SmallVector<unsigned> allocPointSuccessors(unsigned APIdx) const;
   SmallVector<unsigned> allocPointPredecessors(unsigned APIdx) const;
 
@@ -291,12 +296,14 @@ private:
 #endif
 
   void allocateMBB(const MachineBasicBlock &MBB);
+
   void allocateMBBStart(const MachineBasicBlock &MBB);
+  void selectRegCandValues(const MachineBasicBlock &MBB,
+                           MachineBasicBlock::const_iterator I);
   void allocateMI(const MachineInstr &MI);
   void newMIAllocs(const MachineBasicBlock &MBB);
   void shuffleAllocs(const MachineBasicBlock &MBB);
   void dumpNumAllocs(const MachineBasicBlock &MBB) const;
-  DenseSet<Register> LiveValues;
 
   void applyBestAlloc();
   void eliminateTrivialCopies();
@@ -345,7 +352,6 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
 #if 0
   initAllocPoints();
-  initLiveValues(MDT->getRootNode(), {});
 
   decomposeToTree();
   dumpAllocPoints();
@@ -353,6 +359,9 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
   allocatePhysRegs();
 #endif
+
+  initMBBEndNextUsed();
+  dumpMBBEndNextUsed();
 
   MBBAllocs.resize(MF.getNumBlockIDs());
   for (MachineBasicBlock &MBB : MF)
@@ -425,41 +434,6 @@ void MOSRegAlloc::initAllocPoints() {
     }
     MBBEndIdx[&MBB] = AllocPoints.size() - 1;
   }
-}
-
-void MOSRegAlloc::initLiveValues(const MachineDomTreeNode *SubTree,
-                                 DenseSet<Register> LiveValues) {
-  MachineBasicBlock &MBB = *SubTree->getBlock();
-  {
-    SmallVector<Register> Dead;
-    for (Register V : LiveValues)
-      if (V.isPhysical() || !LV->isLiveIn(V, MBB))
-        Dead.push_back(V);
-    for (Register V : Dead)
-      LiveValues.erase(V);
-  }
-
-  for (unsigned I = MBBStartIdx[&MBB], E = MBBEndIdx[&MBB];; ++I) {
-    AllocPoints[I].LiveValues = LiveValues;
-    if (I == E)
-      break;
-    MachineInstr &MI = *AllocPoints[I].I;
-    for (MachineOperand &MO : MI.operands()) {
-      if (!MO.isReg())
-        continue;
-      Register V = MO.getReg();
-      if (MO.isUse()) {
-        if (MO.isKill())
-          LiveValues.erase(V);
-      } else {
-        assert(MO.isDef());
-        if (!MO.isDead())
-          LiveValues.insert(V);
-      }
-    }
-  }
-  for (const auto *Child : SubTree->children())
-    initLiveValues(Child, LiveValues);
 }
 
 SmallVector<unsigned> MOSRegAlloc::allocPointSuccessors(unsigned APIdx) const {
@@ -821,6 +795,105 @@ void MOSRegAlloc::allocatePhysRegs(unsigned SubTreeIdx) {
 
 #endif
 
+void MOSRegAlloc::initMBBEndNextUsed() {
+  dbgs() << "Computing next used values at MBB ends.\n";
+
+  IndexedMap<DenseMap<Register, unsigned>, MBB2NumberFunctor>
+      MBBStartNextUseDists;
+  IndexedMap<DenseMap<Register, unsigned>, MBB2NumberFunctor>
+      MBBEndNextUseDists;
+  IndexedMap<size_t, MBB2NumberFunctor> MBBEndDist;
+  MBBStartNextUseDists.resize(MF->getNumBlockIDs());
+  MBBEndNextUseDists.resize(MF->getNumBlockIDs());
+  MBBEndDist.resize(MF->getNumBlockIDs());
+
+  const auto UpdateDist = [](DenseMap<Register, unsigned> &Dists, Register V,
+                             unsigned D) {
+    auto Res = Dists.try_emplace(V, D);
+    if (Res.second)
+      return true;
+    if (D < Res.first->second) {
+      Res.first->second = D;
+      return true;
+    }
+    return false;
+  };
+
+  for (const MachineBasicBlock &MBB : *MF) {
+    MBBEndDist[&MBB] = std::distance(MBB.getFirstNonPHI(), MBB.end());
+    for (const auto &[I, MI] :
+         enumerate(make_range(MBB.getFirstNonPHI(), MBB.end()))) {
+      for (const MachineOperand &MO : MI.uses()) {
+        if (!MO.isReg() || !MO.isUse() || MO.getReg().isPhysical())
+          continue;
+        UpdateDist(MBBStartNextUseDists[&MBB], MO.getReg(), I);
+      }
+    }
+  }
+
+  // Propagate until fixed point.
+  SetVector<const MachineBasicBlock *> WorkList;
+  for (const MachineBasicBlock &MBB : *MF)
+    WorkList.insert(&MBB);
+  while (!WorkList.empty()) {
+    const MachineBasicBlock &MBB = *WorkList.pop_back_val();
+
+    // TODO: Hard-prioritize loop backedges.
+    // TODO: Soft-prioritize more likely successors.
+    bool Dirty = false;
+    for (const MachineBasicBlock *Succ : MBB.successors()) {
+      for (const MachineInstr &MI : Succ->phis()) {
+        for (unsigned I = 1, E = MI.getNumOperands(); I != E; I += 2) {
+          if (MI.getOperand(I + 1).getMBB() != &MBB)
+            continue;
+          Dirty |= UpdateDist(MBBEndNextUseDists[&MBB],
+                              MI.getOperand(I).getReg(), 0);
+        }
+      }
+
+      // A PHI block counts as one instruction, since they are implemented as a
+      // single shuffle.
+      for (const auto &[R, D] : MBBStartNextUseDists[Succ])
+        Dirty |= UpdateDist(MBBEndNextUseDists[&MBB], R, D + 1);
+    }
+    if (!Dirty)
+      continue;
+
+    Dirty = false;
+    unsigned EndDist = MBBEndDist[&MBB];
+    for (const auto [R, D] : MBBEndNextUseDists[&MBB])
+      Dirty |= UpdateDist(MBBStartNextUseDists[&MBB], R, EndDist + D);
+
+    if (Dirty)
+      for (const MachineBasicBlock *Pred : MBB.predecessors())
+        WorkList.insert(Pred);
+  }
+
+  MBBEndNextUsed.resize(MF->getNumBlockIDs());
+  for (const MachineBasicBlock &MBB : *MF) {
+    const auto &Dists = MBBEndNextUseDists[&MBB];
+    SmallVector<std::pair<Register, unsigned>> NextUsed(Dists.begin(),
+                                                        Dists.end());
+    sort(NextUsed,
+         [](const std::pair<Register, unsigned> &L,
+            std::pair<Register, unsigned> &R) { return L.second < R.second; });
+    sort(NextUsed, [](const std::pair<Register, unsigned> &L,
+                      std::pair<Register, unsigned> &R) { return L.second < R.second; });
+    for (const auto [R, _] : NextUsed)
+      MBBEndNextUsed[&MBB].push_back(R);
+  }
+}
+
+void MOSRegAlloc::dumpMBBEndNextUsed() {
+  for (const MachineBasicBlock &MBB : *MF) {
+    dbgs() << "bb." << MBB.getNumber() << '.' << MBB.getName()
+           << " end next used values:";
+    for (Register V : MBBEndNextUsed[&MBB])
+      dbgs() << ' ' << printReg(V, TRI);
+    dbgs() << '\n';
+  }
+}
+
 void MOSRegAlloc::allocateMBB(const MachineBasicBlock &MBB) {
   allocateMBBStart(MBB);
   for (MachineBasicBlock::const_iterator I = MBB.getFirstNonPHI(),
@@ -840,15 +913,7 @@ void MOSRegAlloc::allocateMBB(const MachineBasicBlock &MBB) {
 }
 
 void MOSRegAlloc::allocateMBBStart(const MachineBasicBlock &MBB) {
-  LiveValues.clear();
-  for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
-    Register R = Register::index2VirtReg(I);
-    if (LV->isLiveIn(R, MBB))
-      LiveValues.insert(R);
-  }
-  for (const MachineInstr &MI : MBB.phis())
-    LiveValues.insert(MI.getOperand(0).getReg());
-
+  selectRegCandValues(MBB, MBB.getFirstNonPHI());
   SmallVector<Alloc> Allocs = {{}};
   SmallVector<Alloc> NewAllocs;
   // For each register, add all possible assignments of values to that register
@@ -859,7 +924,7 @@ void MOSRegAlloc::allocateMBBStart(const MachineBasicBlock &MBB) {
       // No value for register P.
       NewAllocs.push_back(A);
 
-      for (Register V : LiveValues) {
+      for (Register V : RegCandValues) {
         LLT Ty = MRI->getType(V);
         if (TRI->getRegSizeInBits(P, *MRI) != Ty.getSizeInBits())
           continue;
@@ -875,6 +940,27 @@ void MOSRegAlloc::allocateMBBStart(const MachineBasicBlock &MBB) {
   auto &MIAllocs = MBBAllocs[&MBB].MIAllocs.back();
   for (Alloc A : Allocs)
     MIAllocs[A][A] = AllocImpl{/*Cost=*/0, /*IsCopy=*/false, /*PrevAlloc=*/{}};
+}
+
+void MOSRegAlloc::selectRegCandValues(const MachineBasicBlock &MBB,
+                                      MachineBasicBlock::const_iterator I) {
+  RegCandValues.clear();
+  constexpr size_t MaxNumCands = 5;
+  MachineBasicBlock::const_iterator E = MBB.end();
+  for (; I != E; ++I) {
+    for (const MachineOperand &MO : I->uses()) {
+      if (!MO.isReg() || MO.isUndef() || MO.getReg().isPhysical())
+        continue;
+      RegCandValues.push_back(MO.getReg());
+      if (RegCandValues.size() == MaxNumCands)
+        return;
+    }
+  }
+  for (Register R : MBBEndNextUsed[&MBB]) {
+    RegCandValues.push_back(R);
+    if (RegCandValues.size() == MaxNumCands)
+      return;
+  }
 }
 
 void MOSRegAlloc::allocateMI(const MachineInstr &MI) {
@@ -1069,7 +1155,7 @@ void MOSRegAlloc::shuffleAllocs(const MachineBasicBlock &MBB) {
             return false;
           };
 
-          for (Register V : LiveValues) {
+          for (Register V : RegCandValues) {
             if (MRI->getType(V).getScalarSizeInBits() !=
                 TRI->getRegSizeInBits(R, *MRI))
               continue;
