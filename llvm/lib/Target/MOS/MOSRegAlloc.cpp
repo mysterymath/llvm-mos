@@ -156,6 +156,18 @@ template <> struct DenseMapInfo<SmallVector<Alloc>> {
 
 namespace {
 
+// A chain of allocations that can be followed backwards from the current
+// allocation.
+struct AllocImpl {
+  // Cost of using this impl.
+  unsigned Cost;
+
+  // True if the prev alloc is at this MI rather than the previous.
+  bool IsCopy;
+
+  Alloc PrevAlloc;
+};
+
 class MOSRegAlloc;
 
 class MOSRegAlloc : public MachineFunctionPass {
@@ -197,9 +209,17 @@ private:
 
   std::optional<LiveVariables> LV;
 
+  // For each machine instruction (plus the end), a map from end alloc to the
+  // best implementation.
+  SmallVector<DenseMap<Alloc, AllocImpl>> MIAllocs;
+
   void rewriteSSAValues();
   Register rewriteSSAValue(Register R);
   LLT findRegType(Register R);
+  void allocateMBB(const MachineBasicBlock &MBB);
+  void allocateMI(const MachineInstr &MI);
+  void allocateMO(const MachineOperand &MO);
+  void freeUse(const MachineOperand &MO);
 
   void applyBestAlloc();
   void eliminateTrivialCopies();
@@ -218,6 +238,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   LV.emplace(MF);
   MF.dump();
 
+  allocateMBB(*MF.begin());
   applyBestAlloc();
   MF.dump();
   // TODO: Return to SSA form for duplicate imagreg defs.
@@ -272,9 +293,37 @@ LLT MOSRegAlloc::findRegType(Register R) {
   return LLT::scalar(TRI->getRegSizeInBits(R, *MRI));
 }
 
-// Apply the best found allocation implementation.
-void MOSRegAlloc::applyBestAlloc() {
+void MOSRegAlloc::allocateMBB(const MachineBasicBlock &MBB) {
+  MIAllocs.emplace_back();
+  DenseMap<Alloc, AllocImpl> &StartAllocs = MIAllocs.back();
+  StartAllocs[{}] = AllocImpl{/*Cost=*/0, /*IsCopy=*/false, /*PrevAlloc=*/{}};
+  for (MachineBasicBlock::const_iterator I = MBB.getFirstNonPHI(),
+                                         E = MBB.end();
+       ; ++I) {
+    if (I == E)
+      break;
+    allocateMI(*I);
+  }
 }
+
+void MOSRegAlloc::allocateMI(const MachineInstr &MI) {
+  dbgs() << "Allocating MI: " << MI;
+  for (const MachineOperand &MO : MI.uses())
+    if (MO.isReg())
+      allocateMO(MO);
+  for (const MachineOperand &MO : MI.uses())
+    if (MO.isReg() && MO.isUse() && MO.isKill())
+      freeUse(MO);
+  for (const MachineOperand &MO : MI.defs())
+    allocateMO(MO);
+}
+
+void MOSRegAlloc::allocateMO(const MachineOperand &MO) {}
+
+void MOSRegAlloc::freeUse(const MachineOperand &MO) {}
+
+// Apply the best found allocation implementation.
+void MOSRegAlloc::applyBestAlloc() {}
 
 void MOSRegAlloc::eliminateTrivialCopies() {
   for (MachineBasicBlock &MBB : *MF)

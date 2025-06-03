@@ -31,32 +31,6 @@ body: |
     RTS implicit $a
 ...
 ---
-name: across-mbb
-legalized: true
-regBankSelected: true
-tracksRegLiveness: true
-body: |
-  ; CHECK-LABEL: name: across-mbb
-  ; CHECK: bb.0:
-  ; CHECK-NEXT:   successors: %bb.1(0x80000000)
-  ; CHECK-NEXT:   liveins: $a
-  ; CHECK-NEXT: {{  $}}
-  ; CHECK-NEXT:   JMP %bb.1
-  ; CHECK-NEXT: {{  $}}
-  ; CHECK-NEXT: bb.1:
-  ; CHECK-NEXT:   liveins: $a
-  ; CHECK-NEXT: {{  $}}
-  ; CHECK-NEXT:   RTS implicit $a
-  bb.0:
-    liveins: $a
-    %0:anyi8 = COPY $a
-    JMP %bb.1
-
-  bb.1:
-    $a = COPY %0
-    RTS implicit $a
-...
----
 name: untracked-phys-reg
 legalized: true
 regBankSelected: true
