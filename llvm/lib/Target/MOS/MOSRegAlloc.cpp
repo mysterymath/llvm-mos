@@ -301,7 +301,8 @@ private:
   void selectRegCandValues(const MachineBasicBlock &MBB,
                            MachineBasicBlock::const_iterator I);
   void allocateMI(const MachineInstr &MI);
-  void newMIAllocs(const MachineBasicBlock &MBB);
+  void allocateMO(const MachineOperand &MO);
+  void freeUse(const MachineOperand &MO);
   void shuffleAllocs(const MachineBasicBlock &MBB);
   void dumpNumAllocs(const MachineBasicBlock &MBB) const;
 
@@ -877,8 +878,9 @@ void MOSRegAlloc::initMBBEndNextUsed() {
     sort(NextUsed,
          [](const std::pair<Register, unsigned> &L,
             std::pair<Register, unsigned> &R) { return L.second < R.second; });
-    sort(NextUsed, [](const std::pair<Register, unsigned> &L,
-                      std::pair<Register, unsigned> &R) { return L.second < R.second; });
+    sort(NextUsed,
+         [](const std::pair<Register, unsigned> &L,
+            std::pair<Register, unsigned> &R) { return L.second < R.second; });
     for (const auto [R, _] : NextUsed)
       MBBEndNextUsed[&MBB].push_back(R);
   }
@@ -968,7 +970,6 @@ void MOSRegAlloc::allocateMI(const MachineInstr &MI) {
 
   dbgs() << "Allocating MI: " << MI;
 
-  newMIAllocs(MBB);
   dumpNumAllocs(MBB);
 
   if (!MI.isTerminator()) {
@@ -976,134 +977,114 @@ void MOSRegAlloc::allocateMI(const MachineInstr &MI) {
     dumpNumAllocs(MBB);
   }
 
-#if 0
-  for (const MachineOperand &MO : AP.I->operands())
-    if (MO.isReg() && MO.isDef())
-      allocateMO(AP, MO);
-  for (const MachineOperand &MO : AP.I->operands())
-    if (MO.isReg() && MO.isDef())
-      freeDef(AP, MO);
-  for (const MachineOperand &MO : AP.I->operands())
-    if (MO.isReg() && MO.isUse())
-      allocateMO(AP, MO);
-#endif
+  for (const MachineOperand &MO : MI.uses())
+    if (MO.isReg())
+      allocateMO(MO);
+  for (const MachineOperand &MO : MI.uses())
+    if (MO.isReg() && MO.isUse() && MO.isKill())
+      freeUse(MO);
+  for (const MachineOperand &MO : MI.defs())
+    allocateMO(MO);
 }
 
-// Initialize a new alloc table to point back to the previous table's End
-// allocs.
-void MOSRegAlloc::newMIAllocs(const MachineBasicBlock &MBB) {
-  MBBAlloc &MBBA = MBBAllocs[&MBB];
-  MBBA.MIAllocs.push_back(MBBA.MIAllocs.back());
-  auto &Allocs = MBBA.MIAllocs.back();
-  for (auto &[Start, KV] : Allocs) {
-    for (auto &[End, AI] : KV) {
-      AI.IsCopy = false;
-      AI.PrevAlloc = End;
-    }
-  }
-}
+void MOSRegAlloc::allocateMO(const MachineOperand &MO) {
+  Register V = MO.getReg();
 
-#if 0
-void MOSRegAlloc::allocateMO(AllocPoint &AP, const MachineOperand &MO) {
-  const MachineInstr &MI = *AP.I;
-  Register Val = MO.getReg();
+  const TargetRegisterClass *RC =
+      TII->getRegClass(MO.getParent()->getDesc(), MO.getOperandNo(), TRI, *MF);
 
-  // Determine the possible set of physical registers that Val could be / could
-  // have been stored in.
-  SmallVector<Register, 5> PhysRegs;
-  if (Val.isPhysical()) {
-    // Physical registers are considered to be some unique unknown value,
-    // constrained to that physical register.
-    Register R = Val;
-    PhysRegs.push_back(R);
-  } else {
-    assert(Val.isVirtual());
-    if (MI.getOpcode() == MOS::COPY) {
-      Register R =
-          MO.isDef() ? MI.getOperand(1).getReg() : MI.getOperand(0).getReg();
-      assert(R.isPhysical() && "vreg-vreg COPY not allowed");
-      PhysRegs.push_back(R);
-    } else {
-      const TargetRegisterClass *RC =
-          TII->getRegClass(MI.getDesc(), MO.getOperandNo(), TRI, *MF);
-      assert(RC && "TODO");
-      for (Register R : *RC)
-        PhysRegs.push_back(R);
-    }
+  // Some operands effectively have a single register class. In such cases, RC
+  // is null.
+  Register RegRC;
+  if (Val.isVirtual() && MO.getParent()->getOpcode() == MOS::COPY) {
+    RegRC = MO.isDef() ? MO.getParent()->getOperand(1).getReg()
+                       : MO.getParent()->getOperand(0).getReg();
+    assert(RegRC.isPhysical() && "vreg-vreg COPY not allowed");
   }
+
   // If none of the possible physical registers are tracked, then this operand
   // has no impact on the effective allocation.
-  llvm::erase_if(PhysRegs, [](Register R) { return !Alloc::isTracked(R); });
-  if (PhysRegs.empty())
+  if (RC) {
+    if (none_of(*RC, [](Register R) { return Alloc::isTracked(R); }))
+      return;
+  } else if (!Alloc::isTracked(RegRC)) {
     return;
+  }
 
-  DenseMap<Alloc, AllocImpl> NewAIs;
-  for (const auto &[A, AI] : AP.AllocImpls) {
-    for (Register R : PhysRegs) {
-      Alloc NewA = A;
-      if (MO.isDef()) {
-        // Live defs require that the register hold the correct value.
-        // Dead defs require only that the register is free.
-        if (LiveValues.contains(Val) ? NewA[R] != Val : !!NewA[R])
-          continue;
+  auto &Allocs = MBBAllocs[MO.getParent()->getParent()].MIAllocs.back();
+  DenseMap<Alloc, DenseMap<Alloc, AllocImpl>> NewAllocs;
 
-        // An operand defines at most one register.
-        bool CanDef = true;
-        for (Register Other : Alloc::Regs) {
-          if (Other != R && NewA[Other] == Val) {
-            CanDef = false;
-            break;
+  for (auto &[StartA, EndAllocs] : Allocs) {
+    DenseMap<Alloc, AllocImpl> &NewEndAllocs = NewAllocs[StartA];
+    for (auto &[EndA, AI] : EndAllocs) {
+      if (MO.isUse()) {
+        if (RC) {
+          const auto &EndARef = EndA;
+          if (none_of(Alloc::Regs, [&](Register R) {
+                return EndARef[R] == V && RC->contains(R);
+              }))
+            continue;
+        } else {
+          assert(RegRC && "expected either RC or single register constraint");
+          if (EndA[RegRC] != V)
+            continue;
+        }
+        NewEndAllocs[EndA] = AI;
+      } else {
+        assert(MO.isDef());
+      }
+
+#if 0
+        if (MO.isDef()) {
+          // Live defs require that the register hold the correct value.
+          // Dead defs require only that the register is free.
+          if (LV->isLiveOut(Val, *MO.getParent()->getParent())
+                  ? NewEndA[R] != Val
+                  : !!NewEndA[R])
+            continue;
+
+          // An operand defines at most one register.
+          bool CanDef = true;
+          for (Register Other : Alloc::Regs) {
+            if (Other != R && NewEndA[Other] == Val) {
+              CanDef = false;
+              break;
+            }
+          }
+          if (!CanDef)
+            continue;
+
+          NewEndA[R] = Val;
+          NewAllocs[StartA][NewEndA] = AI;
+        } else {
+          assert(MO.isUse());
+          if (!NewEndA[R]) {
+            NewEndA[R] = Val;
+            NewAllocs[StartA][NewEndA] = AI;
           }
         }
-        if (!CanDef)
-          continue;
-
-        if (CanDef)
-          NewAIs.try_emplace(NewA, AI);
-      } else {
-        assert(MO.isUse());
-        if (!NewA[R]) {
-          NewA[R] = Val;
-          NewAIs.try_emplace(NewA, AI);
-        }
-      }
+#endif
     }
   }
-  AP.AllocImpls = std::move(NewAIs);
-
-  if (MO.isUse())
-    LiveValues.insert(Val);
+  Allocs = std::move(NewAllocs);
 }
 
-static bool recordAI(DenseMap<Alloc, AllocImpl> &AIs, const Alloc &A,
-                     const AllocImpl &AI) {
-  auto Result = AIs.try_emplace(A, AI);
-  if (Result.second)
-    return true;
-  if (AI.Cost < Result.first->second.Cost) {
-    Result.first->second = AI;
-    return true;
-  }
-  return false;
-}
-
-// After all defs have been allocated, they must be freed before the uses are
-// handled.
-void MOSRegAlloc::freeDef(AllocPoint &AP, const MachineOperand &MO) {
-  DenseMap<Alloc, AllocImpl> NewAIs;
+void MOSRegAlloc::freeUse(const MachineOperand &MO) {
   Register Val = MO.getReg();
-  for (const auto &[A, AI] : AP.AllocImpls) {
-    Alloc NewA = A;
-    for (Register R : Alloc::Regs)
-      if (NewA[R] == Val)
-        NewA[R] = {};
-    recordAI(NewAIs, NewA, AI);
-  }
-  AP.AllocImpls = std::move(NewAIs);
-  LiveValues.erase(Val);
-}
+  auto &Allocs = MBBAllocs[MO.getParent()->getParent()].MIAllocs.back();
+  DenseMap<Alloc, DenseMap<Alloc, AllocImpl>> NewAllocs;
 
-#endif
+  for (auto &[StartA, EndAllocs] : Allocs) {
+    for (auto &[EndA, AI] : EndAllocs) {
+      Alloc NewEndA = EndA;
+      for (Register R : Alloc::Regs)
+        if (NewEndA[R] == Val)
+          NewEndA[R] = {};
+      NewAllocs[StartA][NewEndA] = AI;
+    }
+  }
+  Allocs = std::move(NewAllocs);
+}
 
 // Find all transitively reachable allocs by spilling, restoring, and copying
 // registers.
