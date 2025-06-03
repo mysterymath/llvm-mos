@@ -39,6 +39,9 @@ namespace {
 
 // An allocation of values for each tracked architectural register.
 struct Alloc {
+  static constexpr std::array<Register, 5> Regs = {MOS::A, MOS::X, MOS::Y,
+                                                   MOS::C, MOS::V};
+
   Register A, X, Y, C, V;
 
   static bool isTracked(Register R) {
@@ -168,6 +171,11 @@ struct AllocImpl {
   Alloc PrevAlloc;
 };
 
+bool operator<(const std::pair<Alloc, AllocImpl> &L,
+               const std::pair<Alloc, AllocImpl> &R) {
+  return L.second.Cost < R.second.Cost;
+}
+
 class MOSRegAlloc;
 
 class MOSRegAlloc : public MachineFunctionPass {
@@ -197,8 +205,6 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override;
 
 private:
-  friend struct TreeNode;
-
   MachineFunction *MF;
   MachineRegisterInfo *MRI;
   const TargetInstrInfo *TII;
@@ -212,6 +218,7 @@ private:
   // For each machine instruction (plus the end), a map from end alloc to the
   // best implementation.
   SmallVector<DenseMap<Alloc, AllocImpl>> MIAllocs;
+  DenseMap<Alloc, AllocImpl> NextAllocs;
 
   void rewriteSSAValues();
   Register rewriteSSAValue(Register R);
@@ -220,6 +227,9 @@ private:
   void allocateMI(const MachineInstr &MI);
   void allocateMO(const MachineOperand &MO);
   void freeUse(const MachineOperand &MO);
+
+  std::optional<Register> selectBestOperandReg(Alloc A,
+                                               const MachineOperand &MO);
 
   void applyBestAlloc();
   void eliminateTrivialCopies();
@@ -237,10 +247,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   rewriteSSAValues();
   LV.emplace(MF);
   MF.dump();
-
   allocateMBB(*MF.begin());
   applyBestAlloc();
-  MF.dump();
   // TODO: Return to SSA form for duplicate imagreg defs.
   eliminateTrivialCopies();
   computeLiveIns();
@@ -296,7 +304,15 @@ LLT MOSRegAlloc::findRegType(Register R) {
 void MOSRegAlloc::allocateMBB(const MachineBasicBlock &MBB) {
   MIAllocs.emplace_back();
   DenseMap<Alloc, AllocImpl> &StartAllocs = MIAllocs.back();
-  StartAllocs[{}] = AllocImpl{/*Cost=*/0, /*IsCopy=*/false, /*PrevAlloc=*/{}};
+  assert(MBB.isEntryBlock() && "TODO");
+  Alloc Entry;
+  for (auto LiveIn : MBB.liveins()) {
+    assert(LiveIn.LaneMask.all() && "TODO");
+    if (Alloc::isTracked(LiveIn.PhysReg))
+      Entry[LiveIn.PhysReg] = LiveIn.PhysReg;
+  }
+  StartAllocs[Entry] =
+      AllocImpl{/*Cost=*/0, /*IsCopy=*/false, /*PrevAlloc=*/{}};
   for (MachineBasicBlock::const_iterator I = MBB.getFirstNonPHI(),
                                          E = MBB.end();
        ; ++I) {
@@ -308,6 +324,14 @@ void MOSRegAlloc::allocateMBB(const MachineBasicBlock &MBB) {
 
 void MOSRegAlloc::allocateMI(const MachineInstr &MI) {
   dbgs() << "Allocating MI: " << MI;
+
+  // Instantiate new allocs for MI.
+  MIAllocs.emplace_back(MIAllocs.back());
+  for (auto &[A, AI] : MIAllocs.back()) {
+    AI.IsCopy = false;
+    AI.PrevAlloc = A;
+  }
+
   for (const MachineOperand &MO : MI.uses())
     if (MO.isReg())
       allocateMO(MO);
@@ -318,12 +342,101 @@ void MOSRegAlloc::allocateMI(const MachineInstr &MI) {
     allocateMO(MO);
 }
 
-void MOSRegAlloc::allocateMO(const MachineOperand &MO) {}
+void MOSRegAlloc::allocateMO(const MachineOperand &MO) {
+  Register V = MO.getReg();
 
-void MOSRegAlloc::freeUse(const MachineOperand &MO) {}
+  SmallVector<Register> Regs;
+  if (V.isVirtual()) {
+    if (MO.getParent()->isCopy()) {
+      const MachineInstr &MI = *MO.getParent();
+      Regs.push_back(MI.getOperand(MI.getOperandNo(&MO) == 0 ? 1 : 0).getReg());
+    } else {
+      append_range(Regs, *TII->getRegClass(MO.getParent()->getDesc(),
+                                           MO.getOperandNo(), TRI, *MF));
+    }
+  } else {
+    Regs.push_back(V);
+  }
+  if (llvm::none_of(Regs, Alloc::isTracked))
+    return;
+
+  auto &Allocs = MIAllocs.back();
+  NextAllocs.clear();
+  for (auto &[A, AI] : Allocs) {
+    if (MO.isDef()) {
+      for (Register R : Regs) {
+        if (A[R])
+          continue;
+        Alloc NewA = A;
+        if (!MO.isDead())
+          NewA[R] = V;
+        NextAllocs[NewA] = AI;
+      }
+    } else {
+      // TODO: Test for undef use
+      assert(MO.isUse());
+      Alloc &ARef = A;
+      if (llvm::any_of(Regs, [&](Register R) {
+            return Alloc::isTracked(R) && ARef[R] == V;
+          }))
+        NextAllocs[A] = AI;
+    }
+  }
+  Allocs.swap(NextAllocs);
+}
+
+void MOSRegAlloc::freeUse(const MachineOperand &MO) {
+  Register V = MO.getReg();
+  auto &Allocs = MIAllocs.back();
+  NextAllocs.clear();
+  for (auto &[A, AI] : Allocs) {
+    Alloc NewA = A;
+    for (Register R : Alloc::Regs)
+      if (A[R] == V)
+        NewA[R] = {};
+    NextAllocs[NewA] = AI;
+  }
+  Allocs.swap(NextAllocs);
+}
+
+std::optional<Register>
+MOSRegAlloc::selectBestOperandReg(Alloc A, const MachineOperand &MO) {
+  // TODO: Pick an register that meets RC and tie constraints. Merge this
+  // logic with the code in allocateMO.
+  return A.getReg(MO.getReg());
+}
 
 // Apply the best found allocation implementation.
-void MOSRegAlloc::applyBestAlloc() {}
+void MOSRegAlloc::applyBestAlloc() {
+  MachineBasicBlock &MBB = *MF->begin();
+  dbgs() << "Applying best alloc.\n";
+  unsigned I = MIAllocs.size() - 1;
+  const auto Best = min_element(MIAllocs[I]);
+  if (Best == MIAllocs[I].end())
+    report_fatal_error("register allocation failed");
+  Alloc A = Best->first;
+  AllocImpl AI = Best->second;
+  for (MachineInstr &MI :
+       llvm::reverse(llvm::make_range(MBB.getFirstNonPHI(), MBB.end()))) {
+    assert(!AI.IsCopy && "TODO");
+    for (MachineOperand &MO : MI.defs()) {
+      if (!MO.getReg().isVirtual())
+        continue;
+      MO.setReg(*selectBestOperandReg(A, MO));
+    }
+
+    A = AI.PrevAlloc;
+    AI = MIAllocs[--I].at(AI.PrevAlloc);
+
+    for (MachineOperand &MO : MI.uses()) {
+      if (!MO.isReg() || !MO.getReg().isVirtual())
+        continue;
+      MO.setReg(*selectBestOperandReg(A, MO));
+    }
+
+    // TODO: Shuffles
+  }
+}
 
 void MOSRegAlloc::eliminateTrivialCopies() {
   for (MachineBasicBlock &MBB : *MF)
