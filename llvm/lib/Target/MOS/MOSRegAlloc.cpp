@@ -64,6 +64,9 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override;
 
 private:
+  using AllocPoint =
+      std::pair<MachineBasicBlock *, MachineBasicBlock::iterator>;
+
   MachineFunction *MF;
   MachineRegisterInfo *MRI;
   const TargetInstrInfo *TII;
@@ -73,10 +76,13 @@ private:
   SmallVector<Register, 0> RewrittenVReg;
 
   std::optional<LiveVariables> LV;
+  SmallVector<AllocPoint, 0> AllocPoints;
 
   void rewriteSSAValues();
   Register rewriteSSAValue(Register R);
   LLT findRegType(Register R);
+
+  void initAllocPoints();
 
   void eliminateTrivialCopies();
   void computeLiveIns();
@@ -93,6 +99,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   rewriteSSAValues();
   LV.emplace(MF);
   MF.dump();
+  initAllocPoints();
   eliminateTrivialCopies();
   computeLiveIns();
   MF.dump();
@@ -142,6 +149,14 @@ LLT MOSRegAlloc::findRegType(Register R) {
   if (Ty.isValid())
     return Ty;
   return LLT::scalar(TRI->getRegSizeInBits(R, *MRI));
+}
+
+void MOSRegAlloc::initAllocPoints() {
+  AllocPoints.clear();
+  for (MachineBasicBlock &MBB : *MF)
+    for (MachineBasicBlock::iterator I = MBB.getFirstNonPHI(), E = MBB.end();
+         I != E; ++I)
+      AllocPoints.emplace_back(&MBB, I);
 }
 
 void MOSRegAlloc::eliminateTrivialCopies() {
