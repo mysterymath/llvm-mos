@@ -222,6 +222,10 @@ private:
 
   SmallSet<Register, 16> RegCandValues;
 
+  // Physical registers that have been assigned a value directly. These must
+  // retain their value until the physical register is killed.
+  SmallSet<Register, 5> PinnedRegs;
+
   void rewriteSSAValues();
   Register rewriteSSAValue(Register R);
   LLT findRegType(Register R);
@@ -320,17 +324,14 @@ void MOSRegAlloc::allocateMBB(const MachineBasicBlock &MBB) {
       RegCandValues.insert(V);
   }
 
-  Alloc Entry;
+  PinnedRegs.clear();
   for (auto LiveIn : MBB.liveins()) {
     assert(LiveIn.LaneMask.all() && "TODO");
-    if (Alloc::isTracked(LiveIn.PhysReg)) {
-      Entry[LiveIn.PhysReg] = LiveIn.PhysReg;
-      RegCandValues.insert(LiveIn.PhysReg);
-    }
+    if (Alloc::isTracked(LiveIn.PhysReg))
+      PinnedRegs.insert(LiveIn.PhysReg);
   }
 
-  StartAllocs[Entry] =
-      AllocImpl{/*Cost=*/0, /*IsCopy=*/false, /*PrevAlloc=*/{}};
+  StartAllocs[{}] = AllocImpl{/*Cost=*/0, /*IsCopy=*/false, /*PrevAlloc=*/{}};
 
   for (MachineBasicBlock::const_iterator I = MBB.getFirstNonPHI(),
                                          E = MBB.end();
@@ -372,19 +373,30 @@ void MOSRegAlloc::allocateMI(const MachineInstr &MI) {
 }
 
 void MOSRegAlloc::allocateMO(const MachineOperand &MO) {
+  const MachineInstr &MI = *MO.getParent();
   Register V = MO.getReg();
 
+  // Find the registers that the given value could possible be assigned to.
   SmallVector<Register> Regs;
+  bool IsPinned = false;
   if (V.isVirtual()) {
-    if (MO.getParent()->isCopy()) {
-      const MachineInstr &MI = *MO.getParent();
-      Regs.push_back(MI.getOperand(MI.getOperandNo(&MO) == 0 ? 1 : 0).getReg());
+    if (MI.isCopy()) {
+      // A vreg -> physreg copy is handled entirely at the def; the use is
+      // not considered to constrain location.
+      if (MO.isUse())
+        return;
+      // This is a physreg -> vreg copy, so the only legal register for the vreg
+      // is the physreg, since we consider such copies no-ops.
+      Regs.push_back(MI.getOperand(1).getReg());
     } else {
       append_range(Regs, *TII->getRegClass(MO.getParent()->getDesc(),
                                            MO.getOperandNo(), TRI, *MF));
     }
   } else {
+    IsPinned = true;
     Regs.push_back(V);
+    // We don't explicitly track the values of physregs until copied to vregs.
+    V = MOS::NoRegister;
   }
   if (llvm::none_of(Regs, Alloc::isTracked))
     return;
@@ -405,20 +417,33 @@ void MOSRegAlloc::allocateMO(const MachineOperand &MO) {
       assert(MO.isUse());
       Alloc &ARef = A;
       if (llvm::any_of(Regs, [&](Register R) {
-            return Alloc::isTracked(R) && ARef[R] == V;
+            return Alloc::isTracked(R) &&
+                   (ARef[R] == V || PinnedRegs.contains(V));
           }))
         recordAllocImpl(A, AI);
     }
   }
   MIAllocs.back().swap(NextAllocs);
 
-  if (MO.isDef() && !MO.isDead())
-    RegCandValues.insert(V);
+  if (MO.isDef() && !MO.isDead()) {
+    if (V)
+      RegCandValues.insert(V);
+    if (IsPinned) {
+      assert(Regs.size() == 1);
+      PinnedRegs.insert(Regs.front());
+    }
+  }
 }
 
 void MOSRegAlloc::freeUse(const MachineOperand &MO) {
   NextAllocs.clear();
   Register V = MO.getReg();
+
+  if (V.isPhysical()) {
+    PinnedRegs.erase(V);
+    return;
+  }
+
   for (auto &[A, AI] : MIAllocs.back()) {
     Alloc NewA = A;
     for (Register R : Alloc::Regs)
@@ -427,7 +452,6 @@ void MOSRegAlloc::freeUse(const MachineOperand &MO) {
     recordAllocImpl(NewA, AI);
   }
   MIAllocs.back().swap(NextAllocs);
-
   RegCandValues.erase(V);
 }
 
@@ -476,6 +500,8 @@ void MOSRegAlloc::shuffleAllocs(const MachineBasicBlock &MBB) {
     NextAllocs[A] = AI;
 
     for (Register R : Alloc::Regs) {
+      if (PinnedRegs.contains(R))
+        continue;
       if (!A[R]) {
         for (Register V : RegCandValues) {
           // Ensure that R is a suitable register to hold V.
@@ -501,9 +527,8 @@ void MOSRegAlloc::shuffleAllocs(const MachineBasicBlock &MBB) {
           WorkList[NewAI.Cost].emplace_back(NewA, NewAI);
         }
       } else {
+        // Forget the value or spill it to an imaginary register.
         Register V = A[R];
-
-        // Forget V or spill it to an imaginary register.
         Alloc NewA = A;
         NewA[R] = {};
         if (NextAllocs.contains(NewA))
