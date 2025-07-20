@@ -169,6 +169,14 @@ struct AllocImpl {
   bool IsCopy;
 
   Alloc PrevAlloc;
+
+  void print(raw_ostream &OS, const TargetRegisterInfo *TRI) const {
+    dbgs() << "Cost: " << Cost << '\n';
+    dbgs() << "IsCopy: " << IsCopy << '\n';
+    dbgs() << "PrevAlloc:\n";
+    PrevAlloc.print(dbgs(), TRI);
+    dbgs() << '\n';
+  }
 };
 
 bool operator<(const std::pair<Alloc, AllocImpl> &L,
@@ -237,7 +245,8 @@ private:
   std::optional<Register> selectBestOperandReg(Alloc A,
                                                const MachineOperand &MO);
   void shuffleAllocs(const MachineBasicBlock &MBB);
-  void dumpNumAllocs(const MachineBasicBlock &MBB) const;
+  void dumpNumAllocs() const;
+  void dumpAllocs() const;
 
   void recordAllocImpl(Alloc A, AllocImpl AI);
 
@@ -543,8 +552,21 @@ void MOSRegAlloc::shuffleAllocs(const MachineBasicBlock &MBB) {
   MIAllocs.back().swap(NextAllocs);
 }
 
-void MOSRegAlloc::dumpNumAllocs(const MachineBasicBlock &MBB) const {
+void MOSRegAlloc::dumpNumAllocs() const {
   dbgs() << "Num allocs: " << MIAllocs.back().size() << '\n';
+}
+
+void MOSRegAlloc::dumpAllocs() const {
+  dbgs() << "Allocs:\n";
+  for (const auto &[A, AI] : MIAllocs.back()) {
+    A.print(dbgs(), TRI);
+    AI.print(dbgs(), TRI);
+    dbgs() << '\n';
+  }
+  dbgs() << "Pinned regs:";
+  for (Register R : PinnedRegs)
+    dbgs() << ' ' << printReg(R, TRI);
+  dbgs() << '\n';
 }
 
 // For the next set of allocs, if the given alloc impl is better than the
