@@ -44,6 +44,7 @@
 #include "MOSMachineFunctionInfo.h"
 #include "MOSMachineScheduler.h"
 #include "MOSNonReentrant.h"
+#include "MOSRegAlloc.h"
 #include "MOSPostRAScavenging.h"
 #include "MOSShiftRotateChain.h"
 #include "MOSStaticStackAlloc.h"
@@ -66,6 +67,7 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeMOSTarget() {
   initializeMOSLateOptimizationPass(PR);
   initializeMOSLowerSelectPass(PR);
   initializeMOSNonReentrantPass(PR);
+  initializeMOSRegAllocPass(PR);
   initializeMOSPostRAScavengingPass(PR);
   initializeMOSShiftRotateChainPass(PR);
   initializeMOSStaticStackAllocPass(PR);
@@ -285,16 +287,7 @@ void MOSPassConfig::addMachineSSAOptimization() {
 }
 
 void MOSPassConfig::addOptimizedRegAlloc() {
-  if (getOptLevel() != CodeGenOptLevel::None) {
-    // Run the coalescer twice to coalesce RMW patterns revealed by the first
-    // coalesce.
-    insertPass(&llvm::TwoAddressInstructionPassID, &llvm::RegisterCoalescerID);
-
-    // Re-run Live Intervals after coalescing to renumber the contained values.
-    // This can allow constant rematerialization after aggressive coalescing.
-    insertPass(&llvm::MachineSchedulerID, &llvm::LiveIntervalsID);
-  }
-  TargetPassConfig::addOptimizedRegAlloc();
+  addPass(createMOSRegAllocPass());
 }
 
 void MOSPassConfig::addMachineLateOptimization() {
