@@ -46,6 +46,7 @@
 #include "MOSNonReentrant.h"
 #include "MOSRegAlloc.h"
 #include "MOSPostRAScavenging.h"
+#include "MOSRegAllocPrepare.h"
 #include "MOSShiftRotateChain.h"
 #include "MOSStaticStackAlloc.h"
 #include "MOSTargetObjectFile.h"
@@ -69,6 +70,7 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeMOSTarget() {
   initializeMOSNonReentrantPass(PR);
   initializeMOSRegAllocPass(PR);
   initializeMOSPostRAScavengingPass(PR);
+  initializeMOSRegAllocPreparePass(PR);
   initializeMOSShiftRotateChainPass(PR);
   initializeMOSStaticStackAllocPass(PR);
   initializeMOSZeroPageAllocPass(PR);
@@ -288,6 +290,19 @@ void MOSPassConfig::addMachineSSAOptimization() {
 
 void MOSPassConfig::addOptimizedRegAlloc() {
   addPass(createMOSRegAllocPass());
+  addPass(createMOSRegAllocPreparePass());
+
+  // Perform stack slot coloring and post-ra machine LICM.
+  addPass(&StackSlotColoringID);
+
+  // Copy propagate to forward register uses and try to eliminate COPYs that
+  // were not coalesced.
+  addPass(&MachineCopyPropagationID);
+
+  // Run post-ra machine LICM to hoist reloads / remats.
+  //
+  // FIXME: can this move into MachineLateOptimization?
+  addPass(&MachineLICMID);
 }
 
 void MOSPassConfig::addMachineLateOptimization() {
