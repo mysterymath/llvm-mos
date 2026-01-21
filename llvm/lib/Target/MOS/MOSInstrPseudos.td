@@ -37,6 +37,14 @@ class MOSPseudo : Instruction {
 // registers before and after the pseudo.
 //===---------------------------------------------------------------------===//
 
+// Parallel (simulatneous) version of copy. Part of out-of-SSA transition in
+// regalloc.
+def PCOPY : MOSPseudo {
+  dag OutOperandList = (outs Imag16:$scratch_ptr, Imag16:$scratch_reg, variable_ops);
+  dag InOperandList = (ins variable_ops);
+  let Constraints = "@earlyclobber $scratch_ptr,@earlyclobber $scratch_reg";
+}
+
 // Abstracts LDAZpIdx and LDYIdx. LDXIdx isn't yet supported, since there's no
 // good way to save and restore $x on a NMOS 6502 when lowering $a = LDZpIdx
 // $y.
