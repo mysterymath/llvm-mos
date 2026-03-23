@@ -131,10 +131,18 @@ public:
       if (MI.isDebugInstr())
         continue;
 
-      // Defs kill vregs.
-      for (MachineOperand &MO : MI.operands())
-        if (MO.isReg() && MO.getReg().isVirtual() && MO.isDef())
-          Live.erase(MO.getReg());
+      // Defs kill vregs. Tied defs must match their use's register.
+      for (MachineOperand &MO : MI.operands()) {
+        if (!MO.isReg() || !MO.getReg().isVirtual() || !MO.isDef())
+          continue;
+        if (MO.isTied()) {
+          Register UseReg =
+              MI.getOperand(MI.findTiedOperandIdx(MO.getOperandNo())).getReg();
+          if (UseReg.isVirtual())
+            int_rel(RegVar[MO.getReg()], IRT_EQ, RegVar[UseReg], 0);
+        }
+        Live.erase(MO.getReg());
+      }
 
       // Uses make vregs live. A newly-live vreg interferes with
       // everything already live.

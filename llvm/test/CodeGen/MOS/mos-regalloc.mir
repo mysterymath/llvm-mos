@@ -133,3 +133,26 @@ body: |
     $a = COPY %1
     RTS implicit $a
 ...
+
+# Tied operands: ASL ties its def to its use (shift in place).
+# %0 and %1 must get the same register.
+---
+name: tied_operands
+legalized: true
+regBankSelected: true
+selected: true
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: tied_operands
+    ; CHECK: $a = LDImm 42
+    ; CHECK-NEXT: $a = COPY killed $a
+    ; CHECK-NEXT: $a, dead $c = ASL killed $a
+    ; CHECK-NEXT: $a = COPY killed $a
+    ; CHECK-NEXT: RTS implicit killed $a
+    %0:gpr = LDImm 42
+    %3:aimag8 = COPY %0
+    %1:aimag8, %2:cc = ASL %3
+    $a = COPY %1
+    RTS implicit $a
+...
