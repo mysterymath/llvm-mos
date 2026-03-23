@@ -1,0 +1,22 @@
+---
+BasedOnStyle: Google
+
+UseTab: ForContinuationAndIndentation
+IndentWidth: 2
+TabWidth: 2
+ColumnLimit: 100
+DerivePointerAlignment: false
+AccessModifierOffset: -2
+QualifierAlignment: Left
+
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex:           '^(<thirdparty/)'
+    Priority:        3
+    SortPriority:    3
+  - Regex:           '^(<)'
+    Priority:        2
+    SortPriority:    2
+  - Regex:           '.*'
+    Priority:        1
+    SortPriority:    1
