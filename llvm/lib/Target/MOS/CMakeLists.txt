@@ -81,6 +81,9 @@ add_llvm_target(MOSCodeGen
   MOS
 )
 
+# Chuffed CP solver (used by MOS register allocator)
+target_link_libraries(LLVMMOSCodeGen PRIVATE chuffed)
+
 add_subdirectory(AsmParser)
 add_subdirectory(Disassembler)
 add_subdirectory(MCTargetDesc)

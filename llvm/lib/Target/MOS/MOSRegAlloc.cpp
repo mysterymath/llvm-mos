@@ -18,6 +18,13 @@
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/InitializePasses.h"
+#include "llvm/Support/Debug.h"
+
+#include "chuffed/core/engine.h"
+#include "chuffed/core/options.h"
+#include "chuffed/globals/globals.h"
+#include "chuffed/primitives/primitives.h"
+#include "chuffed/vars/modelling.h"
 
 #define DEBUG_TYPE "mos-regalloc"
 
@@ -36,9 +43,39 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override;
 };
 
+/// Smoke test: create a trivial Chuffed CP problem and solve it.
+/// This verifies that Chuffed headers, linking, and runtime all work
+/// from within the LLVM pass.
+namespace {
+class ChuffedSmokeTest : public Problem {
+public:
+  IntVar *x, *y;
+
+  ChuffedSmokeTest() {
+    x = newIntVar(1, 5);
+    y = newIntVar(1, 5);
+    int_rel(x, IRT_NE, y, 0);
+    vec<IntVar *> vars;
+    vars.push(x);
+    vars.push(y);
+    branch(vars, VAR_SIZE_MIN, VAL_MIN);
+    optimize(x, OPT_MIN);
+  }
+
+  void print(std::ostream &os) override {
+    os << "x=" << x->getVal() << " y=" << y->getVal() << "\n";
+  }
+};
+} // namespace
+
 bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
-  // Placeholder implementation. The MOS-specific allocator will be introduced
-  // in follow-up patches.
+  LLVM_DEBUG(dbgs() << "MOS RegAlloc: Chuffed smoke test\n");
+  LLVM_DEBUG({
+    so.nof_solutions = 1;
+    so.print_sol = false;
+    engine.solve(new ChuffedSmokeTest());
+    dbgs() << "MOS RegAlloc: Chuffed OK\n";
+  });
   return false;
 }
 
