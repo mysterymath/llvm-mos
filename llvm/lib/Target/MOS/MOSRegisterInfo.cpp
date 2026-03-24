@@ -926,7 +926,8 @@ void MOSRegisterInfo::reserveAllSubregs(BitVector *Reserved,
 }
 
 MOSInstrCost MOSRegisterInfo::copyCost(Register DestReg, Register SrcReg,
-                                       const MOSSubtarget &STI) const {
+                                       const MOSSubtarget &STI,
+                                       const TargetRegisterClass **Clobber) const {
   if (DestReg == SrcReg)
     return MOSInstrCost();
 
@@ -947,24 +948,27 @@ MOSInstrCost MOSRegisterInfo::copyCost(Register DestReg, Register SrcReg,
   if (AreClasses(MOS::GPRRegClass, MOS::GPRRegClass)) {
     if (MOS::AcRegClass.contains(SrcReg)) {
       assert(MOS::XYRegClass.contains(DestReg));
-      // TAX
+      // TAX/TAY — no clobbers
       return TransferCost;
     }
     if (MOS::AcRegClass.contains(DestReg)) {
-      // TXA
+      // TXA/TYA — no clobbers
       return TransferCost;
     }
 
     // X<->Y copies
     if (STI.hasW65816Or65EL02()) {
-      // TXY, TYX
+      // TXY, TYX — no clobbers
       return TransferCost;
     }
     MOSInstrCost XYCopyCost;
     if (STI.hasGPRStackRegs()) {
-      // PHX/PLY, PHY/PLX
+      // PHX/PLY, PHY/PLX — no clobbers (uses hardware stack)
       XYCopyCost = PushCost + PopCost;
     } else {
+      // Goes through A: TXA+TAY or TYA+TAX. Clobbers A.
+      if (Clobber)
+        *Clobber = &MOS::AcRegClass;
       // May need to PHA/PLA around.
       XYCopyCost = (PushCost + PopCost) / 2 + copyCost(DestReg, MOS::A, STI) +
                    copyCost(MOS::A, SrcReg, STI);
@@ -977,22 +981,28 @@ MOSInstrCost MOSRegisterInfo::copyCost(Register DestReg, Register SrcReg,
     return XYCopyCost;
   }
   if (AreClasses(MOS::Imag8RegClass, MOS::GPRRegClass)) {
-    // STImag8
+    // STImag8 — no clobbers
     return MOSInstrCost(2, (STI.hasHUC6280() || STI.hasSPC700()) ? 4 : 3);
   }
   if (AreClasses(MOS::GPRRegClass, MOS::Imag8RegClass)) {
-    // LDImag8
+    // LDImag8 — no clobbers
     return MOSInstrCost(2, (STI.hasHUC6280() || STI.hasSPC700()) ? 4 : 3);
   }
   if (AreClasses(MOS::Imag8RegClass, MOS::Imag8RegClass)) {
     // MOV dp, dp
     if (STI.hasSPC700())
-      return MOSInstrCost(3, 5);
+      return MOSInstrCost(3, 5); // no clobbers (native MOV instruction)
+    // Goes through a GPR: LDA zp + STA zp. Clobbers a GPR.
+    if (Clobber)
+      *Clobber = &MOS::GPRRegClass;
     // May need to PHA/PLA around.
     return (PushCost + PopCost) / 2 + copyCost(DestReg, MOS::A, STI) +
            copyCost(MOS::A, SrcReg, STI);
   }
   if (AreClasses(MOS::Imag16RegClass, MOS::Imag16RegClass)) {
+    // Two 8-bit copies — clobbers same as Imag8→Imag8
+    if (Clobber && !STI.hasSPC700())
+      *Clobber = &MOS::GPRRegClass;
     return copyCost(MOS::RC0, MOS::RC1, STI) * 2;
   }
   if (AreClasses(MOS::Anyi1RegClass, MOS::Anyi1RegClass)) {

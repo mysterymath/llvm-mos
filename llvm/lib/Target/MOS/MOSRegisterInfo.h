@@ -95,8 +95,12 @@ public:
     return Imag8SymbolNames[Reg].c_str();
   }
 
+  /// Return the cost of copying between two physical registers. If Clobber
+  /// is non-null, set it to the register class needed as an intermediate
+  /// (e.g., ZP→ZP copies go through any GPR), or nullptr if none.
   MOSInstrCost copyCost(Register DestReg, Register SrcReg,
-                        const MOSSubtarget &STI) const;
+                        const MOSSubtarget &STI,
+                        const TargetRegisterClass **Clobber = nullptr) const;
 
 private:
   void reserveAllSubregs(BitVector *Reserved, Register Reg) const;
