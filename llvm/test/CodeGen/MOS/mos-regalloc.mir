@@ -17,9 +17,6 @@ body: |
     ; CHECK: $a = LDImm 1
     ; CHECK-NEXT: $x = LDImm 2
     ; CHECK-NEXT: $y = LDImm 3
-    ; CHECK-NEXT: $a = COPY killed $a
-    ; CHECK-NEXT: $x = COPY killed $x
-    ; CHECK-NEXT: $y = COPY killed $y
     ; CHECK-NEXT: RTS implicit killed $a, implicit killed $x, implicit killed $y
     %0:gpr = LDImm 1
     %1:gpr = LDImm 2
@@ -43,9 +40,7 @@ body: |
   bb.0:
     ; CHECK-LABEL: name: no_overlap
     ; CHECK: $a = LDImm 1
-    ; CHECK-NEXT: dead $a = COPY killed $a
     ; CHECK-NEXT: $a = LDImm 2
-    ; CHECK-NEXT: $a = COPY killed $a
     ; CHECK-NEXT: RTS implicit killed $a
     %0:gpr = LDImm 1
     $a = COPY %0
@@ -69,10 +64,7 @@ body: |
     ; CHECK-LABEL: name: overlapping_classes
     ; CHECK: liveins: $a
     ; CHECK-NEXT: {{  $}}
-    ; CHECK-NEXT: $a = COPY killed $a
     ; CHECK-NEXT: $x = LDImm 2
-    ; CHECK-NEXT: $a = COPY killed $a
-    ; CHECK-NEXT: $x = COPY killed $x
     ; CHECK-NEXT: RTS implicit killed $a, implicit killed $x
     %0:ac = COPY $a
     %1:gpr = LDImm 2
@@ -92,8 +84,6 @@ body: |
     ; CHECK-LABEL: name: phys_def_clobber
     ; CHECK: $x = LDImm 1
     ; CHECK-NEXT: $a = LDImm 2
-    ; CHECK-NEXT: $a = COPY killed $a
-    ; CHECK-NEXT: $x = COPY killed $x
     ; CHECK-NEXT: RTS implicit killed $a, implicit killed $x
     %0:gpr = LDImm 1
     %1:gpr = LDImm 2
@@ -112,9 +102,9 @@ body: |
   bb.0:
     ; CHECK-LABEL: name: regmask_clobber
     ; CHECK: $a = LDImm 42
-    ; CHECK-NEXT: $rc20 = COPY killed $a
+    ; CHECK-NEXT: $rc20 = STImag8 $a
     ; CHECK-NEXT: JSR &fn, mos_csr, implicit-def dead $a, implicit-def dead $x
-    ; CHECK-NEXT: $a = COPY killed $rc20
+    ; CHECK-NEXT: $a = LDImag8 $rc20
     ; CHECK-NEXT: RTS implicit killed $a
     %0:gpr = LDImm 42
     %1:anyi8 = COPY %0
@@ -147,9 +137,10 @@ body: |
     ; CHECK: $a = LDImm 1
     ; CHECK-NEXT: $x = LDImm 2
     ; CHECK-NEXT: $rs1, dead early-clobber $y = LDImm16 42
-    ; CHECK-NEXT: $a = COPY killed $a
-    ; CHECK-NEXT: $x = COPY killed $x
-    ; CHECK-NEXT: $rs0 = COPY killed $rs1
+    ; CHECK-NEXT: $x = LDImag8 $rc2
+    ; CHECK-NEXT: $rc0 = STImag8 $x
+    ; CHECK-NEXT: $x = LDImag8 $rc3
+    ; CHECK-NEXT: $rc1 = STImag8 $x
     ; CHECK-NEXT: RTS implicit killed $a, implicit killed $x, implicit $rs0
     %0:gpr = LDImm 1
     %1:gpr = LDImm 2
@@ -175,13 +166,13 @@ tracksRegLiveness: true
 body: |
   bb.0:
     %0:ac = LDImm 1
-    %5:ac = LDImm 99
-    %6:ac = ANDImm %5, 42
-    $a = COPY %6
-    $x = COPY $a
-    %1:cc = LDImm1 0
-    %2:ac, %3:cc, %4:vc = ADCImm %0, 42, %1
+    %1:ac = LDImm 99
+    %2:ac = ANDImm %1, 42
     $a = COPY %2
+    $x = COPY $a
+    %3:cc = LDImm1 0
+    %4:ac, %5:cc, %6:vc = ADCImm %0, 42, %3
+    $a = COPY %4
     RTS implicit $a, implicit $x
 ...
 # Copy with clobber vreg: two vregs both need Xc at different
@@ -208,5 +199,44 @@ body: |
     %1:xc = LDImm 2
     %2:cc = ASLIdx 42, %0
     %3:cc = ASLIdx 43, %1
+    RTS
+...
+# vreg→physreg cost: %0:gpr is copied to $x. The optimizer should
+# assign %0=X (cost 0, COPY elided) rather than %0=A (cost TAX).
+---
+name: cost_vreg_to_phys
+legalized: true
+regBankSelected: true
+selected: true
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: cost_vreg_to_phys
+    ; CHECK: $x = LDImm 1
+    ; CHECK-NEXT: RTS implicit killed $x
+    %0:gpr = LDImm 1
+    $x = COPY %0
+    RTS implicit $x
+...
+# physreg→vreg cost: %0:gpr copies from $y, then is used by CMPImm
+# (which takes GPR, no narrowing). Without optimization, VAL_MIN
+# picks %0=A, so COPY $y expands to TYA. With optimization, %0=Y
+# is free (COPY elided).
+---
+name: cost_phys_to_vreg
+legalized: true
+regBankSelected: true
+selected: true
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $y
+    ; CHECK-LABEL: name: cost_phys_to_vreg
+    ; CHECK: liveins: $y
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: dead $c = CMPImm killed $y, 42
+    ; CHECK-NEXT: RTS
+    %0:gpr = COPY $y
+    %1:cc = CMPImm %0, 42
     RTS
 ...

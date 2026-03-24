@@ -12,8 +12,10 @@
 //
 // Each virtual register's CP variable domain is the set of MCPhysReg enum
 // values from its register class. Interference between simultaneously-live
-// vregs is enforced via != constraints, with aliasing checked via
-// TRI.regsOverlap().
+// vregs is enforced via != constraints (with alias-aware forbidden pairs for
+// sub-register overlap). Copy extension inserts COPY instructions before
+// uses that require a narrower class, letting the solver decide whether to
+// coalesce or copy.
 //
 // See MOSRegAllocRoadmap.md for the development roadmap.
 //
@@ -26,7 +28,6 @@
 #include "MOSRegisterInfo.h"
 #include "MOSSubtarget.h"
 
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/IndexedMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/LiveVariables.h"
@@ -52,41 +53,6 @@ using namespace llvm;
 namespace {
 
 class RegAllocProblem;
-
-/// A use-copy opportunity: before a use that requires a narrower class
-/// than the vreg's definition class, the solver can optionally insert a copy.
-/// Modeled per-possibility (à la Unison): each possible (src, dst) pair is
-/// an alternative with its own cost and clobber.
-struct CopyOp {
-  Register SrcVReg;                   ///< The original vreg being copied.
-  IntVar *DstRegVar;                  ///< CP variable for the copy dest reg.
-  BoolView Active;                    ///< Whether this copy is active.
-  const TargetRegisterClass *DstRC;   ///< Destination (required) class.
-  MachineInstr *MI;                   ///< Instruction containing the use.
-  unsigned UseOpIdx;                  ///< Operand index of the use.
-
-  /// Per-alternative cost: CostVar = CostTable[RegVar[SrcVReg]].
-  /// The table maps each source physreg to the copy cost for that path
-  /// (0 when the vreg is already in the required class).
-  IntVar *CostVar = nullptr;
-
-  /// Per-alternative clobbers. Each entry is a source physreg whose copy
-  /// path requires an intermediate register, plus the clobber's CP variable
-  /// and class. The clobber is only active when RegVar[SrcVReg] equals
-  /// that source physreg AND the copy itself is active.
-  struct Clobber {
-    MCPhysReg SrcPhysReg;
-    IntVar *Var;
-    const TargetRegisterClass *RC;
-    MCPhysReg SolvedReg = 0; ///< Populated by recordSolution.
-  };
-  SmallVector<Clobber, 1> Clobbers;
-
-  // Solution values, populated by recordSolution so they survive
-  // after engine.solve() returns (solver state may be stale).
-  bool SolvedActive = false;
-  MCPhysReg SolvedDstReg = 0;
-};
 
 // ============================================================================
 // MOSRegAlloc pass
@@ -140,10 +106,8 @@ class RegAllocProblem : public Problem {
   SmallSet<Register, 16> Live;
   BitVector PhysLive;
 
-  // Copy extension (M4): use-copies at use operands.
+  // Cost mode for copy optimization.
   MOSInstrCost::Mode CostMode;
-  SmallVector<CopyOp> CopyOps;
-  DenseMap<const MachineOperand *, unsigned> CopyOpForOperand;
 
   // --- Helpers ---
 
@@ -159,13 +123,12 @@ class RegAllocProblem : public Problem {
 
   // --- Model construction ---
 
+  void insertUseCopies(MachineBasicBlock &MBB);
   void postInterference(Register VReg);
   void createVariables();
-  void identifyCopyOpportunities();
   void buildConstraints(MachineBasicBlock &MBB);
-  void postCopyConstraints();
   void configureBranching();
-  void configureObjective();
+  void configureObjective(MachineBasicBlock &MBB);
 
 public:
   RegAllocProblem(MachineFunction &MF, MachineBasicBlock &MBB);
@@ -173,8 +136,7 @@ public:
   void recordSolution();
   bool solved() const { return Solved; }
   MCPhysReg getAssignment(Register VReg) const { return Solution[VReg]; }
-  MCPhysReg getOperandReg(const MachineOperand &MO) const;
-  void emitCopies();
+  void lowerCopies(MachineBasicBlock &MBB);
 
   void print(std::ostream &) override {}
 };
@@ -231,14 +193,14 @@ static void resetChuffedState() {
   so.verbosity = 0;
 }
 
-/// Apply the solved register assignments: emit copy instructions and replace
-/// all virtual register operands with their assigned physical registers.
+/// Apply the solved register assignments: lower COPYs, then replace all
+/// virtual register operands with their assigned physical registers.
 static void applySolution(MachineBasicBlock &MBB, RegAllocProblem &Problem) {
-  Problem.emitCopies();
+  Problem.lowerCopies(MBB);
   for (MachineInstr &MI : MBB)
     for (MachineOperand &MO : MI.operands())
       if (MO.isReg() && MO.getReg().isVirtual())
-        if (MCPhysReg PhysReg = Problem.getOperandReg(MO))
+        if (MCPhysReg PhysReg = Problem.getAssignment(MO.getReg()))
           MO.setReg(PhysReg);
 }
 
@@ -252,12 +214,11 @@ RegAllocProblem::RegAllocProblem(MachineFunction &MF, MachineBasicBlock &MBB)
       TII(*MF.getSubtarget().getInstrInfo()), MRI(MF.getRegInfo()),
       Reserved(TRI.getReservedRegs(MF)),
       CostMode(MOSInstrCost::getModeFor(MF)) {
+  insertUseCopies(MBB);
   createVariables();
-  identifyCopyOpportunities();
   buildConstraints(MBB);
-  postCopyConstraints();
   configureBranching();
-  configureObjective();
+  configureObjective(MBB);
 }
 
 void RegAllocProblem::recordSolution() {
@@ -270,18 +231,82 @@ void RegAllocProblem::recordSolution() {
     LLVM_DEBUG(dbgs() << "  " << printReg(VReg, &TRI) << " -> "
                       << TRI.getName(Solution[VReg]) << "\n");
   }
-  for (CopyOp &CO : CopyOps) {
-    CO.SolvedActive = CO.Active.isTrue();
-    CO.SolvedDstReg = static_cast<MCPhysReg>(CO.DstRegVar->getVal());
-    for (auto &Clob : CO.Clobbers)
-      Clob.SolvedReg = static_cast<MCPhysReg>(Clob.Var->getVal());
-  }
-  LLVM_DEBUG(for (const CopyOp &CO : CopyOps) {
-    dbgs() << "  copy " << printReg(CO.SrcVReg, &TRI) << " -> "
-           << TRI.getRegClassName(CO.DstRC) << ": "
-           << (CO.SolvedActive ? "active" : "coalesced") << "\n";
-  });
 }
+
+// ============================================================================
+// Copy extension: insert COPY instructions before narrowing uses
+// ============================================================================
+
+/// For each vreg whose defining instruction's output class is wider than
+/// what an instruction use requires, insert a COPY to a new vreg in the
+/// required class and rewrite the use. This runs before createVariables
+/// so the new vregs get CP variables.
+void RegAllocProblem::insertUseCopies(MachineBasicBlock &MBB) {
+  // Collect insertions first to avoid iterator invalidation.
+  struct Insertion {
+    MachineInstr *MI;
+    unsigned OpIdx;
+    Register OldVReg;
+    const TargetRegisterClass *RequiredRC;
+  };
+  SmallVector<Insertion> Insertions;
+
+  for (unsigned I = 0, E = MRI.getNumVirtRegs(); I < E; ++I) {
+    Register Reg = Register::index2VirtReg(I);
+    if (MRI.reg_nodbg_empty(Reg) || MRI.def_empty(Reg))
+      continue;
+
+    // Compute the widened def class.
+    const TargetRegisterClass *NarrowRC = MRI.getRegClass(Reg);
+    MachineInstr *DefMI = MRI.getVRegDef(Reg);
+    const TargetRegisterClass *DefRC = NarrowRC;
+    if (DefMI) {
+      for (unsigned J = 0, JE = DefMI->getNumOperands(); J < JE; ++J) {
+        const MachineOperand &MO = DefMI->getOperand(J);
+        if (!MO.isReg() || !MO.isDef() || MO.getReg() != Reg)
+          continue;
+        if (const auto *RC = DefMI->getRegClassConstraint(J, &TII, &TRI))
+          DefRC = RC;
+        break;
+      }
+    }
+    if (DefRC == NarrowRC)
+      continue; // Not widened, no copies needed.
+
+    for (MachineOperand &MO : MRI.use_nodbg_operands(Reg)) {
+      if (MO.isUndef())
+        continue;
+      MachineInstr &MI = *MO.getParent();
+      unsigned OpIdx = MO.getOperandNo();
+
+      const auto *RequiredRC = MI.getRegClassConstraint(OpIdx, &TII, &TRI);
+      if (!RequiredRC)
+        continue;
+      if (DefRC->hasSuperClassEq(RequiredRC))
+        continue;
+
+      Insertions.push_back({&MI, OpIdx, Reg, RequiredRC});
+    }
+  }
+
+  // Apply insertions.
+  for (const auto &Ins : Insertions) {
+    Register NewVReg = MRI.createVirtualRegister(Ins.RequiredRC);
+    BuildMI(MBB, Ins.MI->getIterator(), Ins.MI->getDebugLoc(),
+            TII.get(TargetOpcode::COPY), NewVReg)
+        .addReg(Ins.OldVReg);
+    Ins.MI->getOperand(Ins.OpIdx).setReg(NewVReg);
+
+    LLVM_DEBUG(dbgs() << "  insert use-copy: " << printReg(Ins.OldVReg, &TRI)
+                      << " -> " << printReg(NewVReg, &TRI) << " ("
+                      << TRI.getRegClassName(Ins.RequiredRC) << ") before "
+                      << *Ins.MI);
+  }
+}
+
+// ============================================================================
+// Variable and constraint construction
+// ============================================================================
 
 /// Create a Chuffed IntVar whose domain is the allocatable physical
 /// registers in RC.
@@ -337,103 +362,9 @@ void RegAllocProblem::createVariables() {
   }
 }
 
-/// For each vreg, check if any use operand's instruction requires a
-/// narrower register class than the vreg's (widened) definition class.
-/// For each such use, create a CopyOp with a CP variable in the
-/// required class and a BoolVar controlling whether the copy is active.
-void RegAllocProblem::identifyCopyOpportunities() {
-  for (unsigned I = 0, E = MRI.getNumVirtRegs(); I < E; ++I) {
-    Register Reg = Register::index2VirtReg(I);
-    if (!RegVar[Reg])
-      continue;
-    const TargetRegisterClass *DefRC = getDefClass(Reg);
-
-    for (MachineOperand &MO : MRI.use_nodbg_operands(Reg)) {
-      if (MO.isUndef())
-        continue;
-      MachineInstr &MI = *MO.getParent();
-      unsigned OpIdx = MO.getOperandNo();
-
-      const auto *RequiredRC = MI.getRegClassConstraint(OpIdx, &TII, &TRI);
-      if (!RequiredRC)
-        continue;
-      // If the def class already fits within the required class, no copy
-      // is ever needed — every register the def can produce is acceptable.
-      if (DefRC->hasSuperClassEq(RequiredRC))
-        continue;
-
-      IntVar *DstVar = makeRegVar(RequiredRC);
-      BoolView Active = newBoolVar();
-
-      // Build per-alternative cost table and clobber list.
-      // For each source physreg, compute cost and clobber for the best
-      // copy to any dest in RequiredRC. Pick the cheapest dest.
-      const auto &MOSTRI = static_cast<const MOSRegisterInfo &>(TRI);
-      SmallVector<MCPhysReg> SrcRegs = getClassPhysRegs(DefRC);
-      int SrcLo = *llvm::min_element(SrcRegs);
-      int SrcHi = *llvm::max_element(SrcRegs);
-
-      // Cost table indexed by (src_physreg - SrcLo).
-      vec<int> CostTable;
-      CostTable.growTo(SrcHi - SrcLo + 1, 0);
-
-      SmallVector<CopyOp::Clobber, 1> Clobbers;
-      SmallPtrSet<const TargetRegisterClass *, 2> SeenClobberRCs;
-
-      for (MCPhysReg Src : *DefRC) {
-        if (Reserved[Src])
-          continue;
-        // Find cheapest copy from Src to any register in RequiredRC.
-        int BestCost = INT_MAX;
-        const TargetRegisterClass *BestClobber = nullptr;
-        for (MCPhysReg Dst : *RequiredRC) {
-          if (Reserved[Dst])
-            continue;
-          if (Src == Dst) {
-            BestCost = 0;
-            BestClobber = nullptr;
-            break; // Can't do better than free.
-          }
-          const TargetRegisterClass *ThisClobber = nullptr;
-          int Cost = MOSTRI.copyCost(Dst, Src, STI, &ThisClobber)
-                         .value(CostMode);
-          if (Cost < BestCost) {
-            BestCost = Cost;
-            BestClobber = ThisClobber;
-          }
-        }
-        CostTable[Src - SrcLo] = BestCost == INT_MAX ? 0 : BestCost;
-        if (BestClobber && SeenClobberRCs.insert(BestClobber).second)
-          Clobbers.push_back({Src, makeRegVar(BestClobber), BestClobber});
-      }
-
-      // CostVar = CostTable[RegVar[SrcVReg] - SrcLo]
-      int MaxCost = 0;
-      for (unsigned I = 0; I < CostTable.size(); ++I)
-        MaxCost = std::max(MaxCost, CostTable[I]);
-      IntVar *CostVar = newIntVar(0, MaxCost);
-      array_int_element(RegVar[Reg], CostTable, CostVar, SrcLo);
-
-      CopyOps.push_back({Reg, DstVar, Active, RequiredRC, &MI, OpIdx,
-                          CostVar, std::move(Clobbers)});
-      CopyOpForOperand[&MO] = CopyOps.size() - 1;
-
-      LLVM_DEBUG({
-        dbgs() << "  copy opportunity: " << printReg(Reg, &TRI) << " ("
-               << TRI.getRegClassName(DefRC) << " -> "
-               << TRI.getRegClassName(RequiredRC) << ")";
-        for (const auto &C : CopyOps.back().Clobbers)
-          dbgs() << " clobber(" << TRI.getName(C.SrcPhysReg) << "):"
-                 << TRI.getRegClassName(C.RC);
-        dbgs() << " at " << MI;
-      });
-    }
-  }
-}
-
 /// Walk the block backwards to compute liveness and post interference
 /// constraints. Also handles tied operands, earlyclobber, physical
-/// register defs/uses, regmasks, and block liveins.
+/// register defs/uses, and regmasks.
 void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
   PhysLive.resize(TRI.getNumRegs());
 
@@ -449,24 +380,11 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
       if (Reg.isVirtual()) {
         postInterference(Reg);
         if (MO.isTied()) {
-          unsigned TiedIdx = MI.findTiedOperandIdx(MO.getOperandNo());
-          const MachineOperand &TiedUse = MI.getOperand(TiedIdx);
-          Register UseReg = TiedUse.getReg();
+          Register UseReg =
+              MI.getOperand(MI.findTiedOperandIdx(MO.getOperandNo())).getReg();
           assert(UseReg.isVirtual() &&
                  "Expected tied use to be virtual before regalloc");
-          auto It = CopyOpForOperand.find(&TiedUse);
-          if (It != CopyOpForOperand.end()) {
-            // Tied use has a copy opportunity: conditional tie.
-            // active  → def = copy dest (the copy output is what the
-            //           instruction reads/writes)
-            // !active → def = vreg (direct use, no copy)
-            CopyOp &CO = CopyOps[It->second];
-            int_rel_half_reif(RegVar[Reg], IRT_EQ, CO.DstRegVar, CO.Active);
-            int_rel_half_reif(RegVar[Reg], IRT_EQ, RegVar[UseReg],
-                              ~CO.Active);
-          } else {
-            int_rel(RegVar[Reg], IRT_EQ, RegVar[UseReg], 0);
-          }
+          int_rel(RegVar[Reg], IRT_EQ, RegVar[UseReg], 0);
         }
         Live.erase(Reg);
       } else if (Reg.isPhysical()) {
@@ -491,11 +409,7 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
           PhysLive.reset(R);
     }
 
-    // Phase 3: Uses and earlyclobber defs (simultaneous — earlyclobber
-    // writes before reads, so they interfere with each other).
-    // Collect copy ops; their interference is posted at the end of the
-    // phase so the Live set includes ALL uses of this instruction.
-    SmallVector<CopyOp *> PendingCopyOps;
+    // Phase 3: Uses and earlyclobber defs.
     for (MachineOperand &MO : MI.operands()) {
       if (!MO.isReg())
         continue;
@@ -506,9 +420,6 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
             postInterference(Reg);
             Live.insert(Reg);
           }
-          auto It = CopyOpForOperand.find(&MO);
-          if (It != CopyOpForOperand.end())
-            PendingCopyOps.push_back(&CopyOps[It->second]);
         } else if (Reg.isPhysical()) {
           PhysLive.set(Reg);
         }
@@ -522,70 +433,6 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
         }
       }
     }
-
-    // Post copy temp and clobber interference now that Live includes
-    // all uses.
-    for (CopyOp *CO : PendingCopyOps) {
-      // Helper: post conditional interference for a copy-related IntVar.
-      auto PostConditionalInterference = [&](IntVar *Var,
-                                             const TargetRegisterClass *RC) {
-        for (Register LiveReg : Live) {
-          const TargetRegisterClass *LiveRC = getDefClass(LiveReg);
-          if (!classesCanOverlap(RC, LiveRC))
-            continue;
-          int_rel_half_reif(Var, IRT_NE, RegVar[LiveReg], CO->Active);
-          for (auto [P1, P2] : getAliasingPairs(RC, LiveRC)) {
-            BoolView BEq = newBoolVar();
-            int_rel_reif(Var, IRT_EQ, static_cast<int>(P1), BEq);
-            BoolView BConj = newBoolVar();
-            bool_rel(CO->Active, BRT_AND, BEq, BConj);
-            int_rel_half_reif(RegVar[LiveReg], IRT_NE,
-                              static_cast<int>(P2), BConj);
-          }
-        }
-        for (MCPhysReg ClassReg : *RC) {
-          if (Reserved[ClassReg])
-            continue;
-          if (!physRegConflictsWithLive(ClassReg))
-            continue;
-          int_rel_half_reif(Var, IRT_NE, static_cast<int>(ClassReg),
-                            CO->Active);
-        }
-      };
-
-      PostConditionalInterference(CO->DstRegVar, CO->DstRC);
-      // Clobber interference: conditional on Active AND vreg == SrcPhysReg.
-      for (const auto &Clob : CO->Clobbers) {
-        BoolView IsSrc = newBoolVar();
-        int_rel_reif(RegVar[CO->SrcVReg], IRT_EQ,
-                     static_cast<int>(Clob.SrcPhysReg), IsSrc);
-        BoolView ClobActive = newBoolVar();
-        bool_rel(CO->Active, BRT_AND, IsSrc, ClobActive);
-        // Use ClobActive instead of CO->Active for this clobber.
-        for (Register LiveReg : Live) {
-          const TargetRegisterClass *LiveRC = getDefClass(LiveReg);
-          if (!classesCanOverlap(Clob.RC, LiveRC))
-            continue;
-          int_rel_half_reif(Clob.Var, IRT_NE, RegVar[LiveReg], ClobActive);
-          for (auto [P1, P2] : getAliasingPairs(Clob.RC, LiveRC)) {
-            BoolView BEq = newBoolVar();
-            int_rel_reif(Clob.Var, IRT_EQ, static_cast<int>(P1), BEq);
-            BoolView BConj = newBoolVar();
-            bool_rel(ClobActive, BRT_AND, BEq, BConj);
-            int_rel_half_reif(RegVar[LiveReg], IRT_NE,
-                              static_cast<int>(P2), BConj);
-          }
-        }
-        for (MCPhysReg ClassReg : *Clob.RC) {
-          if (Reserved[ClassReg])
-            continue;
-          if (!physRegConflictsWithLive(ClassReg))
-            continue;
-          int_rel_half_reif(Clob.Var, IRT_NE, static_cast<int>(ClassReg),
-                            ClobActive);
-        }
-      }
-    }
   }
 }
 
@@ -596,27 +443,171 @@ void RegAllocProblem::configureBranching() {
     if (RegVar[VReg])
       BranchVars.push(RegVar[VReg]);
   }
-  for (const CopyOp &CO : CopyOps) {
-    BranchVars.push(CO.DstRegVar);
-    for (const auto &Clob : CO.Clobbers)
-      BranchVars.push(Clob.Var);
-  }
   branch(BranchVars, VAR_SIZE_MIN, VAL_MIN);
 }
 
-/// Minimize total copy cost across all copy operations.
-void RegAllocProblem::configureObjective() {
-  if (CopyOps.empty())
-    return;
+/// Minimize total copy cost. For each COPY with at least one vreg
+/// operand, the cost depends on the vreg's assignment (0 when coalesced).
+void RegAllocProblem::configureObjective(MachineBasicBlock &MBB) {
+  const auto &MOSTRI = static_cast<const MOSRegisterInfo &>(TRI);
   vec<IntVar *> CostVars;
-  for (const CopyOp &CO : CopyOps)
-    CostVars.push(CO.CostVar);
+
+  for (MachineInstr &MI : MBB) {
+    if (!MI.isCopy())
+      continue;
+    Register DstReg = MI.getOperand(0).getReg();
+    Register SrcReg = MI.getOperand(1).getReg();
+
+    // Identify the variable operand (vreg with a CP variable) and the
+    // set of possible physical registers for each side.
+    IntVar *IndexVar = nullptr;
+    const TargetRegisterClass *IndexRC = nullptr;
+    bool IndexIsSrc = true;
+    auto DstPhysRegs = SmallVector<MCPhysReg>();
+    auto SrcPhysRegs = SmallVector<MCPhysReg>();
+
+    if (SrcReg.isVirtual() && RegVar[SrcReg] && DstReg.isPhysical()) {
+      // vreg → physreg: index by source vreg.
+      IndexVar = RegVar[SrcReg];
+      IndexRC = getDefClass(SrcReg);
+      SrcPhysRegs = getClassPhysRegs(IndexRC);
+      DstPhysRegs.push_back(static_cast<MCPhysReg>(DstReg.asMCReg()));
+    } else if (DstReg.isVirtual() && RegVar[DstReg] &&
+               SrcReg.isPhysical()) {
+      // physreg → vreg: index by dest vreg.
+      IndexVar = RegVar[DstReg];
+      IndexRC = getDefClass(DstReg);
+      IndexIsSrc = false;
+      DstPhysRegs = getClassPhysRegs(IndexRC);
+      SrcPhysRegs.push_back(static_cast<MCPhysReg>(SrcReg.asMCReg()));
+    } else if (DstReg.isVirtual() && RegVar[DstReg] &&
+               SrcReg.isVirtual() && RegVar[SrcReg]) {
+      // vreg → vreg: index by source vreg.
+      IndexVar = RegVar[SrcReg];
+      IndexRC = getDefClass(SrcReg);
+      SrcPhysRegs = getClassPhysRegs(IndexRC);
+      DstPhysRegs = getClassPhysRegs(getDefClass(DstReg));
+    } else {
+      continue;
+    }
+
+    // Build cost table indexed by IndexVar's physreg.
+    int Lo = *llvm::min_element(getClassPhysRegs(IndexRC));
+    int Hi = *llvm::max_element(getClassPhysRegs(IndexRC));
+
+    vec<int> CostTable;
+    CostTable.growTo(Hi - Lo + 1, 0);
+
+    for (MCPhysReg IdxReg : *IndexRC) {
+      if (Reserved[IdxReg])
+        continue;
+      int BestCost = INT_MAX;
+      // The index reg is the source or dest depending on direction.
+      auto &OtherRegs = IndexIsSrc ? DstPhysRegs : SrcPhysRegs;
+      for (MCPhysReg OtherReg : OtherRegs) {
+        if (Reserved[OtherReg])
+          continue;
+        MCPhysReg Src = IndexIsSrc ? IdxReg : OtherReg;
+        MCPhysReg Dst = IndexIsSrc ? OtherReg : IdxReg;
+        if (Src == Dst) {
+          BestCost = 0;
+          break;
+        }
+        const TargetRegisterClass *Clobber = nullptr;
+        int Cost = MOSTRI.copyCost(Dst, Src, STI, &Clobber).value(CostMode);
+        BestCost = std::min(BestCost, Cost);
+      }
+      CostTable[IdxReg - Lo] = BestCost == INT_MAX ? 0 : BestCost;
+    }
+
+    int MaxCost = 0;
+    for (unsigned I = 0; I < CostTable.size(); ++I)
+      MaxCost = std::max(MaxCost, CostTable[I]);
+    if (MaxCost == 0)
+      continue; // All paths are free, nothing to optimize.
+
+    LLVM_DEBUG(dbgs() << "  copy cost (max=" << MaxCost << "): " << MI);
+    IntVar *CostVar = newIntVar(0, MaxCost);
+    array_int_element(IndexVar, CostTable, CostVar, Lo);
+    CostVars.push(CostVar);
+  }
+
+  if (CostVars.size() == 0)
+    return;
   IntVar *TotalCost = newIntVar(0, 10000);
   int_linear(CostVars, IRT_EQ, TotalCost);
   optimize(TotalCost, OPT_MIN);
 }
 
-// --- Helpers ---
+// ============================================================================
+// Solution application: lower COPYs
+// ============================================================================
+
+/// Lower all COPY instructions: elide if src == dst (coalesced), expand
+/// via copyPhysReg if different. When copyPhysReg creates intermediate
+/// vregs, assign them physical registers by matching their class to the
+/// clobber from copyCost.
+void RegAllocProblem::lowerCopies(MachineBasicBlock &MBB) {
+  const auto &MOSTRI = static_cast<const MOSRegisterInfo &>(TRI);
+
+  for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
+    if (!MI.isCopy())
+      continue;
+    Register DstReg = MI.getOperand(0).getReg();
+    Register SrcReg = MI.getOperand(1).getReg();
+    // Need at least one virtual operand to lower.
+    if (!DstReg.isVirtual() && !SrcReg.isVirtual())
+      continue;
+
+    MCPhysReg DstPhys = DstReg.isVirtual()
+                            ? Solution[DstReg]
+                            : static_cast<MCPhysReg>(DstReg.asMCReg());
+    MCPhysReg SrcPhys = SrcReg.isVirtual()
+                            ? Solution[SrcReg]
+                            : static_cast<MCPhysReg>(SrcReg.asMCReg());
+
+    if (DstPhys == SrcPhys) {
+      // Coalesced — elide the COPY.
+      MI.eraseFromParent();
+      continue;
+    }
+
+    // Expand via copyPhysReg. Track new vregs for clobber assignment.
+    unsigned VRegsBefore = MRI.getNumVirtRegs();
+    TII.copyPhysReg(MBB, MI.getIterator(), MI.getDebugLoc(), DstPhys,
+                    SrcPhys, /*KillSrc=*/false);
+    MI.eraseFromParent();
+
+    unsigned NewVRegs = MRI.getNumVirtRegs() - VRegsBefore;
+    if (NewVRegs > 0) {
+      // Determine the clobber register from copyCost.
+      const TargetRegisterClass *ClobberRC = nullptr;
+      MOSTRI.copyCost(DstPhys, SrcPhys, STI, &ClobberRC);
+
+      Solution.grow(Register::index2VirtReg(MRI.getNumVirtRegs() - 1));
+      for (unsigned I = 0; I < NewVRegs; ++I) {
+        Register VReg = Register::index2VirtReg(VRegsBefore + I);
+        assert(ClobberRC && "copyPhysReg created vreg but no clobber expected");
+        // Pick the first allocatable register in the clobber class.
+        // copyCost guarantees this class has a valid register.
+        MCPhysReg ClobberPhys = 0;
+        for (MCPhysReg R : *ClobberRC)
+          if (!Reserved[R]) {
+            ClobberPhys = R;
+            break;
+          }
+        assert(ClobberPhys && "No allocatable register in clobber class");
+        Solution[VReg] = ClobberPhys;
+        LLVM_DEBUG(dbgs() << "  clobber vreg " << printReg(VReg, &TRI)
+                          << " -> " << TRI.getName(ClobberPhys) << "\n");
+      }
+    }
+  }
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
 
 SmallVector<MCPhysReg>
 RegAllocProblem::getClassPhysRegs(const TargetRegisterClass *RC) {
@@ -690,82 +681,6 @@ void RegAllocProblem::postInterference(Register VReg) {
     int_rel(RegVar[VReg], IRT_NE, static_cast<int>(ClassReg));
     LLVM_DEBUG(dbgs() << "  interference: " << printReg(VReg, &TRI) << " != "
                       << TRI.getName(ClassReg) << "\n");
-  }
-}
-
-/// Post constraints for each copy operation that don't depend on the
-/// backwards walk: conditional class constraints and dominance breaking.
-void RegAllocProblem::postCopyConstraints() {
-  for (CopyOp &CO : CopyOps) {
-    const TargetRegisterClass *DefRC = getDefClass(CO.SrcVReg);
-
-    // When copy is inactive, the vreg itself must be in the required class.
-    // For each phys reg in the vreg's domain that's NOT in the required class:
-    //   !active → vreg != that_phys_reg
-    for (MCPhysReg PhysReg : *DefRC)
-      if (!CO.DstRC->contains(PhysReg) && !Reserved[PhysReg])
-        int_rel_half_reif(RegVar[CO.SrcVReg], IRT_NE,
-                          static_cast<int>(PhysReg), ~CO.Active);
-
-    // Dominance breaking: no-op copies must be inactive.
-    //   active → vreg != copy_dest
-    int_rel_half_reif(RegVar[CO.SrcVReg], IRT_NE, CO.DstRegVar, CO.Active);
-  }
-}
-
-/// Return the physical register for an operand, considering active copies.
-/// If the operand has an active copy, return the copy destination register;
-/// otherwise return the vreg's assigned register.
-MCPhysReg RegAllocProblem::getOperandReg(const MachineOperand &MO) const {
-  auto It = CopyOpForOperand.find(&MO);
-  if (It != CopyOpForOperand.end()) {
-    const CopyOp &CO = CopyOps[It->second];
-    if (CO.SolvedActive)
-      return CO.SolvedDstReg;
-  }
-  return getAssignment(MO.getReg());
-}
-
-/// Emit copy instructions for all active copy operations. When
-/// copyPhysReg creates intermediate vregs (e.g., A for X→Y on vanilla
-/// 6502), assign them the physical registers from the clobber model.
-void RegAllocProblem::emitCopies() {
-  for (const CopyOp &CO : CopyOps) {
-    if (!CO.SolvedActive)
-      continue;
-
-    MCPhysReg SrcPhysReg = Solution[CO.SrcVReg];
-    MCPhysReg DstPhysReg = CO.SolvedDstReg;
-
-    unsigned VRegsBefore = MRI.getNumVirtRegs();
-    MachineBasicBlock &MBB = *CO.MI->getParent();
-    TII.copyPhysReg(MBB, CO.MI->getIterator(), CO.MI->getDebugLoc(),
-                    DstPhysReg, SrcPhysReg, /*KillSrc=*/false);
-
-    // Assign physical registers to any vregs that copyPhysReg created
-    // for intermediates, using values recorded by recordSolution.
-    unsigned NewVRegs = MRI.getNumVirtRegs() - VRegsBefore;
-    if (NewVRegs > 0) {
-      Solution.grow(Register::index2VirtReg(MRI.getNumVirtRegs() - 1));
-      for (unsigned I = 0; I < NewVRegs; ++I) {
-        Register VReg = Register::index2VirtReg(VRegsBefore + I);
-        const TargetRegisterClass *RC = MRI.getRegClass(VReg);
-        MCPhysReg ClobberPhys = 0;
-        for (const auto &Clob : CO.Clobbers)
-          if (Clob.RC == RC) {
-            ClobberPhys = Clob.SolvedReg;
-            break;
-          }
-        assert(ClobberPhys &&
-               "copyPhysReg created a vreg with no matching clobber");
-        Solution[VReg] = ClobberPhys;
-        LLVM_DEBUG(dbgs() << "  clobber vreg " << printReg(VReg, &TRI)
-                          << " -> " << TRI.getName(ClobberPhys) << "\n");
-      }
-    }
-
-    LLVM_DEBUG(dbgs() << "  emit copy: " << TRI.getName(SrcPhysReg) << " -> "
-                      << TRI.getName(DstPhysReg) << " before " << *CO.MI);
   }
 }
 
