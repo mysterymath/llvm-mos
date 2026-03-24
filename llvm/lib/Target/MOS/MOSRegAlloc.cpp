@@ -39,8 +39,6 @@
 #include "chuffed/ldsb/ldsb.h"
 #include "chuffed/primitives/primitives.h"
 #include "chuffed/support/vec.h"
-#include "chuffed/vars/modelling.h"
-
 
 #define DEBUG_TYPE "mos-regalloc"
 
@@ -48,147 +46,7 @@ using namespace llvm;
 
 namespace {
 
-/// Get the allocatable physical registers for a register class.
-static SmallVector<MCPhysReg> getClassPhysRegs(const TargetRegisterClass *RC,
-                                               const BitVector &Reserved) {
-  SmallVector<MCPhysReg> Regs;
-  for (MCPhysReg Reg : *RC) {
-    if (!Reserved[Reg])
-      Regs.push_back(Reg);
-  }
-  return Regs;
-}
-
-/// Check whether two register classes could ever alias.
-static bool classesCanOverlap(const TargetRegisterInfo &TRI,
-                              const TargetRegisterClass *A,
-                              const TargetRegisterClass *B) {
-  for (MCPhysReg RegA : *A)
-    for (MCPhysReg RegB : *B)
-      if (TRI.regsOverlap(RegA, RegB))
-        return true;
-  return false;
-}
-
-/// Chuffed Problem subclass that models register allocation for a single
-/// basic block as a constraint satisfaction problem.
-///
-/// Variables: one IntVar per virtual register, domain = MCPhysReg enum
-/// values from the vreg's register class.
-///
-/// Constraints: interfering vregs (overlapping live ranges whose register
-/// classes could alias) must be assigned non-overlapping physical registers.
-class RegAllocProblem : public Problem {
-  const TargetRegisterInfo &TRI;
-  MachineRegisterInfo &MRI;
-
-  IndexedMap<IntVar *, VirtReg2IndexFunctor> RegVar;
-  IndexedMap<MCPhysReg, VirtReg2IndexFunctor> Solution;
-  bool Solved = false;
-
-public:
-  RegAllocProblem(MachineFunction &MF, MachineBasicBlock &MBB)
-      : TRI(*MF.getSubtarget().getRegisterInfo()), MRI(MF.getRegInfo()) {
-
-    BitVector Reserved = TRI.getReservedRegs(MF);
-    unsigned NumVRegs = MRI.getNumVirtRegs();
-
-    RegVar.grow(Register::index2VirtReg(NumVRegs - 1));
-    Solution.grow(Register::index2VirtReg(NumVRegs - 1));
-
-    // --- Variables ---
-    // Create a CP variable for each vreg that has non-debug references
-    // and a def. Domain = MCPhysReg values from the register class.
-    vec<IntVar *> BranchVars;
-    for (unsigned I = 0; I < NumVRegs; ++I) {
-      Register VReg = Register::index2VirtReg(I);
-      if (MRI.reg_nodbg_empty(VReg) || MRI.def_empty(VReg))
-        continue;
-
-      SmallVector<MCPhysReg> PhysRegs =
-          getClassPhysRegs(MRI.getRegClass(VReg), Reserved);
-      int Lo = *llvm::min_element(PhysRegs);
-      int Hi = *llvm::max_element(PhysRegs);
-      IntVar *V = newIntVar(Lo, Hi);
-
-      const TargetRegisterClass *RC = MRI.getRegClass(VReg);
-      for (int Val = Lo; Val <= Hi; ++Val)
-        if (!RC->contains(static_cast<MCPhysReg>(Val)) || Reserved[Val])
-          int_rel(V, IRT_NE, Val);
-
-      RegVar[VReg] = V;
-      BranchVars.push(V);
-      LLVM_DEBUG(dbgs() << "  " << printReg(VReg, &TRI) << " ("
-                        << TRI.getRegClassName(MRI.getRegClass(VReg))
-                        << "): " << PhysRegs.size() << " phys regs\n");
-    }
-
-    // --- Constraints: live range interference ---
-    // Walk backwards. Uses make vregs live; defs kill them. A newly-live
-    // vreg interferes with everything already in the live set.
-    SmallSet<Register, 16> Live;
-    for (MachineInstr &MI : reverse(MBB)) {
-      if (MI.isDebugInstr())
-        continue;
-
-      // Defs kill vregs. Tied defs must match their use's register.
-      for (MachineOperand &MO : MI.operands()) {
-        if (!MO.isReg() || !MO.getReg().isVirtual() || !MO.isDef())
-          continue;
-        if (MO.isTied()) {
-          Register UseReg =
-              MI.getOperand(MI.findTiedOperandIdx(MO.getOperandNo())).getReg();
-          if (UseReg.isVirtual())
-            int_rel(RegVar[MO.getReg()], IRT_EQ, RegVar[UseReg], 0);
-        }
-        Live.erase(MO.getReg());
-      }
-
-      // Uses make vregs live. A newly-live vreg interferes with
-      // everything already live.
-      for (MachineOperand &MO : MI.operands()) {
-        if (!MO.isReg() || !MO.getReg().isVirtual() || !MO.isUse())
-          continue;
-        Register Use = MO.getReg();
-        if (Live.contains(Use))
-          continue;
-        for (Register LiveReg : Live) {
-          if (!classesCanOverlap(TRI, MRI.getRegClass(Use),
-                                 MRI.getRegClass(LiveReg)))
-            continue;
-          // For 8-bit classes (M1), != on MCPhysReg values is correct.
-          // 16-bit pairs (M5) will need a more general non-overlap
-          // constraint.
-          int_rel(RegVar[Use], IRT_NE, RegVar[LiveReg], 0);
-          LLVM_DEBUG(dbgs() << "  interference: " << printReg(Use, &TRI)
-                            << " != " << printReg(LiveReg, &TRI) << "\n");
-        }
-        Live.insert(Use);
-      }
-    }
-
-    branch(BranchVars, VAR_SIZE_MIN, VAL_MIN);
-  }
-
-  void recordSolution() {
-    Solved = true;
-    for (unsigned I = 0, E = MRI.getNumVirtRegs(); I < E; ++I) {
-      Register VReg = Register::index2VirtReg(I);
-      if (!RegVar[VReg])
-        continue;
-      Solution[VReg] = static_cast<MCPhysReg>(RegVar[VReg]->getVal());
-      LLVM_DEBUG(dbgs() << "  " << printReg(VReg, &TRI) << " -> "
-                        << TRI.getName(Solution[VReg]) << "\n");
-    }
-  }
-
-  bool solved() const { return Solved; }
-
-  /// Return the assigned physical register, or 0 if unallocated.
-  MCPhysReg getAssignment(Register VReg) const { return Solution[VReg]; }
-
-  void print(std::ostream &) override {}
-};
+class RegAllocProblem;
 
 // ============================================================================
 // MOSRegAlloc pass
@@ -218,6 +76,58 @@ public:
   bool runOnMachineFunction(MachineFunction &MF) override;
 };
 
+// ============================================================================
+// RegAllocProblem — Chuffed CP model for a single basic block
+// ============================================================================
+
+/// Builds a constraint satisfaction problem over virtual register assignments
+/// for a single basic block. The solver picks a physical register (MCPhysReg)
+/// for each virtual register such that no two simultaneously-live vregs share
+/// a physical register (accounting for aliasing and physical reg clobbers).
+class RegAllocProblem : public Problem {
+  const TargetRegisterInfo &TRI;
+  MachineRegisterInfo &MRI;
+  BitVector Reserved;
+
+  // CP variables and solution.
+  IndexedMap<IntVar *, VirtReg2IndexFunctor> RegVar;
+  IndexedMap<MCPhysReg, VirtReg2IndexFunctor> Solution;
+  bool Solved = false;
+
+  // Liveness state for the backwards walk.
+  SmallSet<Register, 16> Live;
+  BitVector PhysLive;
+
+  // --- Helpers ---
+
+  SmallVector<MCPhysReg> getClassPhysRegs(const TargetRegisterClass *RC);
+  bool classesCanOverlap(const TargetRegisterClass *A,
+                         const TargetRegisterClass *B);
+
+  // --- Model construction ---
+
+  void postInterference(Register VReg);
+  void createVariables();
+  void buildConstraints(MachineBasicBlock &MBB);
+  void configureBranching();
+
+public:
+  RegAllocProblem(MachineFunction &MF, MachineBasicBlock &MBB);
+
+  void recordSolution();
+  bool solved() const { return Solved; }
+  MCPhysReg getAssignment(Register VReg) const { return Solution[VReg]; }
+
+  void print(std::ostream &) override {}
+};
+
+// ============================================================================
+// MOSRegAlloc implementation
+// ============================================================================
+
+static void resetChuffedState();
+static void applySolution(MachineBasicBlock &MBB, RegAllocProblem &Problem);
+
 bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   if (MF.getRegInfo().getNumVirtRegs() == 0)
     return false;
@@ -229,18 +139,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
     LLVM_DEBUG(dbgs() << "  Block " << MBB.getName() << ": " << MBB.size()
                       << " instrs\n");
 
-    // Chuffed uses global state (engine, sat, ldsb) that accumulates
-    // variables and propagators. Reset between solves via placement new.
-    engine.~Engine();
-    new (&engine) Engine();
-    sat.~SAT();
-    new (&sat) SAT();
-    ldsb.~LDSB();
-    new (&ldsb) LDSB();
-
-    so.nof_solutions = 1;
-    so.print_sol = false;
-    so.verbosity = 0;
+    resetChuffedState();
 
     auto *Problem = new RegAllocProblem(MF, MBB);
     engine.setSolutionCallback([](::Problem *P) {
@@ -251,16 +150,218 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
     if (!Problem->solved())
       report_fatal_error("MOS CP register allocator failed");
 
-    for (MachineInstr &MI : MBB)
-      for (MachineOperand &MO : MI.operands())
-        if (MO.isReg() && MO.getReg().isVirtual())
-          if (MCPhysReg PhysReg = Problem->getAssignment(MO.getReg()))
-            MO.setReg(PhysReg);
+    applySolution(MBB, *Problem);
   }
 
   MF.getRegInfo().clearVirtRegs();
   LLVM_DEBUG(dbgs() << "MOS RegAlloc: done\n");
   return true;
+}
+
+/// Chuffed accumulates variables and propagators in global state across
+/// solve() calls. Reset everything so each block gets a fresh solver.
+static void resetChuffedState() {
+  engine.~Engine();
+  new (&engine) Engine();
+  sat.~SAT();
+  new (&sat) SAT();
+  ldsb.~LDSB();
+  new (&ldsb) LDSB();
+
+  so.nof_solutions = 1;
+  so.print_sol = false;
+  so.verbosity = 0;
+}
+
+/// Apply the solved register assignments: replace all virtual register
+/// operands with their assigned physical registers.
+static void applySolution(MachineBasicBlock &MBB, RegAllocProblem &Problem) {
+  for (MachineInstr &MI : MBB)
+    for (MachineOperand &MO : MI.operands())
+      if (MO.isReg() && MO.getReg().isVirtual())
+        if (MCPhysReg PhysReg = Problem.getAssignment(MO.getReg()))
+          MO.setReg(PhysReg);
+}
+
+// ============================================================================
+// RegAllocProblem implementation
+// ============================================================================
+
+RegAllocProblem::RegAllocProblem(MachineFunction &MF, MachineBasicBlock &MBB)
+    : TRI(*MF.getSubtarget().getRegisterInfo()), MRI(MF.getRegInfo()),
+      Reserved(TRI.getReservedRegs(MF)) {
+  createVariables();
+  buildConstraints(MBB);
+  configureBranching();
+}
+
+void RegAllocProblem::recordSolution() {
+  Solved = true;
+  for (unsigned I = 0, E = MRI.getNumVirtRegs(); I < E; ++I) {
+    Register VReg = Register::index2VirtReg(I);
+    if (!RegVar[VReg])
+      continue;
+    Solution[VReg] = static_cast<MCPhysReg>(RegVar[VReg]->getVal());
+    LLVM_DEBUG(dbgs() << "  " << printReg(VReg, &TRI) << " -> "
+                      << TRI.getName(Solution[VReg]) << "\n");
+  }
+}
+
+/// Create one Chuffed IntVar per allocatable vreg, with domain =
+/// MCPhysReg values from its register class.
+void RegAllocProblem::createVariables() {
+  unsigned NumVRegs = MRI.getNumVirtRegs();
+  RegVar.grow(Register::index2VirtReg(NumVRegs - 1));
+  Solution.grow(Register::index2VirtReg(NumVRegs - 1));
+
+  for (unsigned I = 0; I < NumVRegs; ++I) {
+    Register VReg = Register::index2VirtReg(I);
+    if (MRI.reg_nodbg_empty(VReg) || MRI.def_empty(VReg))
+      continue;
+
+    SmallVector<MCPhysReg> PhysRegs = getClassPhysRegs(MRI.getRegClass(VReg));
+    int Lo = *llvm::min_element(PhysRegs);
+    int Hi = *llvm::max_element(PhysRegs);
+    IntVar *V = newIntVar(Lo, Hi);
+
+    const TargetRegisterClass *RC = MRI.getRegClass(VReg);
+    for (int Val = Lo; Val <= Hi; ++Val)
+      if (!RC->contains(static_cast<MCPhysReg>(Val)) || Reserved[Val])
+        int_rel(V, IRT_NE, Val);
+
+    RegVar[VReg] = V;
+    LLVM_DEBUG(dbgs() << "  " << printReg(VReg, &TRI) << " ("
+                      << TRI.getRegClassName(RC) << "): " << PhysRegs.size()
+                      << " phys regs\n");
+  }
+}
+
+/// Walk the block backwards to compute liveness and post interference
+/// constraints. Also handles tied operands, earlyclobber, physical
+/// register defs/uses, regmasks, and block liveins.
+void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
+  PhysLive.resize(TRI.getNumRegs());
+
+  for (MachineInstr &MI : reverse(MBB)) {
+    if (MI.isDebugInstr())
+      continue;
+
+    // Phase 1: Defs — post interference with live set, then kill.
+    for (MachineOperand &MO : MI.operands()) {
+      if (!MO.isReg() || !MO.isDef() || MO.isEarlyClobber())
+        continue;
+      Register Reg = MO.getReg();
+      if (Reg.isVirtual()) {
+        postInterference(Reg);
+        // Tied operands should both be virtual before register allocation.
+        if (MO.isTied()) {
+          Register UseReg =
+              MI.getOperand(MI.findTiedOperandIdx(MO.getOperandNo())).getReg();
+          assert(UseReg.isVirtual() &&
+                 "Expected tied use to be virtual before regalloc");
+          int_rel(RegVar[Reg], IRT_EQ, RegVar[UseReg], 0);
+        }
+        Live.erase(Reg);
+      } else if (Reg.isPhysical()) {
+        PhysLive.reset(Reg);
+      }
+    }
+
+    // Phase 2: Regmasks — clobbered registers interfere with live vregs.
+    for (MachineOperand &MO : MI.operands()) {
+      if (!MO.isRegMask())
+        continue;
+      for (Register VReg : Live) {
+        for (MCPhysReg PhysReg : *MRI.getRegClass(VReg))
+          if (MO.clobbersPhysReg(PhysReg)) {
+            int_rel(RegVar[VReg], IRT_NE, static_cast<int>(PhysReg));
+            LLVM_DEBUG(dbgs() << "  regmask: " << printReg(VReg, &TRI)
+                              << " != " << TRI.getName(PhysReg) << "\n");
+          }
+      }
+      for (unsigned R = 1; R < TRI.getNumRegs(); ++R)
+        if (MO.clobbersPhysReg(R))
+          PhysLive.reset(R);
+    }
+
+    // Phase 3: Uses and earlyclobber defs (simultaneous — earlyclobber
+    // writes before reads, so they interfere with each other).
+    for (MachineOperand &MO : MI.operands()) {
+      if (!MO.isReg())
+        continue;
+      if (MO.isUse() && !MO.isUndef()) {
+        Register Reg = MO.getReg();
+        if (Reg.isVirtual()) {
+          if (!Live.contains(Reg)) {
+            postInterference(Reg);
+            Live.insert(Reg);
+          }
+        } else if (Reg.isPhysical()) {
+          PhysLive.set(Reg);
+        }
+      } else if (MO.isDef() && MO.isEarlyClobber()) {
+        Register Reg = MO.getReg();
+        if (Reg.isVirtual()) {
+          postInterference(Reg);
+          Live.erase(Reg);
+        } else if (Reg.isPhysical()) {
+          PhysLive.reset(Reg);
+        }
+      }
+    }
+  }
+}
+
+void RegAllocProblem::configureBranching() {
+  vec<IntVar *> BranchVars;
+  for (unsigned I = 0; I < MRI.getNumVirtRegs(); ++I) {
+    Register VReg = Register::index2VirtReg(I);
+    if (RegVar[VReg])
+      BranchVars.push(RegVar[VReg]);
+  }
+  branch(BranchVars, VAR_SIZE_MIN, VAL_MIN);
+}
+
+// --- Helpers ---
+
+SmallVector<MCPhysReg>
+RegAllocProblem::getClassPhysRegs(const TargetRegisterClass *RC) {
+  SmallVector<MCPhysReg> Regs;
+  for (MCPhysReg Reg : *RC)
+    if (!Reserved[Reg])
+      Regs.push_back(Reg);
+  return Regs;
+}
+
+bool RegAllocProblem::classesCanOverlap(const TargetRegisterClass *A,
+                                        const TargetRegisterClass *B) {
+  for (MCPhysReg RegA : *A)
+    for (MCPhysReg RegB : *B)
+      if (TRI.regsOverlap(RegA, RegB))
+        return true;
+  return false;
+}
+
+/// Post != constraints between VReg and all live vregs/physregs it
+/// conflicts with.
+void RegAllocProblem::postInterference(Register VReg) {
+  const TargetRegisterClass *RC = MRI.getRegClass(VReg);
+  for (Register LiveReg : Live) {
+    if (LiveReg == VReg)
+      continue;
+    if (!classesCanOverlap(RC, MRI.getRegClass(LiveReg)))
+      continue;
+    int_rel(RegVar[VReg], IRT_NE, RegVar[LiveReg], 0);
+    LLVM_DEBUG(dbgs() << "  interference: " << printReg(VReg, &TRI) << " != "
+                      << printReg(LiveReg, &TRI) << "\n");
+  }
+  for (MCPhysReg PhysReg : *RC) {
+    if (!PhysLive[PhysReg])
+      continue;
+    int_rel(RegVar[VReg], IRT_NE, static_cast<int>(PhysReg));
+    LLVM_DEBUG(dbgs() << "  interference: " << printReg(VReg, &TRI) << " != "
+                      << TRI.getName(PhysReg) << "\n");
+  }
 }
 
 } // namespace
