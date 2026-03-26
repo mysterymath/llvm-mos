@@ -42,6 +42,7 @@
 #include "chuffed/core/engine.h"
 #include "chuffed/core/options.h"
 #include "chuffed/core/sat.h"
+#include "chuffed/globals/globals.h"
 #include "chuffed/ldsb/ldsb.h"
 #include "chuffed/primitives/primitives.h"
 #include "chuffed/support/vec.h"
@@ -91,6 +92,7 @@ public:
 /// for each virtual register such that no two simultaneously-live vregs share
 /// a physical register (accounting for aliasing and physical reg clobbers).
 class RegAllocProblem : public Problem {
+  MachineFunction &MF;
   const MOSSubtarget &STI;
   const TargetRegisterInfo &TRI;
   const TargetInstrInfo &TII;
@@ -118,12 +120,11 @@ class RegAllocProblem : public Problem {
   getAliasingPairs(const TargetRegisterClass *RC1,
                    const TargetRegisterClass *RC2);
   bool physRegConflictsWithLive(MCPhysReg ClassReg);
-  const TargetRegisterClass *getDefClass(Register VReg);
   IntVar *makeRegVar(const TargetRegisterClass *RC);
 
   // --- Model construction ---
 
-  void insertUseCopies(MachineBasicBlock &MBB);
+  void insertCopies(MachineBasicBlock &MBB);
   void postInterference(Register VReg);
   void createVariables();
   void buildConstraints(MachineBasicBlock &MBB);
@@ -209,12 +210,12 @@ static void applySolution(MachineBasicBlock &MBB, RegAllocProblem &Problem) {
 // ============================================================================
 
 RegAllocProblem::RegAllocProblem(MachineFunction &MF, MachineBasicBlock &MBB)
-    : STI(MF.getSubtarget<MOSSubtarget>()),
+    : MF(MF), STI(MF.getSubtarget<MOSSubtarget>()),
       TRI(*MF.getSubtarget().getRegisterInfo()),
       TII(*MF.getSubtarget().getInstrInfo()), MRI(MF.getRegInfo()),
       Reserved(TRI.getReservedRegs(MF)),
       CostMode(MOSInstrCost::getModeFor(MF)) {
-  insertUseCopies(MBB);
+  insertCopies(MBB);
   createVariables();
   buildConstraints(MBB);
   configureBranching();
@@ -234,73 +235,82 @@ void RegAllocProblem::recordSolution() {
 }
 
 // ============================================================================
-// Copy extension: insert COPY instructions before narrowing uses
+// Copy extension: insert COPY instructions at defs and uses
 // ============================================================================
 
-/// For each vreg whose defining instruction's output class is wider than
-/// what an instruction use requires, insert a COPY to a new vreg in the
-/// required class and rewrite the use. This runs before createVariables
-/// so the new vregs get CP variables.
-void RegAllocProblem::insertUseCopies(MachineBasicBlock &MBB) {
-  // Collect insertions first to avoid iterator invalidation.
-  struct Insertion {
-    MachineInstr *MI;
-    unsigned OpIdx;
-    Register OldVReg;
-    const TargetRegisterClass *RequiredRC;
-  };
-  SmallVector<Insertion> Insertions;
-
-  for (unsigned I = 0, E = MRI.getNumVirtRegs(); I < E; ++I) {
+/// For each vreg, widen its class to getLargestLegalSuperClass. Then insert
+/// COPYs to bridge any gap between the wide class and instruction constraints:
+/// - After a def whose instruction constrains the output to a narrower class
+/// - Before a use whose instruction constrains the input to a narrower class
+void RegAllocProblem::insertCopies(MachineBasicBlock &MBB) {
+  for (unsigned I = 0, E = MRI.getNumVirtRegs(); I != E; ++I) {
     Register Reg = Register::index2VirtReg(I);
     if (MRI.reg_nodbg_empty(Reg) || MRI.def_empty(Reg))
       continue;
 
-    // Compute the widened def class.
-    const TargetRegisterClass *NarrowRC = MRI.getRegClass(Reg);
-    MachineInstr *DefMI = MRI.getVRegDef(Reg);
-    const TargetRegisterClass *DefRC = NarrowRC;
-    if (DefMI) {
-      for (unsigned J = 0, JE = DefMI->getNumOperands(); J < JE; ++J) {
-        const MachineOperand &MO = DefMI->getOperand(J);
-        if (!MO.isReg() || !MO.isDef() || MO.getReg() != Reg)
-          continue;
-        if (const auto *RC = DefMI->getRegClassConstraint(J, &TII, &TRI))
-          DefRC = RC;
-        break;
+    const TargetRegisterClass *CurRC = MRI.getRegClass(Reg);
+    const TargetRegisterClass *WideRC =
+        TRI.getLargestLegalSuperClass(CurRC, MF);
+    if (WideRC == CurRC)
+      continue; // Already maximally wide.
+
+    // Emit def copy: create a new narrow vreg for the def, COPY into
+    // the original (wide) vreg. The original vreg remains the travelling
+    // vreg that all uses see, symmetric with use copies.
+    MachineOperand &DefMO = *MRI.def_begin(Reg);
+    MachineInstr &DefMI = *DefMO.getParent();
+    if (!DefMI.isCopy()) {
+      unsigned DefOpIdx = DefMO.getOperandNo();
+      if (const auto *DefRC =
+              DefMI.getRegClassConstraint(DefOpIdx, &TII, &TRI)) {
+        if (!WideRC->hasSuperClassEq(DefRC)) {
+          Register DefVReg = MRI.createVirtualRegister(DefRC);
+          DefMO.setReg(DefVReg);
+          BuildMI(MBB, std::next(DefMI.getIterator()), DefMI.getDebugLoc(),
+                  TII.get(TargetOpcode::COPY), Reg)
+              .addReg(DefVReg);
+
+          LLVM_DEBUG(dbgs() << "  def-copy: " << printReg(DefVReg, &TRI)
+                            << " (" << TRI.getRegClassName(DefRC) << ") -> "
+                            << printReg(Reg, &TRI) << " after " << DefMI);
+        }
       }
     }
-    if (DefRC == NarrowRC)
-      continue; // Not widened, no copies needed.
 
+    // Emit use copies.
+    struct UseCopy {
+      MachineInstr *MI;
+      unsigned OpIdx;
+      const TargetRegisterClass *RequiredRC;
+    };
+    SmallVector<UseCopy> UseCopies;
     for (MachineOperand &MO : MRI.use_nodbg_operands(Reg)) {
       if (MO.isUndef())
         continue;
       MachineInstr &MI = *MO.getParent();
       unsigned OpIdx = MO.getOperandNo();
-
       const auto *RequiredRC = MI.getRegClassConstraint(OpIdx, &TII, &TRI);
       if (!RequiredRC)
         continue;
-      if (DefRC->hasSuperClassEq(RequiredRC))
+      if (WideRC->hasSuperClassEq(RequiredRC))
         continue;
-
-      Insertions.push_back({&MI, OpIdx, Reg, RequiredRC});
+      UseCopies.push_back({&MI, OpIdx, RequiredRC});
     }
-  }
+    for (const auto &UC : UseCopies) {
+      Register NewVReg = MRI.createVirtualRegister(UC.RequiredRC);
+      BuildMI(MBB, UC.MI->getIterator(), UC.MI->getDebugLoc(),
+              TII.get(TargetOpcode::COPY), NewVReg)
+          .addReg(Reg);
+      UC.MI->getOperand(UC.OpIdx).setReg(NewVReg);
 
-  // Apply insertions.
-  for (const auto &Ins : Insertions) {
-    Register NewVReg = MRI.createVirtualRegister(Ins.RequiredRC);
-    BuildMI(MBB, Ins.MI->getIterator(), Ins.MI->getDebugLoc(),
-            TII.get(TargetOpcode::COPY), NewVReg)
-        .addReg(Ins.OldVReg);
-    Ins.MI->getOperand(Ins.OpIdx).setReg(NewVReg);
+      LLVM_DEBUG(dbgs() << "  use-copy: " << printReg(Reg, &TRI) << " -> "
+                        << printReg(NewVReg, &TRI) << " ("
+                        << TRI.getRegClassName(UC.RequiredRC) << ") before "
+                        << *UC.MI);
+    }
 
-    LLVM_DEBUG(dbgs() << "  insert use-copy: " << printReg(Ins.OldVReg, &TRI)
-                      << " -> " << printReg(NewVReg, &TRI) << " ("
-                      << TRI.getRegClassName(Ins.RequiredRC) << ") before "
-                      << *Ins.MI);
+    // Widen the vreg's class.
+    MRI.setRegClass(Reg, WideRC);
   }
 }
 
@@ -321,29 +331,9 @@ IntVar *RegAllocProblem::makeRegVar(const TargetRegisterClass *RC) {
   return V;
 }
 
-/// Get the widest register class for a vreg based on its defining
-/// instruction's output constraint. Falls back to MRI.getRegClass() for
-/// COPY or other instructions without a fixed output class.
-const TargetRegisterClass *RegAllocProblem::getDefClass(Register VReg) {
-  const TargetRegisterClass *NarrowRC = MRI.getRegClass(VReg);
-
-  MachineInstr *DefMI = MRI.getVRegDef(VReg);
-  if (!DefMI)
-    return NarrowRC;
-  for (unsigned I = 0, E = DefMI->getNumOperands(); I < E; ++I) {
-    const MachineOperand &MO = DefMI->getOperand(I);
-    if (!MO.isReg() || !MO.isDef() || MO.getReg() != VReg)
-      continue;
-    if (const auto *RC = DefMI->getRegClassConstraint(I, &TII, &TRI))
-      return RC;
-    break;
-  }
-  return NarrowRC;
-}
-
 /// Create one Chuffed IntVar per allocatable vreg. The domain is the
-/// defining instruction's output class (which may be wider than the
-/// parser-narrowed class from MRI), enabling copy extension.
+/// vreg's MRI class, which insertCopies has already widened to
+/// getLargestLegalSuperClass.
 void RegAllocProblem::createVariables() {
   unsigned NumVRegs = MRI.getNumVirtRegs();
   RegVar.grow(Register::index2VirtReg(NumVRegs - 1));
@@ -354,7 +344,7 @@ void RegAllocProblem::createVariables() {
     if (MRI.reg_nodbg_empty(VReg) || MRI.def_empty(VReg))
       continue;
 
-    const TargetRegisterClass *RC = getDefClass(VReg);
+    const TargetRegisterClass *RC = MRI.getRegClass(VReg);
     RegVar[VReg] = makeRegVar(RC);
     LLVM_DEBUG(dbgs() << "  " << printReg(VReg, &TRI) << " ("
                       << TRI.getRegClassName(RC) << "): "
@@ -397,7 +387,7 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
       if (!MO.isRegMask())
         continue;
       for (Register VReg : Live) {
-        for (MCPhysReg PhysReg : *getDefClass(VReg))
+        for (MCPhysReg PhysReg : *MRI.getRegClass(VReg))
           if (MO.clobbersPhysReg(PhysReg)) {
             int_rel(RegVar[VReg], IRT_NE, static_cast<int>(PhysReg));
             LLVM_DEBUG(dbgs() << "  regmask: " << printReg(VReg, &TRI)
@@ -438,7 +428,7 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
 
 void RegAllocProblem::configureBranching() {
   vec<IntVar *> BranchVars;
-  for (unsigned I = 0; I < MRI.getNumVirtRegs(); ++I) {
+  for (unsigned I = 0, E = MRI.getNumVirtRegs(); I != E; ++I) {
     Register VReg = Register::index2VirtReg(I);
     if (RegVar[VReg])
       BranchVars.push(RegVar[VReg]);
@@ -469,29 +459,62 @@ void RegAllocProblem::configureObjective(MachineBasicBlock &MBB) {
     if (SrcReg.isVirtual() && RegVar[SrcReg] && DstReg.isPhysical()) {
       // vreg → physreg: index by source vreg.
       IndexVar = RegVar[SrcReg];
-      IndexRC = getDefClass(SrcReg);
+      IndexRC = MRI.getRegClass(SrcReg);
       SrcPhysRegs = getClassPhysRegs(IndexRC);
       DstPhysRegs.push_back(static_cast<MCPhysReg>(DstReg.asMCReg()));
     } else if (DstReg.isVirtual() && RegVar[DstReg] &&
                SrcReg.isPhysical()) {
       // physreg → vreg: index by dest vreg.
       IndexVar = RegVar[DstReg];
-      IndexRC = getDefClass(DstReg);
+      IndexRC = MRI.getRegClass(DstReg);
       IndexIsSrc = false;
       DstPhysRegs = getClassPhysRegs(IndexRC);
       SrcPhysRegs.push_back(static_cast<MCPhysReg>(SrcReg.asMCReg()));
     } else if (DstReg.isVirtual() && RegVar[DstReg] &&
                SrcReg.isVirtual() && RegVar[SrcReg]) {
-      // vreg → vreg: index by source vreg.
-      IndexVar = RegVar[SrcReg];
-      IndexRC = getDefClass(SrcReg);
-      SrcPhysRegs = getClassPhysRegs(IndexRC);
-      DstPhysRegs = getClassPhysRegs(getDefClass(DstReg));
+      // vreg → vreg: cost depends on both variables. Use a table
+      // constraint over (SrcVar, DstVar, CostVar) with one tuple per
+      // (src_phys, dst_phys) pair.
+      const TargetRegisterClass *SrcRC = MRI.getRegClass(SrcReg);
+      const TargetRegisterClass *DstRC = MRI.getRegClass(DstReg);
+      auto SrcRegs = getClassPhysRegs(SrcRC);
+      auto DstRegs = getClassPhysRegs(DstRC);
+
+      int MaxCost = 0;
+      vec<vec<int>> Tuples;
+      for (MCPhysReg S : SrcRegs) {
+        for (MCPhysReg D : DstRegs) {
+          int Cost = 0;
+          if (S != D) {
+            const TargetRegisterClass *Clobber = nullptr;
+            Cost = MOSTRI.copyCost(D, S, STI, &Clobber).value(CostMode);
+          }
+          Tuples.push();
+          Tuples.last().push(static_cast<int>(S));
+          Tuples.last().push(static_cast<int>(D));
+          Tuples.last().push(Cost);
+          MaxCost = std::max(MaxCost, Cost);
+        }
+      }
+
+      if (MaxCost == 0)
+        continue;
+
+      LLVM_DEBUG(dbgs() << "  copy cost (vreg-vreg, max=" << MaxCost
+                        << "): " << MI);
+      IntVar *CostVar = newIntVar(0, MaxCost);
+      vec<IntVar *> TableVars;
+      TableVars.push(RegVar[SrcReg]);
+      TableVars.push(RegVar[DstReg]);
+      TableVars.push(CostVar);
+      table(TableVars, Tuples);
+      CostVars.push(CostVar);
+      continue;
     } else {
       continue;
     }
 
-    // Build cost table indexed by IndexVar's physreg.
+    // Build cost table indexed by IndexVar's physreg (vreg↔phys cases).
     int Lo = *llvm::min_element(getClassPhysRegs(IndexRC));
     int Hi = *llvm::max_element(getClassPhysRegs(IndexRC));
 
@@ -502,7 +525,6 @@ void RegAllocProblem::configureObjective(MachineBasicBlock &MBB) {
       if (Reserved[IdxReg])
         continue;
       int BestCost = INT_MAX;
-      // The index reg is the source or dest depending on direction.
       auto &OtherRegs = IndexIsSrc ? DstPhysRegs : SrcPhysRegs;
       for (MCPhysReg OtherReg : OtherRegs) {
         if (Reserved[OtherReg])
@@ -654,11 +676,11 @@ bool RegAllocProblem::physRegConflictsWithLive(MCPhysReg ClassReg) {
 /// conflicts with. Uses the widened def class for both the vreg and
 /// live vregs to correctly model the wider domains.
 void RegAllocProblem::postInterference(Register VReg) {
-  const TargetRegisterClass *RC = getDefClass(VReg);
+  const TargetRegisterClass *RC = MRI.getRegClass(VReg);
   for (Register LiveReg : Live) {
     if (LiveReg == VReg)
       continue;
-    const TargetRegisterClass *LiveRC = getDefClass(LiveReg);
+    const TargetRegisterClass *LiveRC = MRI.getRegClass(LiveReg);
     if (!classesCanOverlap(RC, LiveRC))
       continue;
     int_rel(RegVar[VReg], IRT_NE, RegVar[LiveReg], 0);
