@@ -104,6 +104,10 @@ class RegAllocProblem : public Problem {
   IndexedMap<MCPhysReg, VirtReg2IndexFunctor> Solution;
   bool Solved = false;
 
+  // Scheduling variables.
+  DenseMap<MachineInstr *, IntVar *> IssueVar;
+  DenseMap<MachineInstr *, unsigned> InstrIndex;
+
   // Liveness state for the backwards walk.
   SmallSet<Register, 16> Live;
   BitVector PhysLive;
@@ -125,6 +129,7 @@ class RegAllocProblem : public Problem {
   // --- Model construction ---
 
   void insertCopies(MachineBasicBlock &MBB);
+  void createIssueVariables(MachineBasicBlock &MBB);
   void postInterference(Register VReg);
   void createVariables();
   void buildConstraints(MachineBasicBlock &MBB);
@@ -216,6 +221,7 @@ RegAllocProblem::RegAllocProblem(MachineFunction &MF, MachineBasicBlock &MBB)
       Reserved(TRI.getReservedRegs(MF)),
       CostMode(MOSInstrCost::getModeFor(MF)) {
   insertCopies(MBB);
+  createIssueVariables(MBB);
   createVariables();
   buildConstraints(MBB);
   configureBranching();
@@ -245,7 +251,7 @@ void RegAllocProblem::recordSolution() {
 void RegAllocProblem::insertCopies(MachineBasicBlock &MBB) {
   for (unsigned I = 0, E = MRI.getNumVirtRegs(); I != E; ++I) {
     Register Reg = Register::index2VirtReg(I);
-    if (MRI.reg_nodbg_empty(Reg) || MRI.def_empty(Reg))
+    if (MRI.reg_nodbg_empty(Reg))
       continue;
 
     const TargetRegisterClass *CurRC = MRI.getRegClass(Reg);
@@ -331,6 +337,110 @@ IntVar *RegAllocProblem::makeRegVar(const TargetRegisterClass *RC) {
   return V;
 }
 
+/// Create issue (scheduling position) variables for each instruction.
+/// Posts dependency constraints and pins to original order for now.
+void RegAllocProblem::createIssueVariables(MachineBasicBlock &MBB) {
+  // Count non-debug instructions first, then create variables.
+  unsigned N = 0;
+  for (MachineInstr &MI : MBB)
+    if (!MI.isDebugInstr())
+      ++N;
+  if (N == 0)
+    return;
+
+  for (MachineInstr &MI : MBB) {
+    if (MI.isDebugInstr())
+      continue;
+    InstrIndex[&MI] = IssueVar.size();
+    IssueVar[&MI] = newIntVar(0, N - 1);
+  }
+
+  // All-different: each instruction at a unique position.
+  vec<IntVar *> AllIssue;
+  for (MachineInstr &MI : MBB)
+    if (!MI.isDebugInstr())
+      AllIssue.push(IssueVar[&MI]);
+  all_different(AllIssue);
+
+  // --- Dependency constraints ---
+
+  // Data dependencies: issue(user) > issue(definer) for each vreg.
+  for (unsigned I = 0, E = MRI.getNumVirtRegs(); I != E; ++I) {
+    Register Reg = Register::index2VirtReg(I);
+    if (MRI.reg_nodbg_empty(Reg))
+      continue;
+    MachineInstr *DefMI = MRI.getVRegDef(Reg);
+    if (!DefMI)
+      continue;
+    for (MachineOperand &MO : MRI.use_nodbg_operands(Reg)) {
+      MachineInstr *UseMI = MO.getParent();
+      if (UseMI == DefMI)
+        continue;
+      // issue(use) > issue(def), i.e., issue(use) >= issue(def) + 1
+      int_rel(IssueVar[UseMI], IRT_GE, IssueVar[DefMI], 1);
+    }
+  }
+
+  // Memory ordering: chain all memory-accessing instructions in original
+  // program order (conservative).
+  MachineInstr *PrevMem = nullptr;
+  for (MachineInstr &MI : MBB) {
+    if (MI.isDebugInstr())
+      continue;
+    if (MI.mayLoadOrStore() || MI.hasUnmodeledSideEffects() || MI.isCall()) {
+      if (PrevMem)
+        int_rel(IssueVar[&MI], IRT_GE, IssueVar[PrevMem], 1);
+      PrevMem = &MI;
+    }
+  }
+
+  // Terminators: pin to end of block in original relative order.
+  unsigned TermStart = N;
+  for (MachineInstr &MI : reverse(MBB)) {
+    if (MI.isDebugInstr())
+      continue;
+    if (!MI.isTerminator())
+      break;
+    --TermStart;
+  }
+  for (MachineInstr &MI : MBB) {
+    if (MI.isDebugInstr())
+      continue;
+    if (MI.isTerminator())
+      int_rel(IssueVar[&MI], IRT_EQ, static_cast<int>(InstrIndex[&MI]));
+    else
+      int_rel(IssueVar[&MI], IRT_LT, static_cast<int>(TermStart));
+  }
+
+  // Physical register ordering: def before use in original order.
+  // Scan forward, tracking last physreg def; post ordering to first use.
+  DenseMap<MCPhysReg, MachineInstr *> PhysRegDef;
+  for (MachineInstr &MI : MBB) {
+    if (MI.isDebugInstr())
+      continue;
+    // Process uses first — they read the value from the prior def.
+    for (const MachineOperand &MO : MI.operands()) {
+      if (!MO.isReg() || !MO.isUse() || !MO.getReg().isPhysical())
+        continue;
+      MCPhysReg Reg = MO.getReg().asMCReg();
+      if (auto It = PhysRegDef.find(Reg); It != PhysRegDef.end())
+        int_rel(IssueVar[&MI], IRT_GE, IssueVar[It->second], 1);
+    }
+    // Then process defs — update the tracking.
+    for (const MachineOperand &MO : MI.operands()) {
+      if (!MO.isReg() || !MO.isDef() || !MO.getReg().isPhysical())
+        continue;
+      PhysRegDef[MO.getReg().asMCReg()] = &MI;
+    }
+  }
+
+  // M5a: Pin all issue variables to original order.
+  for (auto &[MI, Idx] : InstrIndex)
+    int_rel(IssueVar[MI], IRT_EQ, static_cast<int>(Idx));
+
+  LLVM_DEBUG(dbgs() << "  " << N << " issue variables created\n");
+}
+
 /// Create one Chuffed IntVar per allocatable vreg. The domain is the
 /// vreg's MRI class, which insertCopies has already widened to
 /// getLargestLegalSuperClass.
@@ -341,7 +451,7 @@ void RegAllocProblem::createVariables() {
 
   for (unsigned I = 0; I < NumVRegs; ++I) {
     Register VReg = Register::index2VirtReg(I);
-    if (MRI.reg_nodbg_empty(VReg) || MRI.def_empty(VReg))
+    if (MRI.reg_nodbg_empty(VReg))
       continue;
 
     const TargetRegisterClass *RC = MRI.getRegClass(VReg);
@@ -427,13 +537,20 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
 }
 
 void RegAllocProblem::configureBranching() {
-  vec<IntVar *> BranchVars;
+  // Branch on register variables first (most constrained), then issue.
+  vec<IntVar *> RegVars;
   for (unsigned I = 0, E = MRI.getNumVirtRegs(); I != E; ++I) {
     Register VReg = Register::index2VirtReg(I);
     if (RegVar[VReg])
-      BranchVars.push(RegVar[VReg]);
+      RegVars.push(RegVar[VReg]);
   }
-  branch(BranchVars, VAR_SIZE_MIN, VAL_MIN);
+  branch(RegVars, VAR_SIZE_MIN, VAL_MIN);
+
+  vec<IntVar *> IssueVars;
+  for (auto &[MI, Var] : IssueVar)
+    IssueVars.push(Var);
+  if (IssueVars.size() > 0)
+    branch(IssueVars, VAR_SIZE_MIN, VAL_MIN);
 }
 
 /// Minimize total copy cost. For each COPY with at least one vreg
