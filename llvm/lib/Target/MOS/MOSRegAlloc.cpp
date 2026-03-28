@@ -29,6 +29,7 @@
 #include "MOSSubtarget.h"
 
 #include "llvm/ADT/IndexedMap.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -104,12 +105,14 @@ class RegAllocProblem : public Problem {
   IndexedMap<MCPhysReg, VirtReg2IndexFunctor> Solution;
   bool Solved = false;
 
-  // Scheduling variables.
+  // Scheduling variables and solution.
   DenseMap<MachineInstr *, IntVar *> IssueVar;
   DenseMap<MachineInstr *, unsigned> InstrIndex;
+  DenseMap<MachineInstr *, unsigned> IssueSolution;
+  vec<IntVar *> IssueOrder; // Issue vars in original block order.
 
   // Liveness state for the backwards walk.
-  SmallSet<Register, 16> Live;
+  SmallSetVector<Register, 16> Live;
   BitVector PhysLive;
 
   // Cost mode for copy optimization.
@@ -142,6 +145,7 @@ public:
   void recordSolution();
   bool solved() const { return Solved; }
   MCPhysReg getAssignment(Register VReg) const { return Solution[VReg]; }
+  void applySchedule(MachineBasicBlock &MBB);
   void lowerCopies(MachineBasicBlock &MBB);
 
   void print(std::ostream &) override {}
@@ -202,6 +206,7 @@ static void resetChuffedState() {
 /// Apply the solved register assignments: lower COPYs, then replace all
 /// virtual register operands with their assigned physical registers.
 static void applySolution(MachineBasicBlock &MBB, RegAllocProblem &Problem) {
+  Problem.applySchedule(MBB);
   Problem.lowerCopies(MBB);
   for (MachineInstr &MI : MBB)
     for (MachineOperand &MO : MI.operands())
@@ -237,6 +242,11 @@ void RegAllocProblem::recordSolution() {
     Solution[VReg] = static_cast<MCPhysReg>(RegVar[VReg]->getVal());
     LLVM_DEBUG(dbgs() << "  " << printReg(VReg, &TRI) << " -> "
                       << TRI.getName(Solution[VReg]) << "\n");
+  }
+  for (auto &[MI, Var] : IssueVar) {
+    IssueSolution[MI] = static_cast<unsigned>(Var->getVal());
+    LLVM_DEBUG(dbgs() << "  issue[" << InstrIndex[MI] << "] -> "
+                      << IssueSolution[MI] << ": " << *MI);
   }
 }
 
@@ -352,7 +362,9 @@ void RegAllocProblem::createIssueVariables(MachineBasicBlock &MBB) {
     if (MI.isDebugInstr())
       continue;
     InstrIndex[&MI] = IssueVar.size();
-    IssueVar[&MI] = newIntVar(0, N - 1);
+    IntVar *V = newIntVar(0, N - 1);
+    IssueVar[&MI] = V;
+    IssueOrder.push(V);
   }
 
   // All-different: each instruction at a unique position.
@@ -434,10 +446,6 @@ void RegAllocProblem::createIssueVariables(MachineBasicBlock &MBB) {
     }
   }
 
-  // M5a: Pin all issue variables to original order.
-  for (auto &[MI, Idx] : InstrIndex)
-    int_rel(IssueVar[MI], IRT_EQ, static_cast<int>(Idx));
-
   LLVM_DEBUG(dbgs() << "  " << N << " issue variables created\n");
 }
 
@@ -486,7 +494,7 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
                  "Expected tied use to be virtual before regalloc");
           int_rel(RegVar[Reg], IRT_EQ, RegVar[UseReg], 0);
         }
-        Live.erase(Reg);
+        Live.remove(Reg);
       } else if (Reg.isPhysical()) {
         PhysLive.reset(Reg);
       }
@@ -527,7 +535,7 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
         Register Reg = MO.getReg();
         if (Reg.isVirtual()) {
           postInterference(Reg);
-          Live.erase(Reg);
+          Live.remove(Reg);
         } else if (Reg.isPhysical()) {
           PhysLive.reset(Reg);
         }
@@ -546,11 +554,9 @@ void RegAllocProblem::configureBranching() {
   }
   branch(RegVars, VAR_SIZE_MIN, VAL_MIN);
 
-  vec<IntVar *> IssueVars;
-  for (auto &[MI, Var] : IssueVar)
-    IssueVars.push(Var);
-  if (IssueVars.size() > 0)
-    branch(IssueVars, VAR_SIZE_MIN, VAL_MIN);
+  // Issue variables in original block order for deterministic branching.
+  if (IssueOrder.size() > 0)
+    branch(IssueOrder, VAR_SIZE_MIN, VAL_MIN);
 }
 
 /// Minimize total copy cost. For each COPY with at least one vreg
@@ -681,6 +687,33 @@ void RegAllocProblem::configureObjective(MachineBasicBlock &MBB) {
 // ============================================================================
 // Solution application: lower COPYs
 // ============================================================================
+
+/// Reorder instructions in MBB according to the solved issue values.
+/// Debug instructions are left in place relative to their neighbors.
+void RegAllocProblem::applySchedule(MachineBasicBlock &MBB) {
+  // Collect non-debug instructions with their solved positions.
+  SmallVector<std::pair<unsigned, MachineInstr *>> Ordered;
+  for (MachineInstr &MI : MBB)
+    if (!MI.isDebugInstr())
+      Ordered.push_back({IssueSolution[&MI], &MI});
+
+  // Stable sort preserves original order for same-position instructions
+  // (shouldn't happen with all_different, but defensive).
+  llvm::stable_sort(Ordered,
+                    [](const auto &A, const auto &B) { return A.first < B.first; });
+
+  // Re-insert in solved order. Splice each instruction to the end,
+  // building the new order incrementally.
+  // First, find the insertion point (before any debug instrs at the end).
+  for (auto &[Pos, MI] : Ordered)
+    MBB.splice(MBB.end(), &MBB, MI->getIterator());
+
+  LLVM_DEBUG({
+    dbgs() << "  scheduled order:\n";
+    for (auto &[Pos, MI] : Ordered)
+      dbgs() << "    [" << Pos << "] " << *MI;
+  });
+}
 
 /// Lower all COPY instructions: elide if src == dst (coalesced), expand
 /// via copyPhysReg if different. When copyPhysReg creates intermediate
