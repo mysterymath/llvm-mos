@@ -1,0 +1,102 @@
+# Copyright 2010-2025 Google LLC
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Description: java wrapping of the code in ../
+
+load("@contrib_rules_jvm//java:defs.bzl", "java_junit5_test")
+load("@rules_jvm_external//:defs.bzl", "artifact")
+load("//bazel:swig_java.bzl", "ortools_java_wrap_cc")
+
+ortools_java_wrap_cc(
+    name = "sat",
+    src = "sat.i",
+    java_deps = [
+        "//ortools/sat:cp_model_java_proto",
+        "//ortools/sat:sat_parameters_java_proto",
+        "//ortools/util/java:sorted_interval_list",
+        "@com_google_protobuf//java/core",
+    ],
+    package = "com.google.ortools.sat",
+    swig_includes = [
+        "//ortools/base:base_swig",
+        "//ortools/util/java:proto_swig",
+        "//ortools/util/java:sorted_interval_list_swig",
+        "//ortools/util/java:vector_swig",
+    ],
+    use_directors = True,
+    visibility = ["//visibility:public"],
+    deps = [
+        "//ortools/sat:swig_helper",
+        "//ortools/util:sorted_interval_list",
+    ],
+)
+
+java_junit5_test(
+    name = "CpModelTest",
+    srcs = ["CpModelTest.java"],
+    test_class = "com.google.ortools.sat.CpModelTest",
+    deps = [
+        "//ortools/java/com/google/ortools:Loader",
+        "//ortools/java/com/google/ortools/sat",
+        "//ortools/sat:cp_model_java_proto",
+        "//ortools/sat:sat_parameters_java_proto",
+        "//ortools/sat/java:sat",
+        "//ortools/util/java:sorted_interval_list",
+        "@maven//:com_google_truth_truth",
+        artifact("org.junit.jupiter:junit-jupiter-api"),
+        artifact("org.junit.jupiter:junit-jupiter-params"),
+        artifact("org.junit.jupiter:junit-jupiter-engine"),
+        artifact("org.junit.platform:junit-platform-launcher"),
+        artifact("org.junit.platform:junit-platform-reporting"),
+    ],
+)
+
+java_junit5_test(
+    name = "CpSolverTest",
+    srcs = ["CpSolverTest.java"],
+    test_class = "com.google.ortools.sat.CpSolverTest",
+    deps = [
+        "//ortools/java/com/google/ortools:Loader",
+        "//ortools/java/com/google/ortools/sat",
+        "//ortools/sat:cp_model_java_proto",
+        "//ortools/sat:sat_parameters_java_proto",
+        "//ortools/sat/java:sat",
+        "//ortools/util/java:sorted_interval_list",
+        "@maven//:com_google_truth_truth",
+        artifact("org.junit.jupiter:junit-jupiter-api"),
+        artifact("org.junit.jupiter:junit-jupiter-params"),
+        artifact("org.junit.jupiter:junit-jupiter-engine"),
+        artifact("org.junit.platform:junit-platform-launcher"),
+        artifact("org.junit.platform:junit-platform-reporting"),
+    ],
+)
+
+java_junit5_test(
+    name = "LinearExprTest",
+    srcs = ["LinearExprTest.java"],
+    test_class = "com.google.ortools.sat.LinearExprTest",
+    deps = [
+        "//ortools/java/com/google/ortools:Loader",
+        "//ortools/java/com/google/ortools/sat",
+        "//ortools/sat:cp_model_java_proto",
+        "//ortools/sat:sat_parameters_java_proto",
+        "//ortools/sat/java:sat",
+        "//ortools/util/java:sorted_interval_list",
+        "@maven//:com_google_truth_truth",
+        artifact("org.junit.jupiter:junit-jupiter-api"),
+        artifact("org.junit.jupiter:junit-jupiter-params"),
+        artifact("org.junit.jupiter:junit-jupiter-engine"),
+        artifact("org.junit.platform:junit-platform-launcher"),
+        artifact("org.junit.platform:junit-platform-reporting"),
+    ],
+)

@@ -720,7 +720,6 @@ RESULT Engine::search(const std::string& problemLabel) {
 
 		const bool propResult = propagate();
 		const long timeus = 0;
-		//        long timeus = dur.total_microseconds();
 		if (!propResult) {
 #if DEBUG_VERBOSE
 			std::cerr << "failure\n";
