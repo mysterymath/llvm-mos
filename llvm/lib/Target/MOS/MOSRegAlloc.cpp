@@ -10,12 +10,13 @@
 // Unison framework (Castañeda Lozano et al., TOPLAS 2019). Uses the Chuffed
 // lazy clause generation solver.
 //
-// Each virtual register's CP variable domain is the set of MCPhysReg enum
-// values from its register class. Interference between simultaneously-live
-// vregs is enforced via != constraints (with alias-aware forbidden pairs for
-// sub-register overlap). Copy extension inserts COPY instructions before
-// uses that require a narrower class, letting the solver decide whether to
-// coalesce or copy.
+// Each virtual register gets a CP variable whose domain is the set of
+// MCPhysReg values from its register class, plus start/end variables for
+// its live range. Each instruction gets an issue variable (scheduling
+// position). The solver simultaneously assigns registers AND schedules
+// instructions, using temporal overlap constraints for interference.
+// Copy extension inserts COPYs at def/use boundaries where register
+// classes narrow, letting the solver decide whether to coalesce or copy.
 //
 // See MOSRegAllocRoadmap.md for the development roadmap.
 //
@@ -87,10 +88,10 @@ public:
 // RegAllocProblem — Chuffed CP model for a single basic block
 // ============================================================================
 
-/// Builds a constraint satisfaction problem over virtual register assignments
-/// for a single basic block. The solver picks a physical register (MCPhysReg)
-/// for each virtual register such that no two simultaneously-live vregs share
-/// a physical register (accounting for aliasing and physical reg clobbers).
+/// Builds a constraint problem for integrated register allocation and
+/// instruction scheduling over a single basic block. The solver
+/// simultaneously picks physical registers for vregs and schedules
+/// instruction order, using temporal overlap constraints for interference.
 class RegAllocProblem : public Problem {
   MachineFunction &MF;
   const MOSSubtarget &STI;
@@ -247,7 +248,7 @@ void RegAllocProblem::recordSolution() {
 }
 
 // ============================================================================
-// Copy extension: insert COPY instructions at defs and uses
+/// Copy extension: insert COPY instructions at defs and uses
 // ============================================================================
 
 /// For each vreg, widen its class to getLargestLegalSuperClass. Then insert
@@ -344,7 +345,7 @@ IntVar *RegAllocProblem::makeRegVar(const TargetRegisterClass *RC) {
 }
 
 /// Create issue (scheduling position) variables for each instruction.
-/// Posts dependency constraints and pins to original order for now.
+/// Posts dependency constraints (data, memory, terminator, physreg).
 void RegAllocProblem::createIssueVariables(MachineBasicBlock &MBB) {
   // Count non-debug instructions first, then create variables.
   unsigned N = 0;
@@ -825,7 +826,7 @@ void RegAllocProblem::configureObjective(MachineBasicBlock &MBB) {
 }
 
 // ============================================================================
-// Solution application: lower COPYs
+/// Solution application
 // ============================================================================
 
 /// Reorder instructions in MBB according to the solved issue values.
