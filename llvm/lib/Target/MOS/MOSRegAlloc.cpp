@@ -110,7 +110,12 @@ class RegAllocProblem : public Problem {
   bool Solved = false;
 
   // Scheduling variables and solution.
+  // Each instruction has an issue slot [0, N). Within each slot, there
+  // are 3 sub-points: use (3*issue), clobber (3*issue+1), def (3*issue+2).
+  // Start/End vars use sub-points; IssueVar uses slots.
   DenseMap<MachineInstr *, IntVar *> IssueVar;
+  DenseMap<MachineInstr *, IntVar *> UsePoint;  // 3 * issue
+  DenseMap<MachineInstr *, IntVar *> DefPoint;  // 3 * issue + 2
   DenseMap<MachineInstr *, unsigned> InstrIndex;
   DenseMap<MachineInstr *, unsigned> IssueSolution;
   vec<IntVar *> IssueOrder; // Issue vars in original block order.
@@ -360,6 +365,32 @@ void RegAllocProblem::createIssueVariables(MachineBasicBlock &MBB) {
     IntVar *V = newIntVar(0, N - 1);
     IssueVar[&MI] = V;
     IssueOrder.push(V);
+
+    // Sub-points: use = 3*issue, def = 3*issue+2.
+    // Channel via int_linear: 3*issue - subpoint = -offset.
+    int MaxSubPoint = 3 * (N - 1) + 2;
+    IntVar *UP = newIntVar(0, MaxSubPoint);
+    IntVar *DP = newIntVar(0, MaxSubPoint);
+    {
+      vec<int> Coeffs;
+      Coeffs.push(3);
+      Coeffs.push(-1);
+      vec<IntVar *> Vars;
+      Vars.push(V);
+      Vars.push(UP);
+      int_linear(Coeffs, Vars, IRT_EQ, 0); // 3*V - UP = 0
+    }
+    {
+      vec<int> Coeffs;
+      Coeffs.push(3);
+      Coeffs.push(-1);
+      vec<IntVar *> Vars;
+      Vars.push(V);
+      Vars.push(DP);
+      int_linear(Coeffs, Vars, IRT_EQ, -2); // 3*V - DP = -2
+    }
+    UsePoint[&MI] = UP;
+    DefPoint[&MI] = DP;
   }
 
   // All-different: each instruction at a unique position.
@@ -454,7 +485,8 @@ void RegAllocProblem::createVariables() {
   EndVar.grow(Register::index2VirtReg(NumVRegs - 1));
   Solution.grow(Register::index2VirtReg(NumVRegs - 1));
 
-  int MaxSlot = std::max(1u, NumIssueSlots) - 1;
+  // Sub-point space: 3 sub-points per issue slot.
+  int MaxSubPoint = std::max(1u, NumIssueSlots) * 3 - 1;
 
   for (unsigned I = 0; I < NumVRegs; ++I) {
     Register VReg = Register::index2VirtReg(I);
@@ -464,23 +496,26 @@ void RegAllocProblem::createVariables() {
     const TargetRegisterClass *RC = MRI.getRegClass(VReg);
     RegVar[VReg] = makeRegVar(RC);
 
-    // Live range variables: half-open [start, end).
-    // The vreg is alive on slots [start, end). It is NOT alive at the
-    // slot where it is last used — at that slot the instruction reads
-    // and consumes the value. This allows the producing instruction to
-    // define a new value at the same register in the same slot.
-    StartVar[VReg] = newIntVar(0, MaxSlot);
-    EndVar[VReg] = newIntVar(0, MaxSlot);
+    // Live range variables in sub-point space, half-open [start, end).
+    // Each instruction has 3 sub-points: use, clobber, def.
+    // - Normal def: start = DefPoint (3*issue+2)
+    // - Earlyclobber def: start = UsePoint (3*issue)
+    // - Use: end >= UsePoint+1 (alive through the use sub-point)
+    StartVar[VReg] = newIntVar(0, MaxSubPoint);
+    EndVar[VReg] = newIntVar(0, MaxSubPoint);
 
-    // Channeling: start = issue(def), end >= issue(each use).
-    MachineInstr *DefMI = MRI.getVRegDef(VReg);
-    if (DefMI && IssueVar.count(DefMI))
-      int_rel(StartVar[VReg], IRT_EQ, IssueVar[DefMI], 0);
+    // Channeling: start at def point, end past use point.
+    MachineOperand &DefMO = *MRI.def_begin(VReg);
+    MachineInstr *DefMI = DefMO.getParent();
+    if (DefMO.isEarlyClobber())
+      int_rel(StartVar[VReg], IRT_EQ, UsePoint[DefMI], 0);
+    else
+      int_rel(StartVar[VReg], IRT_EQ, DefPoint[DefMI], 0);
 
     for (MachineOperand &MO : MRI.use_nodbg_operands(VReg)) {
       MachineInstr *UseMI = MO.getParent();
-      if (IssueVar.count(UseMI))
-        int_rel(EndVar[VReg], IRT_GE, IssueVar[UseMI], 0);
+      // end > UsePoint, i.e., end >= UsePoint + 1.
+      int_rel(EndVar[VReg], IRT_GE, UsePoint[UseMI], 1);
     }
 
     // end >= start
@@ -497,7 +532,7 @@ void RegAllocProblem::createVariables() {
 /// physreg segments, then hands them to MOSDiffnProp.
 void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
   unsigned NumVRegs = MRI.getNumVirtRegs();
-  int MaxSlot = std::max(1u, NumIssueSlots) - 1;
+  int MaxSubPoint = std::max(1u, NumIssueSlots) * 3 - 1;
   unsigned NumRegUnits = TRI.getNumRegUnits();
 
   // Tied operands: def and use must be the same register.
@@ -586,6 +621,7 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
     if (MI.isDebugInstr())
       continue;
 
+    // Physreg uses: extend end to use point (alive through use phase).
     for (const MachineOperand &MO : MI.operands()) {
       if (!MO.isReg() || !MO.isUse() || !MO.getReg().isPhysical())
         continue;
@@ -594,20 +630,14 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
         continue;
       auto It = OpenSegment.find(Reg);
       if (It != OpenSegment.end())
-        int_rel(PhysSegments[It->second].End, IRT_GE, IssueVar[&MI], 0);
+        // end > UsePoint, i.e., end >= UsePoint + 1
+        int_rel(PhysSegments[It->second].End, IRT_GE, UsePoint[&MI], 1);
     }
 
+    // Regmask clobbers: point at clobber sub-point (3*issue+1).
     for (const MachineOperand &MO : MI.operands()) {
       if (!MO.isRegMask())
         continue;
-
-      // Collect the set of clobbered reg units, excluding those from
-      // explicit defs (which create their own segments below).
-      BitVector ExplicitDefUnits(NumRegUnits);
-      for (const MachineOperand &DefMO : MI.operands())
-        if (DefMO.isReg() && DefMO.isDef() && DefMO.getReg().isPhysical())
-          for (MCRegUnit U : TRI.regunits(DefMO.getReg().asMCReg()))
-            ExplicitDefUnits.set(static_cast<unsigned>(U));
 
       BitVector ClobberedUnits(NumRegUnits);
       for (unsigned R = 1; R < TRI.getNumRegs(); ++R) {
@@ -615,17 +645,14 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
           continue;
         OpenSegment.erase(static_cast<MCPhysReg>(R));
         for (MCRegUnit U : TRI.regunits(static_cast<MCPhysReg>(R)))
-          if (!ExplicitDefUnits.test(static_cast<unsigned>(U)))
-            ClobberedUnits.set(static_cast<unsigned>(U));
+          ClobberedUnits.set(static_cast<unsigned>(U));
       }
 
-      // Create point segments for contiguous ranges of clobbered units.
-      // These go directly into DiffnProp (no PhysSegment needed since
-      // the start/end are fixed).
-      IntVar *S = newIntVar(0, MaxSlot);
-      IntVar *E = newIntVar(0, MaxSlot);
-      int_rel(S, IRT_EQ, IssueVar[&MI]);
-      int_rel(E, IRT_EQ, IssueVar[&MI]);
+      // Clobber point = UsePoint + 1 = 3*issue + 1.
+      IntVar *S = newIntVar(0, MaxSubPoint);
+      IntVar *E = newIntVar(0, MaxSubPoint);
+      int_rel(S, IRT_EQ, UsePoint[&MI], 1);
+      int_rel(E, IRT_EQ, UsePoint[&MI], 1);
       int RangeStart = -1, Prev = -1;
       for (int U = ClobberedUnits.find_first(); U != -1;
            U = ClobberedUnits.find_next(U)) {
@@ -659,10 +686,12 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
       OpenSegment.erase(Reg);
       if (MO.isDead())
         continue;
-      IntVar *S = newIntVar(0, MaxSlot);
-      IntVar *E = newIntVar(0, MaxSlot);
-      int_rel(S, IRT_EQ, IssueVar[&MI]);
-      int_rel(E, IRT_GE, IssueVar[&MI], 0);
+      // Physreg def: start at def point (or use point if earlyclobber).
+      IntVar *Start = MO.isEarlyClobber() ? UsePoint[&MI] : DefPoint[&MI];
+      IntVar *S = newIntVar(0, MaxSubPoint);
+      IntVar *E = newIntVar(0, MaxSubPoint);
+      int_rel(S, IRT_EQ, Start, 0);
+      int_rel(E, IRT_GE, Start, 0);
       unsigned Idx = PhysSegments.size();
       PhysSegments.push_back({Reg, S, E});
       OpenSegment[Reg] = Idx;
