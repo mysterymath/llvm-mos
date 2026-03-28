@@ -132,9 +132,9 @@ tracksRegLiveness: true
 body: |
   bb.0:
     ; CHECK-LABEL: name: earlyclobber
-    ; CHECK: $rs1, dead early-clobber $a = LDImm16 42
+    ; CHECK: $x = LDImm 2
+    ; CHECK-NEXT: $rs1, dead early-clobber $a = LDImm16 42
     ; CHECK-NEXT: $a = LDImm 1
-    ; CHECK-NEXT: $x = LDImm 2
     ; CHECK-NEXT: $x = LDImag8 $rc2
     ; CHECK-NEXT: $rc0 = STImag8 $x
     ; CHECK-NEXT: $x = LDImag8 $rc3
@@ -195,12 +195,14 @@ tracksRegLiveness: true
 body: |
   bb.0:
     ; CHECK-LABEL: name: copy_forced
-    ; CHECK: $a = LDImm 99
-    ; CHECK-NEXT: $a = ANDImm killed $a, 42
-    ; CHECK-NEXT: $x = COPY killed $a
-    ; CHECK-NEXT: $a = LDImm 1
+    ; CHECK: $x = LDImm 1
+    ; CHECK-NEXT: $a = T_A $x
     ; CHECK-NEXT: $c = LDImm1 0
     ; CHECK-NEXT: $a, dead $c, dead $v = ADCImm killed $a, 42, killed $c
+    ; CHECK-NEXT: $y = TA $a
+    ; CHECK-NEXT: $a = LDImm 99
+    ; CHECK-NEXT: $a = ANDImm killed $a, 42
+    ; CHECK-NEXT: $x = COPY $a
     ; CHECK-NEXT: RTS implicit killed $a, implicit killed $x
     %0:ac = LDImm 1
     %1:ac = LDImm 99
@@ -294,9 +296,10 @@ tracksRegLiveness: true
 body: |
   bb.0:
     ; CHECK-LABEL: name: scheduling_reorder
-    ; CHECK: $x = LDImm 1
+    ; CHECK: $a = LDImm 1
+    ; CHECK-NEXT: $x = TA $a
+    ; CHECK-NEXT: $a = LDImm 2
     ; CHECK-NEXT: dead $c = ASLIdx 42, killed $x
-    ; CHECK-NEXT: $x = LDImm 2
     ; CHECK-NEXT: dead $c = ASLIdx 43, killed $x
     ; CHECK-NEXT: $a = LDImm 0
     ; CHECK-NEXT: RTS implicit killed $a
