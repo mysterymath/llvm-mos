@@ -24,7 +24,9 @@
 
 #include "MOSRegAlloc.h"
 
+#include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
+#include "MOSDiffnProp.h"
 #include "MOSInstrCost.h"
 #include "MOSRegisterInfo.h"
 #include "MOSSubtarget.h"
@@ -120,11 +122,6 @@ class RegAllocProblem : public Problem {
   // --- Helpers ---
 
   SmallVector<MCPhysReg> getClassPhysRegs(const TargetRegisterClass *RC);
-  bool classesCanOverlap(const TargetRegisterClass *A,
-                         const TargetRegisterClass *B);
-  SmallVector<std::pair<MCPhysReg, MCPhysReg>>
-  getAliasingPairs(const TargetRegisterClass *RC1,
-                   const TargetRegisterClass *RC2);
   IntVar *makeRegVar(const TargetRegisterClass *RC);
 
   // --- Model construction ---
@@ -467,7 +464,11 @@ void RegAllocProblem::createVariables() {
     const TargetRegisterClass *RC = MRI.getRegClass(VReg);
     RegVar[VReg] = makeRegVar(RC);
 
-    // Live range variables.
+    // Live range variables: half-open [start, end).
+    // The vreg is alive on slots [start, end). It is NOT alive at the
+    // slot where it is last used — at that slot the instruction reads
+    // and consumes the value. This allows the producing instruction to
+    // define a new value at the same register in the same slot.
     StartVar[VReg] = newIntVar(0, MaxSlot);
     EndVar[VReg] = newIntVar(0, MaxSlot);
 
@@ -491,11 +492,13 @@ void RegAllocProblem::createVariables() {
   }
 }
 
-/// Build interference constraints using start/end channeling variables.
-/// Two vregs with overlapping register classes must be separated in time
-/// OR assigned to non-overlapping registers.
+/// Build interference constraints using the DiffnProp global propagator.
+/// Creates rectangles in (reg_unit × time) space for both vregs and
+/// physreg segments, then hands them to MOSDiffnProp.
 void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
   unsigned NumVRegs = MRI.getNumVirtRegs();
+  int MaxSlot = std::max(1u, NumIssueSlots) - 1;
+  unsigned NumRegUnits = TRI.getNumRegUnits();
 
   // Tied operands: def and use must be the same register.
   for (MachineInstr &MI : MBB) {
@@ -514,85 +517,75 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
     }
   }
 
-  // Pairwise vreg interference: if same register, live ranges must
-  // not overlap. "sameReg => aBeforeB OR bBeforeA"
+  // --- Build DiffnProp rectangles ---
+  //
+  // For each vreg, for each allocatable register R in its class, for
+  // each contiguous reg-unit range in R: create a rectangle with fixed
+  // X and W, present iff RegVar == R. Rectangles from the same register
+  // share the same present BoolView.
+
+  vec<IntVar *> DiffnX;
+  vec<int> DiffnW;
+  vec<IntVar *> DiffnYStart;
+  vec<IntVar *> DiffnYEnd;
+  vec<BoolView> DiffnPresent;
+
   for (unsigned I = 0; I < NumVRegs; ++I) {
-    Register A = Register::index2VirtReg(I);
-    if (!RegVar[A])
+    Register VReg = Register::index2VirtReg(I);
+    if (!RegVar[VReg])
       continue;
-    const TargetRegisterClass *RCA = MRI.getRegClass(A);
+    const TargetRegisterClass *RC = MRI.getRegClass(VReg);
 
-    for (unsigned J = I + 1; J < NumVRegs; ++J) {
-      Register B = Register::index2VirtReg(J);
-      if (!RegVar[B])
-        continue;
-      const TargetRegisterClass *RCB = MRI.getRegClass(B);
-      if (!classesCanOverlap(RCA, RCB))
+    for (MCPhysReg R : *RC) {
+      if (Reserved[R])
         continue;
 
-      // sameReg <=> RegVar[A] == RegVar[B]
-      BoolView SameReg = newBoolVar();
-      int_rel_reif(RegVar[A], IRT_EQ, RegVar[B], SameReg);
+      // present <=> RegVar[VReg] == R
+      BoolView PresentVar = newBoolVar();
+      int_rel_reif(RegVar[VReg], IRT_EQ, static_cast<int>(R), PresentVar);
 
-      // aBeforeB <=> EndVar[A] < StartVar[B]
-      BoolView ABeforeB = newBoolVar();
-      int_rel_reif(EndVar[A], IRT_LE, StartVar[B], ABeforeB);
-
-      // bBeforeA <=> EndVar[B] < StartVar[A]
-      BoolView BBeforeA = newBoolVar();
-      int_rel_reif(EndVar[B], IRT_LE, StartVar[A], BBeforeA);
-
-      // sameReg => aBeforeB OR bBeforeA
-      // i.e., ~sameReg OR aBeforeB OR bBeforeA
-      vec<BoolView> Clause;
-      Clause.push(~SameReg);
-      Clause.push(ABeforeB);
-      Clause.push(BBeforeA);
-      bool_clause(Clause);
-
-      LLVM_DEBUG(dbgs() << "  overlap: " << printReg(A, &TRI) << " vs "
-                        << printReg(B, &TRI) << "\n");
-
-      // Aliasing pairs: different MCPhysReg values that overlap
-      // (e.g., A and ALSB). Same temporal separation required.
-      for (auto [P1, P2] : getAliasingPairs(RCA, RCB)) {
-        BoolView AtP1 = newBoolVar();
-        int_rel_reif(RegVar[A], IRT_EQ, static_cast<int>(P1), AtP1);
-        BoolView AtP2 = newBoolVar();
-        int_rel_reif(RegVar[B], IRT_EQ, static_cast<int>(P2), AtP2);
-        BoolView BothAlias = newBoolVar();
-        bool_rel(AtP1, BRT_AND, AtP2, BothAlias);
-
-        vec<BoolView> AliasClause;
-        AliasClause.push(~BothAlias);
-        AliasClause.push(ABeforeB);
-        AliasClause.push(BBeforeA);
-        bool_clause(AliasClause);
+      // Split R's reg units into contiguous ranges.
+      int RangeStart = -1, Prev = -1;
+      for (MCRegUnit U : TRI.regunits(R)) {
+        int UInt = static_cast<int>(U);
+        if (Prev >= 0 && UInt != Prev + 1) {
+          // Emit previous range.
+          DiffnX.push(newIntVar(RangeStart, RangeStart));
+          DiffnW.push(Prev - RangeStart + 1);
+          DiffnYStart.push(StartVar[VReg]);
+          DiffnYEnd.push(EndVar[VReg]);
+          DiffnPresent.push(PresentVar);
+          RangeStart = UInt;
+        } else if (Prev < 0) {
+          RangeStart = UInt;
+        }
+        Prev = UInt;
+      }
+      if (RangeStart >= 0) {
+        DiffnX.push(newIntVar(RangeStart, RangeStart));
+        DiffnW.push(Prev - RangeStart + 1);
+        DiffnYStart.push(StartVar[VReg]);
+        DiffnYEnd.push(EndVar[VReg]);
+        DiffnPresent.push(PresentVar);
       }
     }
   }
 
-  // Physical register interference: build live range segments for each
-  // physreg (def → last use before next def), then use the same overlap
-  // constraint as vreg pairs.
-  //
-  // A physreg segment is like a vreg pre-assigned to a fixed register.
-  // Each segment gets start/end vars channeled to its def/use issue slots.
+  // Physical register segments: scan for physreg defs/uses, build
+  // segments, add as fixed-X rectangles to DiffnProp.
+  {
   struct PhysSegment {
     MCPhysReg Reg;
     IntVar *Start;
     IntVar *End;
   };
   SmallVector<PhysSegment> PhysSegments;
-  int MaxSlot = std::max(1u, NumIssueSlots) - 1;
+  DenseMap<MCPhysReg, unsigned> OpenSegment;
 
-  // Scan forward, tracking open segments per physreg.
-  DenseMap<MCPhysReg, unsigned> OpenSegment; // physreg → index in PhysSegments
   for (MachineInstr &MI : MBB) {
     if (MI.isDebugInstr())
       continue;
 
-    // Process uses first: extend open segments.
     for (const MachineOperand &MO : MI.operands()) {
       if (!MO.isReg() || !MO.isUse() || !MO.getReg().isPhysical())
         continue;
@@ -601,87 +594,129 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
         continue;
       auto It = OpenSegment.find(Reg);
       if (It != OpenSegment.end())
-        int_rel(PhysSegments[It->second].End, IRT_GE, IssueVar[&MI]);
+        int_rel(PhysSegments[It->second].End, IRT_GE, IssueVar[&MI], 0);
     }
 
-    // Process regmasks: close all segments for clobbered regs.
     for (const MachineOperand &MO : MI.operands()) {
       if (!MO.isRegMask())
         continue;
-      // A regmask clobbers everything not preserved. Create a segment
-      // for the clobber point itself: start=end=issue(MI).
+
+      // Collect the set of clobbered reg units, excluding those from
+      // explicit defs (which create their own segments below).
+      BitVector ExplicitDefUnits(NumRegUnits);
+      for (const MachineOperand &DefMO : MI.operands())
+        if (DefMO.isReg() && DefMO.isDef() && DefMO.getReg().isPhysical())
+          for (MCRegUnit U : TRI.regunits(DefMO.getReg().asMCReg()))
+            ExplicitDefUnits.set(static_cast<unsigned>(U));
+
+      BitVector ClobberedUnits(NumRegUnits);
       for (unsigned R = 1; R < TRI.getNumRegs(); ++R) {
         if (Reserved[R] || !MO.clobbersPhysReg(R))
           continue;
-        MCPhysReg Reg = static_cast<MCPhysReg>(R);
-        OpenSegment.erase(Reg);
-        IntVar *S = newIntVar(0, MaxSlot);
-        IntVar *E = newIntVar(0, MaxSlot);
-        int_rel(S, IRT_EQ, IssueVar[&MI]);
-        int_rel(E, IRT_EQ, IssueVar[&MI]);
-        PhysSegments.push_back({Reg, S, E});
+        OpenSegment.erase(static_cast<MCPhysReg>(R));
+        for (MCRegUnit U : TRI.regunits(static_cast<MCPhysReg>(R)))
+          if (!ExplicitDefUnits.test(static_cast<unsigned>(U)))
+            ClobberedUnits.set(static_cast<unsigned>(U));
+      }
+
+      // Create point segments for contiguous ranges of clobbered units.
+      // These go directly into DiffnProp (no PhysSegment needed since
+      // the start/end are fixed).
+      IntVar *S = newIntVar(0, MaxSlot);
+      IntVar *E = newIntVar(0, MaxSlot);
+      int_rel(S, IRT_EQ, IssueVar[&MI]);
+      int_rel(E, IRT_EQ, IssueVar[&MI]);
+      int RangeStart = -1, Prev = -1;
+      for (int U = ClobberedUnits.find_first(); U != -1;
+           U = ClobberedUnits.find_next(U)) {
+        if (Prev >= 0 && U != Prev + 1) {
+          DiffnX.push(newIntVar(RangeStart, RangeStart));
+          DiffnW.push(Prev - RangeStart + 1);
+          DiffnYStart.push(S);
+          DiffnYEnd.push(E);
+          DiffnPresent.push(bv_true);
+          RangeStart = U;
+        } else if (Prev < 0) {
+          RangeStart = U;
+        }
+        Prev = U;
+      }
+      if (RangeStart >= 0) {
+        DiffnX.push(newIntVar(RangeStart, RangeStart));
+        DiffnW.push(Prev - RangeStart + 1);
+        DiffnYStart.push(S);
+        DiffnYEnd.push(E);
+        DiffnPresent.push(bv_true);
       }
     }
 
-    // Process defs: close any open segment, start a new one.
     for (const MachineOperand &MO : MI.operands()) {
       if (!MO.isReg() || !MO.isDef() || !MO.getReg().isPhysical())
         continue;
       MCPhysReg Reg = MO.getReg().asMCReg();
       if (Reserved[Reg])
         continue;
-      OpenSegment.erase(Reg); // Close old segment if any.
+      OpenSegment.erase(Reg);
       if (MO.isDead())
-        continue; // Dead def: clobbers but no live range needed.
+        continue;
       IntVar *S = newIntVar(0, MaxSlot);
       IntVar *E = newIntVar(0, MaxSlot);
       int_rel(S, IRT_EQ, IssueVar[&MI]);
-      int_rel(E, IRT_GE, IssueVar[&MI]);
+      int_rel(E, IRT_GE, IssueVar[&MI], 0);
       unsigned Idx = PhysSegments.size();
       PhysSegments.push_back({Reg, S, E});
       OpenSegment[Reg] = Idx;
     }
   }
 
-  // Post overlap constraints: each physreg segment vs each vreg.
+  // Add physreg segments as fixed-X, always-present rectangles,
+  // one per contiguous reg-unit range.
   for (const auto &Seg : PhysSegments) {
-    for (unsigned I = 0; I < NumVRegs; ++I) {
-      Register VReg = Register::index2VirtReg(I);
-      if (!RegVar[VReg])
-        continue;
-      const TargetRegisterClass *RC = MRI.getRegClass(VReg);
+    BoolView PresentVar = bv_true;
 
-      // Check if the physreg (or any alias) could conflict with this vreg.
-      bool Conflicts = false;
-      for (MCRegAliasIterator AI(Seg.Reg, &TRI, /*IncludeSelf=*/true);
-           AI.isValid(); ++AI)
-        if (RC->contains(*AI)) {
-          Conflicts = true;
-          break;
-        }
-      if (!Conflicts)
-        continue;
-
-      // atP <=> RegVar[VReg] == Seg.Reg
-      BoolView AtP = newBoolVar();
-      int_rel_reif(RegVar[VReg], IRT_EQ, static_cast<int>(Seg.Reg), AtP);
-
-      // Temporal separation: EndVar[VReg] < Seg.Start OR Seg.End < StartVar[VReg]
-      BoolView VRegBefore = newBoolVar();
-      int_rel_reif(EndVar[VReg], IRT_LE, Seg.Start, VRegBefore);
-      BoolView SegBefore = newBoolVar();
-      int_rel_reif(Seg.End, IRT_LE, StartVar[VReg], SegBefore);
-
-      // atP => vregBefore OR segBefore
-      vec<BoolView> Clause;
-      Clause.push(~AtP);
-      Clause.push(VRegBefore);
-      Clause.push(SegBefore);
-      bool_clause(Clause);
-
-      LLVM_DEBUG(dbgs() << "  phys-seg: " << TRI.getName(Seg.Reg) << " vs "
-                        << printReg(VReg, &TRI) << "\n");
+    int RangeStart = -1, Prev = -1;
+    for (MCRegUnit U : TRI.regunits(Seg.Reg)) {
+      int UInt = static_cast<int>(U);
+      if (Prev >= 0 && UInt != Prev + 1) {
+        DiffnX.push(newIntVar(RangeStart, RangeStart));
+        DiffnW.push(Prev - RangeStart + 1);
+        DiffnYStart.push(Seg.Start);
+        DiffnYEnd.push(Seg.End);
+        DiffnPresent.push(PresentVar);
+        RangeStart = UInt;
+      } else if (Prev < 0) {
+        RangeStart = UInt;
+      }
+      Prev = UInt;
     }
+    if (RangeStart >= 0) {
+      DiffnX.push(newIntVar(RangeStart, RangeStart));
+      DiffnW.push(Prev - RangeStart + 1);
+      DiffnYStart.push(Seg.Start);
+      DiffnYEnd.push(Seg.End);
+      DiffnPresent.push(PresentVar);
+    }
+  } // end physreg segments
+  }
+
+  // Create the global no-overlap propagator.
+  if (DiffnX.size() > 0) {
+    LLVM_DEBUG({
+      dbgs() << "  DiffnProp: " << DiffnX.size() << " rectangles, "
+             << NumRegUnits << " reg units\n";
+      for (int I = 0; I < DiffnX.size(); I++)
+        dbgs() << "    rect[" << I << "]: x=[" << DiffnX[I]->getMin() << ","
+               << DiffnX[I]->getMax() << "] w=" << DiffnW[I]
+               << " y=[" << DiffnYStart[I]->getMin() << ".."
+               << DiffnYStart[I]->getMax() << ", " << DiffnYEnd[I]->getMin()
+               << ".." << DiffnYEnd[I]->getMax() << "]"
+               << " present=" << (DiffnPresent[I].isFixed()
+                                      ? (DiffnPresent[I].isTrue() ? "T" : "F")
+                                      : "?")
+               << "\n";
+    });
+    new MOSDiffnProp(DiffnX, DiffnW, DiffnYStart, DiffnYEnd, DiffnPresent,
+                     NumRegUnits);
   }
 }
 
@@ -929,29 +964,6 @@ RegAllocProblem::getClassPhysRegs(const TargetRegisterClass *RC) {
     if (!Reserved[Reg])
       Regs.push_back(Reg);
   return Regs;
-}
-
-bool RegAllocProblem::classesCanOverlap(const TargetRegisterClass *A,
-                                        const TargetRegisterClass *B) {
-  for (MCPhysReg RegA : *A)
-    for (MCPhysReg RegB : *B)
-      if (TRI.regsOverlap(RegA, RegB))
-        return true;
-  return false;
-}
-
-/// Return all (phys1, phys2) pairs from (RC1, RC2) where the registers
-/// overlap but have different enum values. These are the aliasing pairs
-/// that a simple != constraint would miss (e.g., A and ALSB).
-SmallVector<std::pair<MCPhysReg, MCPhysReg>>
-RegAllocProblem::getAliasingPairs(const TargetRegisterClass *RC1,
-                                   const TargetRegisterClass *RC2) {
-  SmallVector<std::pair<MCPhysReg, MCPhysReg>> Pairs;
-  for (MCPhysReg R1 : *RC1)
-    for (MCPhysReg R2 : *RC2)
-      if (R1 != R2 && TRI.regsOverlap(R1, R2))
-        Pairs.push_back({R1, R2});
-  return Pairs;
 }
 
 } // namespace
