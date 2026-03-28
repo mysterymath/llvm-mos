@@ -29,7 +29,6 @@
 #include "MOSSubtarget.h"
 
 #include "llvm/ADT/IndexedMap.h"
-#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/CodeGen/MachineFunction.h"
@@ -102,6 +101,8 @@ class RegAllocProblem : public Problem {
 
   // CP variables and solution.
   IndexedMap<IntVar *, VirtReg2IndexFunctor> RegVar;
+  IndexedMap<IntVar *, VirtReg2IndexFunctor> StartVar;
+  IndexedMap<IntVar *, VirtReg2IndexFunctor> EndVar;
   IndexedMap<MCPhysReg, VirtReg2IndexFunctor> Solution;
   bool Solved = false;
 
@@ -110,10 +111,7 @@ class RegAllocProblem : public Problem {
   DenseMap<MachineInstr *, unsigned> InstrIndex;
   DenseMap<MachineInstr *, unsigned> IssueSolution;
   vec<IntVar *> IssueOrder; // Issue vars in original block order.
-
-  // Liveness state for the backwards walk.
-  SmallSetVector<Register, 16> Live;
-  BitVector PhysLive;
+  unsigned NumIssueSlots = 0;
 
   // Cost mode for copy optimization.
   MOSInstrCost::Mode CostMode;
@@ -126,14 +124,12 @@ class RegAllocProblem : public Problem {
   SmallVector<std::pair<MCPhysReg, MCPhysReg>>
   getAliasingPairs(const TargetRegisterClass *RC1,
                    const TargetRegisterClass *RC2);
-  bool physRegConflictsWithLive(MCPhysReg ClassReg);
   IntVar *makeRegVar(const TargetRegisterClass *RC);
 
   // --- Model construction ---
 
   void insertCopies(MachineBasicBlock &MBB);
   void createIssueVariables(MachineBasicBlock &MBB);
-  void postInterference(Register VReg);
   void createVariables();
   void buildConstraints(MachineBasicBlock &MBB);
   void configureBranching();
@@ -355,6 +351,7 @@ void RegAllocProblem::createIssueVariables(MachineBasicBlock &MBB) {
   for (MachineInstr &MI : MBB)
     if (!MI.isDebugInstr())
       ++N;
+  NumIssueSlots = N;
   if (N == 0)
     return;
 
@@ -455,7 +452,11 @@ void RegAllocProblem::createIssueVariables(MachineBasicBlock &MBB) {
 void RegAllocProblem::createVariables() {
   unsigned NumVRegs = MRI.getNumVirtRegs();
   RegVar.grow(Register::index2VirtReg(NumVRegs - 1));
+  StartVar.grow(Register::index2VirtReg(NumVRegs - 1));
+  EndVar.grow(Register::index2VirtReg(NumVRegs - 1));
   Solution.grow(Register::index2VirtReg(NumVRegs - 1));
+
+  int MaxSlot = std::max(1u, NumIssueSlots) - 1;
 
   for (unsigned I = 0; I < NumVRegs; ++I) {
     Register VReg = Register::index2VirtReg(I);
@@ -464,82 +465,221 @@ void RegAllocProblem::createVariables() {
 
     const TargetRegisterClass *RC = MRI.getRegClass(VReg);
     RegVar[VReg] = makeRegVar(RC);
+
+    // Live range variables.
+    StartVar[VReg] = newIntVar(0, MaxSlot);
+    EndVar[VReg] = newIntVar(0, MaxSlot);
+
+    // Channeling: start = issue(def), end >= issue(each use).
+    MachineInstr *DefMI = MRI.getVRegDef(VReg);
+    if (DefMI && IssueVar.count(DefMI))
+      int_rel(StartVar[VReg], IRT_EQ, IssueVar[DefMI], 0);
+
+    for (MachineOperand &MO : MRI.use_nodbg_operands(VReg)) {
+      MachineInstr *UseMI = MO.getParent();
+      if (IssueVar.count(UseMI))
+        int_rel(EndVar[VReg], IRT_GE, IssueVar[UseMI], 0);
+    }
+
+    // end >= start
+    int_rel(EndVar[VReg], IRT_GE, StartVar[VReg], 0);
+
     LLVM_DEBUG(dbgs() << "  " << printReg(VReg, &TRI) << " ("
                       << TRI.getRegClassName(RC) << "): "
                       << getClassPhysRegs(RC).size() << " phys regs\n");
   }
 }
 
-/// Walk the block backwards to compute liveness and post interference
-/// constraints. Also handles tied operands, earlyclobber, physical
-/// register defs/uses, and regmasks.
+/// Build interference constraints using start/end channeling variables.
+/// Two vregs with overlapping register classes must be separated in time
+/// OR assigned to non-overlapping registers.
 void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
-  PhysLive.resize(TRI.getNumRegs());
+  unsigned NumVRegs = MRI.getNumVirtRegs();
 
-  for (MachineInstr &MI : reverse(MBB)) {
+  // Tied operands: def and use must be the same register.
+  for (MachineInstr &MI : MBB) {
+    if (MI.isDebugInstr())
+      continue;
+    for (MachineOperand &MO : MI.operands()) {
+      if (!MO.isReg() || !MO.isDef() || !MO.isTied())
+        continue;
+      Register DefReg = MO.getReg();
+      if (!DefReg.isVirtual())
+        continue;
+      Register UseReg =
+          MI.getOperand(MI.findTiedOperandIdx(MO.getOperandNo())).getReg();
+      if (UseReg.isVirtual())
+        int_rel(RegVar[DefReg], IRT_EQ, RegVar[UseReg], 0);
+    }
+  }
+
+  // Pairwise vreg interference: if same register, live ranges must
+  // not overlap. "sameReg => aBeforeB OR bBeforeA"
+  for (unsigned I = 0; I < NumVRegs; ++I) {
+    Register A = Register::index2VirtReg(I);
+    if (!RegVar[A])
+      continue;
+    const TargetRegisterClass *RCA = MRI.getRegClass(A);
+
+    for (unsigned J = I + 1; J < NumVRegs; ++J) {
+      Register B = Register::index2VirtReg(J);
+      if (!RegVar[B])
+        continue;
+      const TargetRegisterClass *RCB = MRI.getRegClass(B);
+      if (!classesCanOverlap(RCA, RCB))
+        continue;
+
+      // sameReg <=> RegVar[A] == RegVar[B]
+      BoolView SameReg = newBoolVar();
+      int_rel_reif(RegVar[A], IRT_EQ, RegVar[B], SameReg);
+
+      // aBeforeB <=> EndVar[A] < StartVar[B]
+      BoolView ABeforeB = newBoolVar();
+      int_rel_reif(EndVar[A], IRT_LE, StartVar[B], ABeforeB);
+
+      // bBeforeA <=> EndVar[B] < StartVar[A]
+      BoolView BBeforeA = newBoolVar();
+      int_rel_reif(EndVar[B], IRT_LE, StartVar[A], BBeforeA);
+
+      // sameReg => aBeforeB OR bBeforeA
+      // i.e., ~sameReg OR aBeforeB OR bBeforeA
+      vec<BoolView> Clause;
+      Clause.push(~SameReg);
+      Clause.push(ABeforeB);
+      Clause.push(BBeforeA);
+      bool_clause(Clause);
+
+      LLVM_DEBUG(dbgs() << "  overlap: " << printReg(A, &TRI) << " vs "
+                        << printReg(B, &TRI) << "\n");
+
+      // Aliasing pairs: different MCPhysReg values that overlap
+      // (e.g., A and ALSB). Same temporal separation required.
+      for (auto [P1, P2] : getAliasingPairs(RCA, RCB)) {
+        BoolView AtP1 = newBoolVar();
+        int_rel_reif(RegVar[A], IRT_EQ, static_cast<int>(P1), AtP1);
+        BoolView AtP2 = newBoolVar();
+        int_rel_reif(RegVar[B], IRT_EQ, static_cast<int>(P2), AtP2);
+        BoolView BothAlias = newBoolVar();
+        bool_rel(AtP1, BRT_AND, AtP2, BothAlias);
+
+        vec<BoolView> AliasClause;
+        AliasClause.push(~BothAlias);
+        AliasClause.push(ABeforeB);
+        AliasClause.push(BBeforeA);
+        bool_clause(AliasClause);
+      }
+    }
+  }
+
+  // Physical register interference: build live range segments for each
+  // physreg (def → last use before next def), then use the same overlap
+  // constraint as vreg pairs.
+  //
+  // A physreg segment is like a vreg pre-assigned to a fixed register.
+  // Each segment gets start/end vars channeled to its def/use issue slots.
+  struct PhysSegment {
+    MCPhysReg Reg;
+    IntVar *Start;
+    IntVar *End;
+  };
+  SmallVector<PhysSegment> PhysSegments;
+  int MaxSlot = std::max(1u, NumIssueSlots) - 1;
+
+  // Scan forward, tracking open segments per physreg.
+  DenseMap<MCPhysReg, unsigned> OpenSegment; // physreg → index in PhysSegments
+  for (MachineInstr &MI : MBB) {
     if (MI.isDebugInstr())
       continue;
 
-    // Phase 1: Defs — post interference with live set, then kill.
-    for (MachineOperand &MO : MI.operands()) {
-      if (!MO.isReg() || !MO.isDef() || MO.isEarlyClobber())
+    // Process uses first: extend open segments.
+    for (const MachineOperand &MO : MI.operands()) {
+      if (!MO.isReg() || !MO.isUse() || !MO.getReg().isPhysical())
         continue;
-      Register Reg = MO.getReg();
-      if (Reg.isVirtual()) {
-        postInterference(Reg);
-        if (MO.isTied()) {
-          Register UseReg =
-              MI.getOperand(MI.findTiedOperandIdx(MO.getOperandNo())).getReg();
-          assert(UseReg.isVirtual() &&
-                 "Expected tied use to be virtual before regalloc");
-          int_rel(RegVar[Reg], IRT_EQ, RegVar[UseReg], 0);
-        }
-        Live.remove(Reg);
-      } else if (Reg.isPhysical()) {
-        PhysLive.reset(Reg);
-      }
+      MCPhysReg Reg = MO.getReg().asMCReg();
+      if (Reserved[Reg])
+        continue;
+      auto It = OpenSegment.find(Reg);
+      if (It != OpenSegment.end())
+        int_rel(PhysSegments[It->second].End, IRT_GE, IssueVar[&MI]);
     }
 
-    // Phase 2: Regmasks — clobbered registers interfere with live vregs.
-    for (MachineOperand &MO : MI.operands()) {
+    // Process regmasks: close all segments for clobbered regs.
+    for (const MachineOperand &MO : MI.operands()) {
       if (!MO.isRegMask())
         continue;
-      for (Register VReg : Live) {
-        for (MCPhysReg PhysReg : *MRI.getRegClass(VReg))
-          if (MO.clobbersPhysReg(PhysReg)) {
-            int_rel(RegVar[VReg], IRT_NE, static_cast<int>(PhysReg));
-            LLVM_DEBUG(dbgs() << "  regmask: " << printReg(VReg, &TRI)
-                              << " != " << TRI.getName(PhysReg) << "\n");
-          }
+      // A regmask clobbers everything not preserved. Create a segment
+      // for the clobber point itself: start=end=issue(MI).
+      for (unsigned R = 1; R < TRI.getNumRegs(); ++R) {
+        if (Reserved[R] || !MO.clobbersPhysReg(R))
+          continue;
+        MCPhysReg Reg = static_cast<MCPhysReg>(R);
+        OpenSegment.erase(Reg);
+        IntVar *S = newIntVar(0, MaxSlot);
+        IntVar *E = newIntVar(0, MaxSlot);
+        int_rel(S, IRT_EQ, IssueVar[&MI]);
+        int_rel(E, IRT_EQ, IssueVar[&MI]);
+        PhysSegments.push_back({Reg, S, E});
       }
-      for (unsigned R = 1; R < TRI.getNumRegs(); ++R)
-        if (MO.clobbersPhysReg(R))
-          PhysLive.reset(R);
     }
 
-    // Phase 3: Uses and earlyclobber defs.
-    for (MachineOperand &MO : MI.operands()) {
-      if (!MO.isReg())
+    // Process defs: close any open segment, start a new one.
+    for (const MachineOperand &MO : MI.operands()) {
+      if (!MO.isReg() || !MO.isDef() || !MO.getReg().isPhysical())
         continue;
-      if (MO.isUse() && !MO.isUndef()) {
-        Register Reg = MO.getReg();
-        if (Reg.isVirtual()) {
-          if (!Live.contains(Reg)) {
-            postInterference(Reg);
-            Live.insert(Reg);
-          }
-        } else if (Reg.isPhysical()) {
-          PhysLive.set(Reg);
+      MCPhysReg Reg = MO.getReg().asMCReg();
+      if (Reserved[Reg])
+        continue;
+      OpenSegment.erase(Reg); // Close old segment if any.
+      if (MO.isDead())
+        continue; // Dead def: clobbers but no live range needed.
+      IntVar *S = newIntVar(0, MaxSlot);
+      IntVar *E = newIntVar(0, MaxSlot);
+      int_rel(S, IRT_EQ, IssueVar[&MI]);
+      int_rel(E, IRT_GE, IssueVar[&MI]);
+      unsigned Idx = PhysSegments.size();
+      PhysSegments.push_back({Reg, S, E});
+      OpenSegment[Reg] = Idx;
+    }
+  }
+
+  // Post overlap constraints: each physreg segment vs each vreg.
+  for (const auto &Seg : PhysSegments) {
+    for (unsigned I = 0; I < NumVRegs; ++I) {
+      Register VReg = Register::index2VirtReg(I);
+      if (!RegVar[VReg])
+        continue;
+      const TargetRegisterClass *RC = MRI.getRegClass(VReg);
+
+      // Check if the physreg (or any alias) could conflict with this vreg.
+      bool Conflicts = false;
+      for (MCRegAliasIterator AI(Seg.Reg, &TRI, /*IncludeSelf=*/true);
+           AI.isValid(); ++AI)
+        if (RC->contains(*AI)) {
+          Conflicts = true;
+          break;
         }
-      } else if (MO.isDef() && MO.isEarlyClobber()) {
-        Register Reg = MO.getReg();
-        if (Reg.isVirtual()) {
-          postInterference(Reg);
-          Live.remove(Reg);
-        } else if (Reg.isPhysical()) {
-          PhysLive.reset(Reg);
-        }
-      }
+      if (!Conflicts)
+        continue;
+
+      // atP <=> RegVar[VReg] == Seg.Reg
+      BoolView AtP = newBoolVar();
+      int_rel_reif(RegVar[VReg], IRT_EQ, static_cast<int>(Seg.Reg), AtP);
+
+      // Temporal separation: EndVar[VReg] < Seg.Start OR Seg.End < StartVar[VReg]
+      BoolView VRegBefore = newBoolVar();
+      int_rel_reif(EndVar[VReg], IRT_LE, Seg.Start, VRegBefore);
+      BoolView SegBefore = newBoolVar();
+      int_rel_reif(Seg.End, IRT_LE, StartVar[VReg], SegBefore);
+
+      // atP => vregBefore OR segBefore
+      vec<BoolView> Clause;
+      Clause.push(~AtP);
+      Clause.push(VRegBefore);
+      Clause.push(SegBefore);
+      bool_clause(Clause);
+
+      LLVM_DEBUG(dbgs() << "  phys-seg: " << TRI.getName(Seg.Reg) << " vs "
+                        << printReg(VReg, &TRI) << "\n");
     }
   }
 }
@@ -811,49 +951,6 @@ RegAllocProblem::getAliasingPairs(const TargetRegisterClass *RC1,
       if (R1 != R2 && TRI.regsOverlap(R1, R2))
         Pairs.push_back({R1, R2});
   return Pairs;
-}
-
-/// Check whether ClassReg (or any of its aliases) is physically live.
-bool RegAllocProblem::physRegConflictsWithLive(MCPhysReg ClassReg) {
-  for (MCRegAliasIterator AI(ClassReg, &TRI, /*IncludeSelf=*/true);
-       AI.isValid(); ++AI)
-    if (PhysLive[*AI])
-      return true;
-  return false;
-}
-
-/// Post != constraints between VReg and all live vregs/physregs it
-/// conflicts with. Uses the widened def class for both the vreg and
-/// live vregs to correctly model the wider domains.
-void RegAllocProblem::postInterference(Register VReg) {
-  const TargetRegisterClass *RC = MRI.getRegClass(VReg);
-  for (Register LiveReg : Live) {
-    if (LiveReg == VReg)
-      continue;
-    const TargetRegisterClass *LiveRC = MRI.getRegClass(LiveReg);
-    if (!classesCanOverlap(RC, LiveRC))
-      continue;
-    int_rel(RegVar[VReg], IRT_NE, RegVar[LiveReg], 0);
-    LLVM_DEBUG(dbgs() << "  interference: " << printReg(VReg, &TRI) << " != "
-                      << printReg(LiveReg, &TRI) << "\n");
-    // Forbid aliasing pairs that != misses (e.g., A vs ALSB).
-    for (auto [P1, P2] : getAliasingPairs(RC, LiveRC)) {
-      BoolView B = newBoolVar();
-      int_rel_reif(RegVar[VReg], IRT_EQ, static_cast<int>(P1), B);
-      int_rel_half_reif(RegVar[LiveReg], IRT_NE, static_cast<int>(P2), B);
-    }
-  }
-  // Alias-aware physreg interference: exclude class members whose
-  // aliases are physically live.
-  for (MCPhysReg ClassReg : *RC) {
-    if (Reserved[ClassReg])
-      continue;
-    if (!physRegConflictsWithLive(ClassReg))
-      continue;
-    int_rel(RegVar[VReg], IRT_NE, static_cast<int>(ClassReg));
-    LLVM_DEBUG(dbgs() << "  interference: " << printReg(VReg, &TRI) << " != "
-                      << TRI.getName(ClassReg) << "\n");
-  }
 }
 
 } // namespace
