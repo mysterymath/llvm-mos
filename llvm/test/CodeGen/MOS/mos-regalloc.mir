@@ -14,9 +14,9 @@ registers:
 body: |
   bb.0:
     ; CHECK-LABEL: name: gpr_conflict
-    ; CHECK: $y = LDImm 3
+    ; CHECK: $a = LDImm 1
     ; CHECK-NEXT: $x = LDImm 2
-    ; CHECK-NEXT: $a = LDImm 1
+    ; CHECK-NEXT: $y = LDImm 3
     ; CHECK-NEXT: RTS implicit killed $a, implicit killed $x, implicit killed $y
     %0:gpr = LDImm 1
     %1:gpr = LDImm 2
@@ -82,8 +82,8 @@ tracksRegLiveness: true
 body: |
   bb.0:
     ; CHECK-LABEL: name: phys_def_clobber
-    ; CHECK: $x = LDImm 1
-    ; CHECK-NEXT: $a = LDImm 2
+    ; CHECK: $a = LDImm 2
+    ; CHECK-NEXT: $x = LDImm 1
     ; CHECK-NEXT: RTS implicit killed $a, implicit killed $x
     %0:gpr = LDImm 1
     %1:gpr = LDImm 2
@@ -101,8 +101,8 @@ tracksRegLiveness: true
 body: |
   bb.0:
     ; CHECK-LABEL: name: regmask_clobber
-    ; CHECK: JSR &fn, mos_csr, implicit-def dead $a, implicit-def dead $x
-    ; CHECK-NEXT: $a = LDImm 42
+    ; CHECK: $a = LDImm 42
+    ; CHECK-NEXT: JSR &fn, mos_csr, implicit-def dead $a, implicit-def dead $x
     ; CHECK-NEXT: RTS implicit killed $a
     %0:gpr = LDImm 42
     %1:anyi8 = COPY %0
@@ -132,12 +132,12 @@ tracksRegLiveness: true
 body: |
   bb.0:
     ; CHECK-LABEL: name: earlyclobber
-    ; CHECK: $rs14, dead early-clobber $a = LDImm16 42
+    ; CHECK: $rs11, dead early-clobber $a = LDImm16 42
     ; CHECK-NEXT: $x = LDImm 2
     ; CHECK-NEXT: $a = LDImm 1
-    ; CHECK-NEXT: $x = LDImag8 $rc28
+    ; CHECK-NEXT: $x = LDImag8 $rc22
     ; CHECK-NEXT: $rc0 = STImag8 $x
-    ; CHECK-NEXT: $x = LDImag8 $rc29
+    ; CHECK-NEXT: $x = LDImag8 $rc23
     ; CHECK-NEXT: $rc1 = STImag8 $x
     ; CHECK-NEXT: RTS implicit killed $a, implicit killed $x, implicit $rs0
     %0:gpr = LDImm 1
@@ -171,8 +171,8 @@ body: |
     ; CHECK-LABEL: name: def_copy
     ; CHECK: $a = LDImm 1
     ; CHECK-NEXT: $a = ANDImm killed $a, 42
-    ; CHECK-NEXT: dead $c = CMPImm killed $a, 10
     ; CHECK-NEXT: $a = LDImm 2
+    ; CHECK-NEXT: dead $c = CMPImm killed $a, 10
     ; CHECK-NEXT: RTS implicit killed $a
     %0:ac = LDImm 1
     %1:ac = ANDImm %0, 42
@@ -198,8 +198,8 @@ body: |
     ; CHECK: $a = LDImm 99
     ; CHECK-NEXT: $a = ANDImm killed $a, 42
     ; CHECK-NEXT: $x = COPY killed $a
-    ; CHECK-NEXT: $a = LDImm 1
     ; CHECK-NEXT: $c = LDImm1 0
+    ; CHECK-NEXT: $a = LDImm 1
     ; CHECK-NEXT: $a, dead $c, dead $v = ADCImm killed $a, 42, killed $c
     ; CHECK-NEXT: RTS implicit killed $a, implicit killed $x
     %0:ac = LDImm 1
@@ -226,9 +226,9 @@ tracksRegLiveness: true
 body: |
   bb.0:
     ; CHECK-LABEL: name: copy_creates_vreg
-    ; CHECK: $x = LDImm 1
+    ; CHECK: $x = LDImm 2
+    ; CHECK-NEXT: $x = LDImm 1
     ; CHECK-NEXT: dead $c = ASLIdx 42, killed $x
-    ; CHECK-NEXT: $x = LDImm 2
     ; CHECK-NEXT: dead $c = ASLIdx 43, killed $x
     ; CHECK-NEXT: RTS
     %0:xc = LDImm 1
@@ -294,10 +294,10 @@ tracksRegLiveness: true
 body: |
   bb.0:
     ; CHECK-LABEL: name: scheduling_reorder
-    ; CHECK: $x = LDImm 1
-    ; CHECK-NEXT: dead $c = ASLIdx 42, killed $x
+    ; CHECK: $x = LDImm 2
     ; CHECK-NEXT: $a = LDImm 0
-    ; CHECK-NEXT: $x = LDImm 2
+    ; CHECK-NEXT: $x = LDImm 1
+    ; CHECK-NEXT: dead $c = ASLIdx 42, killed $x
     ; CHECK-NEXT: dead $c = ASLIdx 43, killed $x
     ; CHECK-NEXT: RTS implicit killed $a
     $a = LDImm 0
@@ -306,4 +306,139 @@ body: |
     dead %2:cc = ASLIdx 42, %0
     dead %3:cc = ASLIdx 43, %1
     RTS implicit $a
+...
+
+# M9: Sub-register liveness tests
+
+# REG_SEQUENCE: compose two 8-bit values into a 16-bit pointer.
+# Both inputs are GPR (A register), so they can't be simultaneously live.
+# The solver must schedule copies to ZP sequentially.
+---
+name: reg_sequence_basic
+legalized: true
+regBankSelected: true
+selected: true
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: reg_sequence_basic
+    ; CHECK: $a = LDImm 99
+    ; CHECK-NEXT: $y = LDImm 42
+    ; CHECK-NEXT: $rc28 = STImag8 $y
+    ; CHECK-NEXT: $rc29 = STImag8 $a
+    ; CHECK-NEXT: $rc0 = STImag8 $y
+    ; CHECK-NEXT: $rc1 = STImag8 $a
+    ; CHECK-NEXT: RTS implicit $rs0
+    %0:gpr = LDImm 42
+    %1:gpr = LDImm 99
+    %2:imag16 = REG_SEQUENCE %0, %subreg.sublo, %1, %subreg.subhi
+    $rs0 = COPY %2
+    RTS implicit $rs0
+...
+
+# Same vreg used by two REG_SEQUENCEs with different partners.
+# Without freshening, %0 would get two conflicting adjacency constraints:
+# %0+1==%1 AND %0+1==%2, forcing %1==%2 — but they're different
+# simultaneously-live values. Freshening gives each REG_SEQUENCE its
+# own copy of %0, so each pair can be at a different location.
+---
+name: reg_sequence_conflicting_adj
+legalized: true
+regBankSelected: true
+selected: true
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: reg_sequence_conflicting_adj
+    ; CHECK: $y = LDImm 0
+    ; CHECK-NEXT: $rc2 = STImag8 $y
+    ; CHECK-NEXT: $a = LDImm 1
+    ; CHECK-NEXT: $rc3 = STImag8 $a
+    ; CHECK-NEXT: $rc0 = STImag8 $y
+    ; CHECK-NEXT: $rc1 = STImag8 $a
+    ; CHECK-NEXT: $a = LDImm 2
+    ; CHECK-NEXT: RTS implicit $rs0, implicit killed $rs1
+    %0:gpr = LDImm 0
+    %1:gpr = LDImm 1
+    %2:gpr = LDImm 2
+    %3:imag16 = REG_SEQUENCE %0, %subreg.sublo, %1, %subreg.subhi
+    %4:imag16 = REG_SEQUENCE %0, %subreg.sublo, %2, %subreg.subhi
+    $rs0 = COPY %3
+    $rs1 = COPY %4
+    RTS implicit $rs0, implicit $rs1
+...
+
+# EXTRACT_SUBREG: extract the low byte of a 16-bit pointer.
+# The 16-bit value is loaded natively, then the lo byte is extracted
+# and used as an 8-bit value.
+---
+name: extract_subreg_basic
+legalized: true
+regBankSelected: true
+selected: true
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: extract_subreg_basic
+    ; CHECK: $rs2, dead early-clobber $a = LDImm16 4660
+    ; CHECK-NEXT: $a = LDImag8 $rc4
+    ; CHECK-NEXT: RTS implicit killed $a
+    %0:imag16, dead %1:gpr = LDImm16 4660
+    %2:imag8 = EXTRACT_SUBREG %0, %subreg.sublo
+    $a = COPY %2
+    RTS implicit $a
+...
+
+# Partial liveness: extract sublo from an imag16, then reuse the hi
+# byte's slot for a new pair. The hi lane of %0 dies immediately (no
+# uses of subhi). A REG_SEQUENCE reuses %0's lo byte as the lo of a
+# new pair, forcing the new hi byte into %0.hi's slot via adjacency.
+# This only works if the hi lane's EndVar is independent and short.
+---
+name: extract_partial_liveness
+legalized: true
+regBankSelected: true
+selected: true
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: extract_partial_liveness
+    ; CHECK: $rs4, dead early-clobber $a = LDImm16 4660
+    ; CHECK-NEXT: $a = LDImm 99
+    ; CHECK-NEXT: $rc9 = STImag8 $a
+    ; CHECK-NEXT: $x = LDImag8 $rc8
+    ; CHECK-NEXT: $rc0 = STImag8 $x
+    ; CHECK-NEXT: $rc1 = STImag8 $a
+    ; CHECK-NEXT: RTS implicit $rs0
+    %0:imag16, dead %1:gpr = LDImm16 4660
+    %2:imag8 = EXTRACT_SUBREG %0, %subreg.sublo
+    %3:gpr = LDImm 99
+    %4:imag16 = REG_SEQUENCE %2, %subreg.sublo, %3, %subreg.subhi
+    $rs0 = COPY %4
+    RTS implicit $rs0
+...
+
+# INSERT_SUBREG: replace the hi byte of an Imag16 pair.
+# The output should reuse the same RS register as the input.
+---
+name: insert_subreg_basic
+legalized: true
+regBankSelected: true
+selected: true
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: insert_subreg_basic
+    ; CHECK: $rs3, dead early-clobber $a = LDImm16 4660
+    ; CHECK-NEXT: $a = LDImm 99
+    ; CHECK-NEXT: $rc7 = STImag8 $a
+    ; CHECK-NEXT: $x = LDImag8 $rc6
+    ; CHECK-NEXT: $rc0 = STImag8 $x
+    ; CHECK-NEXT: $rc1 = STImag8 $a
+    ; CHECK-NEXT: RTS implicit $rs0
+    %0:imag16, dead %1:gpr = LDImm16 4660
+    %2:gpr = LDImm 99
+    %3:imag16 = INSERT_SUBREG %0, %2, %subreg.subhi
+    $rs0 = COPY %3
+    RTS implicit $rs0
 ...
