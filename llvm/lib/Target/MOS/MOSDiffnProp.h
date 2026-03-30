@@ -47,6 +47,9 @@ class MOSDiffnProp : public Propagator {
   vec<IntVar *> YEnd;
   vec<BoolView> Present;
 
+  // Precomputed set of X values that any rectangle could cover.
+  std::vector<int> ActiveXVals;
+
   enum InfType { INF_REMVAL, INF_START_MIN, INF_END_MAX };
 
   struct Pinfo {
@@ -113,6 +116,18 @@ public:
       YEnd.push(YEnds[I]);
       Present.push(PresentFlags[I]);
     }
+
+    // Precompute active X values: any X value reachable by any rectangle.
+    std::vector<bool> XActive(NumXVals, false);
+    for (int I = 0; I < N; I++) {
+      for (int V = X[I]->getMin(); V <= X[I]->getMax(); V++)
+        if (X[I]->indomain(V))
+          for (int R = V; R < V + W[I] && R < NumXVals; R++)
+            XActive[R] = true;
+    }
+    for (int R = 0; R < NumXVals; R++)
+      if (XActive[R])
+        ActiveXVals.push_back(R);
 
     for (int I = 0; I < N; I++) {
       int Base = I * 4;

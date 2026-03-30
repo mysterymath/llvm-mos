@@ -7,8 +7,8 @@
 //===----------------------------------------------------------------------===//
 //
 // Constraint-programming register allocator for the MOS 6502, based on the
-// Unison framework (Castañeda Lozano et al., TOPLAS 2019). Uses the Chuffed
-// lazy clause generation solver.
+// Unison framework (Castañeda Lozano et al., TOPLAS 2019). Uses Google
+// OR-Tools CP-SAT solver.
 //
 // Each virtual register gets a CP variable whose domain is the set of
 // MCPhysReg values from its register class, plus start/end variables for
@@ -26,7 +26,6 @@
 
 #include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
-#include "MOSDiffnProp.h"
 #include "MOSInstrCost.h"
 #include "MOSRegisterInfo.h"
 #include "MOSSubtarget.h"
@@ -42,17 +41,16 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/Debug.h"
 
-#include "chuffed/core/engine.h"
-#include "chuffed/core/options.h"
-#include "chuffed/core/sat.h"
-#include "chuffed/globals/globals.h"
-#include "chuffed/ldsb/ldsb.h"
-#include "chuffed/primitives/primitives.h"
-#include "chuffed/support/vec.h"
+#include "ortools/sat/cp_model.h"
+#include "ortools/sat/cp_model_checker.h"
+#include "ortools/sat/cp_model_solver.h"
+#include "ortools/sat/sat_parameters.pb.h"
 
 #define DEBUG_TYPE "mos-regalloc"
 
 using namespace llvm;
+using namespace operations_research;
+using namespace operations_research::sat;
 
 namespace {
 
@@ -87,14 +85,13 @@ public:
 };
 
 // ============================================================================
-// RegAllocProblem — Chuffed CP model for a single basic block
+// RegAllocProblem — CP-SAT model for a single basic block
 // ============================================================================
 
 /// Builds a constraint problem for integrated register allocation and
-/// instruction scheduling over a single basic block. The solver
-/// simultaneously picks physical registers for vregs and schedules
-/// instruction order, using temporal overlap constraints for interference.
-class RegAllocProblem : public Problem {
+/// instruction scheduling over a single basic block. Uses OR-Tools CP-SAT
+/// solver with NoOverlap2D for interference.
+class RegAllocProblem {
   MachineFunction &MF;
   const MOSSubtarget &STI;
   const TargetRegisterInfo &TRI;
@@ -102,24 +99,32 @@ class RegAllocProblem : public Problem {
   MachineRegisterInfo &MRI;
   BitVector Reserved;
 
-  // CP variables and solution.
-  IndexedMap<IntVar *, VirtReg2IndexFunctor> RegVar;
-  IndexedMap<IntVar *, VirtReg2IndexFunctor> StartVar;
-  IndexedMap<IntVar *, VirtReg2IndexFunctor> EndVar;
+  // CP-SAT model and solution.
+  CpModelBuilder Model;
+  CpSolverResponse Response;
+
+  // CP variables: IntVar is a lightweight value type (index into Model).
+  // Default-constructed IntVar has index < 0 (invalid sentinel).
+  IndexedMap<sat::IntVar, VirtReg2IndexFunctor> RegVar;
+  IndexedMap<sat::IntVar, VirtReg2IndexFunctor> StartVar;
+  IndexedMap<sat::IntVar, VirtReg2IndexFunctor> EndVar;
   IndexedMap<MCPhysReg, VirtReg2IndexFunctor> Solution;
   bool Solved = false;
 
-  // Scheduling variables and solution.
+  static bool isValidVar(sat::IntVar V) { return V.index() >= 0; }
+
+  // Scheduling variables.
   // Each instruction has an issue slot [0, N). Within each slot, there
   // are 3 sub-points: use (3*issue), clobber (3*issue+1), def (3*issue+2).
-  // Start/End vars use sub-points; IssueVar uses slots.
-  DenseMap<MachineInstr *, IntVar *> IssueVar;
-  DenseMap<MachineInstr *, IntVar *> UsePoint;  // 3 * issue
-  DenseMap<MachineInstr *, IntVar *> DefPoint;  // 3 * issue + 2
+  DenseMap<MachineInstr *, sat::IntVar> IssueVar;
+  DenseMap<MachineInstr *, sat::IntVar> UsePoint;  // 3 * issue
+  DenseMap<MachineInstr *, sat::IntVar> DefPoint;  // 3 * issue + 2
   DenseMap<MachineInstr *, unsigned> InstrIndex;
   DenseMap<MachineInstr *, unsigned> IssueSolution;
-  vec<IntVar *> IssueOrder; // Issue vars in original block order.
   unsigned NumIssueSlots = 0;
+
+  // NoOverlap2D constraint for rectangle packing (initialized in buildConstraints).
+  std::optional<NoOverlap2DConstraint> NoOverlap;
 
   // Cost mode for copy optimization.
   MOSInstrCost::Mode CostMode;
@@ -127,7 +132,7 @@ class RegAllocProblem : public Problem {
   // --- Helpers ---
 
   SmallVector<MCPhysReg> getClassPhysRegs(const TargetRegisterClass *RC);
-  IntVar *makeRegVar(const TargetRegisterClass *RC);
+  sat::IntVar makeRegVar(const TargetRegisterClass *RC);
 
   // --- Model construction ---
 
@@ -135,26 +140,22 @@ class RegAllocProblem : public Problem {
   void createIssueVariables(MachineBasicBlock &MBB);
   void createVariables();
   void buildConstraints(MachineBasicBlock &MBB);
-  void configureBranching();
   void configureObjective(MachineBasicBlock &MBB);
 
 public:
   RegAllocProblem(MachineFunction &MF, MachineBasicBlock &MBB);
 
-  void recordSolution();
+  bool solve();
   bool solved() const { return Solved; }
   MCPhysReg getAssignment(Register VReg) const { return Solution[VReg]; }
   void applySchedule(MachineBasicBlock &MBB);
   void lowerCopies(MachineBasicBlock &MBB);
-
-  void print(std::ostream &) override {}
 };
 
 // ============================================================================
 // MOSRegAlloc implementation
 // ============================================================================
 
-static void resetChuffedState();
 static void applySolution(MachineBasicBlock &MBB, RegAllocProblem &Problem);
 
 bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
@@ -168,18 +169,12 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
     LLVM_DEBUG(dbgs() << "  Block " << MBB.getName() << ": " << MBB.size()
                       << " instrs\n");
 
-    resetChuffedState();
-
-    auto *Problem = new RegAllocProblem(MF, MBB);
-    engine.setSolutionCallback([](::Problem *P) {
-      static_cast<RegAllocProblem *>(P)->recordSolution();
-    });
-    engine.solve(Problem);
-
-    if (!Problem->solved())
+    // Each block gets a fresh CP-SAT model — no global state to reset.
+    RegAllocProblem Problem(MF, MBB);
+    if (!Problem.solve())
       report_fatal_error("MOS CP register allocator failed");
 
-    applySolution(MBB, *Problem);
+    applySolution(MBB, Problem);
   }
 
   MF.getRegInfo().clearVirtRegs();
@@ -187,23 +182,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   return true;
 }
 
-/// Chuffed accumulates variables and propagators in global state across
-/// solve() calls. Reset everything so each block gets a fresh solver.
-static void resetChuffedState() {
-  engine.~Engine();
-  new (&engine) Engine();
-  sat.~SAT();
-  new (&sat) SAT();
-  ldsb.~LDSB();
-  new (&ldsb) LDSB();
-
-  so.nof_solutions = 1;
-  so.print_sol = false;
-  so.verbosity = 0;
-}
-
-/// Apply the solved register assignments: lower COPYs, then replace all
-/// virtual register operands with their assigned physical registers.
+/// Apply the solved register assignments: reorder, lower COPYs, then
+/// replace all virtual register operands with their assigned physical regs.
 static void applySolution(MachineBasicBlock &MBB, RegAllocProblem &Problem) {
   Problem.applySchedule(MBB);
   Problem.lowerCopies(MBB);
@@ -228,25 +208,51 @@ RegAllocProblem::RegAllocProblem(MachineFunction &MF, MachineBasicBlock &MBB)
   createIssueVariables(MBB);
   createVariables();
   buildConstraints(MBB);
-  configureBranching();
   configureObjective(MBB);
 }
 
-void RegAllocProblem::recordSolution() {
+bool RegAllocProblem::solve() {
+  CpModelProto Proto = Model.Build();
+  std::string Error = ValidateCpModel(Proto);
+  if (!Error.empty())
+    LLVM_DEBUG(dbgs() << "  Model validation: " << Error << "\n");
+
+  SatParameters Params;
+  Params.set_num_workers(1);
+  Params.set_log_search_progress(false);
+  Response = SolveWithParameters(Proto, Params);
+
+  if (Response.status() != CpSolverStatus::OPTIMAL &&
+      Response.status() != CpSolverStatus::FEASIBLE) {
+    LLVM_DEBUG(dbgs() << "  CP-SAT status: " << Response.status()
+                      << " (" << CpSolverResponseStats(Response) << ")\n");
+    return false;
+  }
+
   Solved = true;
-  for (unsigned I = 0, E = MRI.getNumVirtRegs(); I < E; ++I) {
+  LLVM_DEBUG(dbgs() << "  CP-SAT: "
+                    << (Response.status() == CpSolverStatus::OPTIMAL
+                            ? "OPTIMAL"
+                            : "FEASIBLE")
+                    << ", objective=" << Response.objective_value() << "\n");
+  unsigned NumVRegs = MRI.getNumVirtRegs();
+  Solution.grow(Register::index2VirtReg(NumVRegs ? NumVRegs - 1 : 0));
+  for (unsigned I = 0; I < NumVRegs; ++I) {
     Register VReg = Register::index2VirtReg(I);
-    if (!RegVar[VReg])
+    if (!isValidVar(RegVar[VReg]))
       continue;
-    Solution[VReg] = static_cast<MCPhysReg>(RegVar[VReg]->getVal());
+    Solution[VReg] =
+        static_cast<MCPhysReg>(SolutionIntegerValue(Response, RegVar[VReg]));
     LLVM_DEBUG(dbgs() << "  " << printReg(VReg, &TRI) << " -> "
                       << TRI.getName(Solution[VReg]) << "\n");
   }
   for (auto &[MI, Var] : IssueVar) {
-    IssueSolution[MI] = static_cast<unsigned>(Var->getVal());
+    IssueSolution[MI] =
+        static_cast<unsigned>(SolutionIntegerValue(Response, Var));
     LLVM_DEBUG(dbgs() << "  issue[" << InstrIndex[MI] << "] -> "
                       << IssueSolution[MI] << ": " << *MI);
   }
+  return true;
 }
 
 // ============================================================================
@@ -333,23 +339,19 @@ void RegAllocProblem::insertCopies(MachineBasicBlock &MBB) {
 // Variable and constraint construction
 // ============================================================================
 
-/// Create a Chuffed IntVar whose domain is the allocatable physical
+/// Create a CP-SAT IntVar whose domain is the allocatable physical
 /// registers in RC.
-IntVar *RegAllocProblem::makeRegVar(const TargetRegisterClass *RC) {
+sat::IntVar RegAllocProblem::makeRegVar(const TargetRegisterClass *RC) {
   SmallVector<MCPhysReg> PhysRegs = getClassPhysRegs(RC);
-  int Lo = *llvm::min_element(PhysRegs);
-  int Hi = *llvm::max_element(PhysRegs);
-  IntVar *V = newIntVar(Lo, Hi);
-  for (int Val = Lo; Val <= Hi; ++Val)
-    if (!RC->contains(static_cast<MCPhysReg>(Val)) || Reserved[Val])
-      int_rel(V, IRT_NE, Val);
-  return V;
+  std::vector<int64_t> Vals;
+  for (MCPhysReg R : PhysRegs)
+    Vals.push_back(static_cast<int64_t>(R));
+  return Model.NewIntVar(Domain::FromValues(Vals));
 }
 
 /// Create issue (scheduling position) variables for each instruction.
 /// Posts dependency constraints (data, memory, terminator, physreg).
 void RegAllocProblem::createIssueVariables(MachineBasicBlock &MBB) {
-  // Count non-debug instructions first, then create variables.
   unsigned N = 0;
   for (MachineInstr &MI : MBB)
     if (!MI.isDebugInstr())
@@ -358,47 +360,30 @@ void RegAllocProblem::createIssueVariables(MachineBasicBlock &MBB) {
   if (N == 0)
     return;
 
+  int MaxSubPoint = 3 * (N - 1) + 2;
+
   for (MachineInstr &MI : MBB) {
     if (MI.isDebugInstr())
       continue;
     InstrIndex[&MI] = IssueVar.size();
-    IntVar *V = newIntVar(0, N - 1);
+    sat::IntVar V = Model.NewIntVar(Domain(0, N - 1));
     IssueVar[&MI] = V;
-    IssueOrder.push(V);
 
     // Sub-points: use = 3*issue, def = 3*issue+2.
-    // Channel via int_linear: 3*issue - subpoint = -offset.
-    int MaxSubPoint = 3 * (N - 1) + 2;
-    IntVar *UP = newIntVar(0, MaxSubPoint);
-    IntVar *DP = newIntVar(0, MaxSubPoint);
-    {
-      vec<int> Coeffs;
-      Coeffs.push(3);
-      Coeffs.push(-1);
-      vec<IntVar *> Vars;
-      Vars.push(V);
-      Vars.push(UP);
-      int_linear(Coeffs, Vars, IRT_EQ, 0); // 3*V - UP = 0
-    }
-    {
-      vec<int> Coeffs;
-      Coeffs.push(3);
-      Coeffs.push(-1);
-      vec<IntVar *> Vars;
-      Vars.push(V);
-      Vars.push(DP);
-      int_linear(Coeffs, Vars, IRT_EQ, -2); // 3*V - DP = -2
-    }
+    sat::IntVar UP = Model.NewIntVar(Domain(0, MaxSubPoint));
+    sat::IntVar DP = Model.NewIntVar(Domain(0, MaxSubPoint));
+    Model.AddEquality(UP, 3 * LinearExpr(V));
+    Model.AddEquality(DP, 3 * LinearExpr(V) + 2);
     UsePoint[&MI] = UP;
     DefPoint[&MI] = DP;
   }
 
   // All-different: each instruction at a unique position.
-  vec<IntVar *> AllIssue;
+  std::vector<sat::IntVar> AllIssue;
   for (MachineInstr &MI : MBB)
     if (!MI.isDebugInstr())
-      AllIssue.push(IssueVar[&MI]);
-  all_different(AllIssue);
+      AllIssue.push_back(IssueVar[&MI]);
+  Model.AddAllDifferent(AllIssue);
 
   // --- Dependency constraints ---
 
@@ -414,20 +399,18 @@ void RegAllocProblem::createIssueVariables(MachineBasicBlock &MBB) {
       MachineInstr *UseMI = MO.getParent();
       if (UseMI == DefMI)
         continue;
-      // issue(use) > issue(def), i.e., issue(use) >= issue(def) + 1
-      int_rel(IssueVar[UseMI], IRT_GE, IssueVar[DefMI], 1);
+      Model.AddGreaterThan(IssueVar[UseMI], IssueVar[DefMI]);
     }
   }
 
-  // Memory ordering: chain all memory-accessing instructions in original
-  // program order (conservative).
+  // Memory ordering: chain all memory-accessing instructions.
   MachineInstr *PrevMem = nullptr;
   for (MachineInstr &MI : MBB) {
     if (MI.isDebugInstr())
       continue;
     if (MI.mayLoadOrStore() || MI.hasUnmodeledSideEffects() || MI.isCall()) {
       if (PrevMem)
-        int_rel(IssueVar[&MI], IRT_GE, IssueVar[PrevMem], 1);
+        Model.AddGreaterThan(IssueVar[&MI], IssueVar[PrevMem]);
       PrevMem = &MI;
     }
   }
@@ -445,26 +428,24 @@ void RegAllocProblem::createIssueVariables(MachineBasicBlock &MBB) {
     if (MI.isDebugInstr())
       continue;
     if (MI.isTerminator())
-      int_rel(IssueVar[&MI], IRT_EQ, static_cast<int>(InstrIndex[&MI]));
+      Model.AddEquality(IssueVar[&MI],
+                         static_cast<int64_t>(InstrIndex[&MI]));
     else
-      int_rel(IssueVar[&MI], IRT_LT, static_cast<int>(TermStart));
+      Model.AddLessThan(IssueVar[&MI], static_cast<int64_t>(TermStart));
   }
 
-  // Physical register ordering: def before use in original order.
-  // Scan forward, tracking last physreg def; post ordering to first use.
+  // Physical register ordering: def before use.
   DenseMap<MCPhysReg, MachineInstr *> PhysRegDef;
   for (MachineInstr &MI : MBB) {
     if (MI.isDebugInstr())
       continue;
-    // Process uses first — they read the value from the prior def.
     for (const MachineOperand &MO : MI.operands()) {
       if (!MO.isReg() || !MO.isUse() || !MO.getReg().isPhysical())
         continue;
       MCPhysReg Reg = MO.getReg().asMCReg();
       if (auto It = PhysRegDef.find(Reg); It != PhysRegDef.end())
-        int_rel(IssueVar[&MI], IRT_GE, IssueVar[It->second], 1);
+        Model.AddGreaterThan(IssueVar[&MI], IssueVar[It->second]);
     }
-    // Then process defs — update the tracking.
     for (const MachineOperand &MO : MI.operands()) {
       if (!MO.isReg() || !MO.isDef() || !MO.getReg().isPhysical())
         continue;
@@ -475,7 +456,7 @@ void RegAllocProblem::createIssueVariables(MachineBasicBlock &MBB) {
   LLVM_DEBUG(dbgs() << "  " << N << " issue variables created\n");
 }
 
-/// Create one Chuffed IntVar per allocatable vreg. The domain is the
+/// Create one CP-SAT IntVar per allocatable vreg. The domain is the
 /// vreg's MRI class, which insertCopies has already widened to
 /// getLargestLegalSuperClass.
 void RegAllocProblem::createVariables() {
@@ -501,25 +482,24 @@ void RegAllocProblem::createVariables() {
     // - Normal def: start = DefPoint (3*issue+2)
     // - Earlyclobber def: start = UsePoint (3*issue)
     // - Use: end >= UsePoint+1 (alive through the use sub-point)
-    StartVar[VReg] = newIntVar(0, MaxSubPoint);
-    EndVar[VReg] = newIntVar(0, MaxSubPoint);
+    StartVar[VReg] = Model.NewIntVar(Domain(0, MaxSubPoint));
+    EndVar[VReg] = Model.NewIntVar(Domain(0, MaxSubPoint));
 
     // Channeling: start at def point, end past use point.
     MachineOperand &DefMO = *MRI.def_begin(VReg);
     MachineInstr *DefMI = DefMO.getParent();
     if (DefMO.isEarlyClobber())
-      int_rel(StartVar[VReg], IRT_EQ, UsePoint[DefMI], 0);
+      Model.AddEquality(StartVar[VReg], UsePoint[DefMI]);
     else
-      int_rel(StartVar[VReg], IRT_EQ, DefPoint[DefMI], 0);
+      Model.AddEquality(StartVar[VReg], DefPoint[DefMI]);
 
     for (MachineOperand &MO : MRI.use_nodbg_operands(VReg)) {
       MachineInstr *UseMI = MO.getParent();
-      // end > UsePoint, i.e., end >= UsePoint + 1.
-      int_rel(EndVar[VReg], IRT_GE, UsePoint[UseMI], 1);
+      Model.AddGreaterThan(EndVar[VReg], UsePoint[UseMI]);
     }
 
     // end >= start
-    int_rel(EndVar[VReg], IRT_GE, StartVar[VReg], 0);
+    Model.AddGreaterOrEqual(EndVar[VReg], StartVar[VReg]);
 
     LLVM_DEBUG(dbgs() << "  " << printReg(VReg, &TRI) << " ("
                       << TRI.getRegClassName(RC) << "): "
@@ -527,9 +507,9 @@ void RegAllocProblem::createVariables() {
   }
 }
 
-/// Build interference constraints using the DiffnProp global propagator.
-/// Creates rectangles in (reg_unit × time) space for both vregs and
-/// physreg segments, then hands them to MOSDiffnProp.
+/// Build interference constraints using CP-SAT NoOverlap2D.
+/// Creates rectangles in (reg_unit x time) space for both vregs and
+/// physreg segments.
 void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
   unsigned NumVRegs = MRI.getNumVirtRegs();
   int MaxSubPoint = std::max(1u, NumIssueSlots) * 3 - 1;
@@ -548,48 +528,53 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
       Register UseReg =
           MI.getOperand(MI.findTiedOperandIdx(MO.getOperandNo())).getReg();
       if (UseReg.isVirtual())
-        int_rel(RegVar[DefReg], IRT_EQ, RegVar[UseReg], 0);
+        Model.AddEquality(RegVar[DefReg], RegVar[UseReg]);
     }
   }
 
-  // --- Build DiffnProp rectangles ---
+  // --- Build NoOverlap2D rectangles ---
   //
   // For each vreg, for each allocatable register R in its class, for
-  // each contiguous reg-unit range in R: create a rectangle with fixed
-  // X and W, present iff RegVar == R. Rectangles from the same register
-  // share the same present BoolView.
+  // each contiguous reg-unit range in R: create an optional rectangle
+  // present iff RegVar == R.
 
-  vec<IntVar *> DiffnX;
-  vec<int> DiffnW;
-  vec<IntVar *> DiffnYStart;
-  vec<IntVar *> DiffnYEnd;
-  vec<BoolView> DiffnPresent;
+  NoOverlap = Model.AddNoOverlap2D();
+  unsigned RectCount = 0;
 
   for (unsigned I = 0; I < NumVRegs; ++I) {
     Register VReg = Register::index2VirtReg(I);
-    if (!RegVar[VReg])
+    if (!isValidVar(RegVar[VReg]))
       continue;
     const TargetRegisterClass *RC = MRI.getRegClass(VReg);
+
+    // Size variable for this vreg's live range (reused across all rectangles).
+    sat::IntVar SizeVar = Model.NewIntVar(Domain(0, MaxSubPoint));
+    Model.AddEquality(SizeVar,
+                      LinearExpr(EndVar[VReg]) - LinearExpr(StartVar[VReg]));
 
     for (MCPhysReg R : *RC) {
       if (Reserved[R])
         continue;
 
       // present <=> RegVar[VReg] == R
-      BoolView PresentVar = newBoolVar();
-      int_rel_reif(RegVar[VReg], IRT_EQ, static_cast<int>(R), PresentVar);
+      BoolVar PresentVar = Model.NewBoolVar();
+      Model.AddEquality(RegVar[VReg], static_cast<int64_t>(R))
+          .OnlyEnforceIf(PresentVar);
+      Model.AddNotEqual(RegVar[VReg], static_cast<int64_t>(R))
+          .OnlyEnforceIf(PresentVar.Not());
 
       // Split R's reg units into contiguous ranges.
       int RangeStart = -1, Prev = -1;
       for (MCRegUnit U : TRI.regunits(R)) {
         int UInt = static_cast<int>(U);
         if (Prev >= 0 && UInt != Prev + 1) {
-          // Emit previous range.
-          DiffnX.push(newIntVar(RangeStart, RangeStart));
-          DiffnW.push(Prev - RangeStart + 1);
-          DiffnYStart.push(StartVar[VReg]);
-          DiffnYEnd.push(EndVar[VReg]);
-          DiffnPresent.push(PresentVar);
+          int Width = Prev - RangeStart + 1;
+          IntervalVar XIv = Model.NewOptionalFixedSizeIntervalVar(
+              RangeStart, Width, PresentVar);
+          IntervalVar YIv = Model.NewOptionalIntervalVar(
+              StartVar[VReg], SizeVar, EndVar[VReg], PresentVar);
+          NoOverlap->AddRectangle(XIv, YIv);
+          ++RectCount;
           RangeStart = UInt;
         } else if (Prev < 0) {
           RangeStart = UInt;
@@ -597,22 +582,24 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
         Prev = UInt;
       }
       if (RangeStart >= 0) {
-        DiffnX.push(newIntVar(RangeStart, RangeStart));
-        DiffnW.push(Prev - RangeStart + 1);
-        DiffnYStart.push(StartVar[VReg]);
-        DiffnYEnd.push(EndVar[VReg]);
-        DiffnPresent.push(PresentVar);
+        int Width = Prev - RangeStart + 1;
+        IntervalVar XIv = Model.NewOptionalFixedSizeIntervalVar(
+            RangeStart, Width, PresentVar);
+        IntervalVar YIv = Model.NewOptionalIntervalVar(
+            StartVar[VReg], SizeVar, EndVar[VReg], PresentVar);
+        NoOverlap->AddRectangle(XIv, YIv);
+        ++RectCount;
       }
     }
   }
 
   // Physical register segments: scan for physreg defs/uses, build
-  // segments, add as fixed-X rectangles to DiffnProp.
+  // segments, add as always-present rectangles to NoOverlap2D.
   {
   struct PhysSegment {
     MCPhysReg Reg;
-    IntVar *Start;
-    IntVar *End;
+    sat::IntVar Start;
+    sat::IntVar End;
   };
   SmallVector<PhysSegment> PhysSegments;
   DenseMap<MCPhysReg, unsigned> OpenSegment;
@@ -631,7 +618,8 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
       auto It = OpenSegment.find(Reg);
       if (It != OpenSegment.end())
         // end > UsePoint, i.e., end >= UsePoint + 1
-        int_rel(PhysSegments[It->second].End, IRT_GE, UsePoint[&MI], 1);
+        Model.AddGreaterOrEqual(PhysSegments[It->second].End,
+                                LinearExpr(UsePoint[&MI]) + 1);
     }
 
     // Regmask clobbers: point at clobber sub-point (3*issue+1).
@@ -649,19 +637,22 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
       }
 
       // Clobber point = UsePoint + 1 = 3*issue + 1.
-      IntVar *S = newIntVar(0, MaxSubPoint);
-      IntVar *E = newIntVar(0, MaxSubPoint);
-      int_rel(S, IRT_EQ, UsePoint[&MI], 1);
-      int_rel(E, IRT_EQ, UsePoint[&MI], 1);
+      sat::IntVar S = Model.NewIntVar(Domain(0, MaxSubPoint));
+      sat::IntVar E = Model.NewIntVar(Domain(0, MaxSubPoint));
+      Model.AddEquality(S, LinearExpr(UsePoint[&MI]) + 1);
+      Model.AddEquality(E, LinearExpr(UsePoint[&MI]) + 1);
+      // S == E, so size is 0 — point clobber.
+      sat::IntVar ClobSize = Model.NewConstant(0);
       int RangeStart = -1, Prev = -1;
       for (int U = ClobberedUnits.find_first(); U != -1;
            U = ClobberedUnits.find_next(U)) {
         if (Prev >= 0 && U != Prev + 1) {
-          DiffnX.push(newIntVar(RangeStart, RangeStart));
-          DiffnW.push(Prev - RangeStart + 1);
-          DiffnYStart.push(S);
-          DiffnYEnd.push(E);
-          DiffnPresent.push(bv_true);
+          int Width = Prev - RangeStart + 1;
+          IntervalVar XIv =
+              Model.NewFixedSizeIntervalVar(RangeStart, Width);
+          IntervalVar YIv = Model.NewIntervalVar(S, ClobSize, E);
+          NoOverlap->AddRectangle(XIv, YIv);
+          ++RectCount;
           RangeStart = U;
         } else if (Prev < 0) {
           RangeStart = U;
@@ -669,11 +660,12 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
         Prev = U;
       }
       if (RangeStart >= 0) {
-        DiffnX.push(newIntVar(RangeStart, RangeStart));
-        DiffnW.push(Prev - RangeStart + 1);
-        DiffnYStart.push(S);
-        DiffnYEnd.push(E);
-        DiffnPresent.push(bv_true);
+        int Width = Prev - RangeStart + 1;
+        IntervalVar XIv =
+            Model.NewFixedSizeIntervalVar(RangeStart, Width);
+        IntervalVar YIv = Model.NewIntervalVar(S, ClobSize, E);
+        NoOverlap->AddRectangle(XIv, YIv);
+        ++RectCount;
       }
     }
 
@@ -687,31 +679,34 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
       if (MO.isDead())
         continue;
       // Physreg def: start at def point (or use point if earlyclobber).
-      IntVar *Start = MO.isEarlyClobber() ? UsePoint[&MI] : DefPoint[&MI];
-      IntVar *S = newIntVar(0, MaxSubPoint);
-      IntVar *E = newIntVar(0, MaxSubPoint);
-      int_rel(S, IRT_EQ, Start, 0);
-      int_rel(E, IRT_GE, Start, 0);
+      sat::IntVar Start =
+          MO.isEarlyClobber() ? UsePoint[&MI] : DefPoint[&MI];
+      sat::IntVar S = Model.NewIntVar(Domain(0, MaxSubPoint));
+      sat::IntVar E = Model.NewIntVar(Domain(0, MaxSubPoint));
+      Model.AddEquality(S, Start);
+      Model.AddGreaterOrEqual(E, Start);
       unsigned Idx = PhysSegments.size();
       PhysSegments.push_back({Reg, S, E});
       OpenSegment[Reg] = Idx;
     }
   }
 
-  // Add physreg segments as fixed-X, always-present rectangles,
+  // Add physreg segments as always-present rectangles,
   // one per contiguous reg-unit range.
   for (const auto &Seg : PhysSegments) {
-    BoolView PresentVar = bv_true;
-
+    sat::IntVar SegSize = Model.NewIntVar(Domain(0, MaxSubPoint));
+    Model.AddEquality(SegSize,
+                      LinearExpr(Seg.End) - LinearExpr(Seg.Start));
     int RangeStart = -1, Prev = -1;
     for (MCRegUnit U : TRI.regunits(Seg.Reg)) {
       int UInt = static_cast<int>(U);
       if (Prev >= 0 && UInt != Prev + 1) {
-        DiffnX.push(newIntVar(RangeStart, RangeStart));
-        DiffnW.push(Prev - RangeStart + 1);
-        DiffnYStart.push(Seg.Start);
-        DiffnYEnd.push(Seg.End);
-        DiffnPresent.push(PresentVar);
+        int Width = Prev - RangeStart + 1;
+        IntervalVar XIv =
+            Model.NewFixedSizeIntervalVar(RangeStart, Width);
+        IntervalVar YIv = Model.NewIntervalVar(Seg.Start, SegSize, Seg.End);
+        NoOverlap->AddRectangle(XIv, YIv);
+        ++RectCount;
         RangeStart = UInt;
       } else if (Prev < 0) {
         RangeStart = UInt;
@@ -719,56 +714,25 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
       Prev = UInt;
     }
     if (RangeStart >= 0) {
-      DiffnX.push(newIntVar(RangeStart, RangeStart));
-      DiffnW.push(Prev - RangeStart + 1);
-      DiffnYStart.push(Seg.Start);
-      DiffnYEnd.push(Seg.End);
-      DiffnPresent.push(PresentVar);
+      int Width = Prev - RangeStart + 1;
+      IntervalVar XIv =
+          Model.NewFixedSizeIntervalVar(RangeStart, Width);
+      IntervalVar YIv = Model.NewIntervalVar(Seg.Start, SegSize, Seg.End);
+      NoOverlap->AddRectangle(XIv, YIv);
+      ++RectCount;
     }
   } // end physreg segments
   }
 
-  // Create the global no-overlap propagator.
-  if (DiffnX.size() > 0) {
-    LLVM_DEBUG({
-      dbgs() << "  DiffnProp: " << DiffnX.size() << " rectangles, "
-             << NumRegUnits << " reg units\n";
-      for (int I = 0; I < DiffnX.size(); I++)
-        dbgs() << "    rect[" << I << "]: x=[" << DiffnX[I]->getMin() << ","
-               << DiffnX[I]->getMax() << "] w=" << DiffnW[I]
-               << " y=[" << DiffnYStart[I]->getMin() << ".."
-               << DiffnYStart[I]->getMax() << ", " << DiffnYEnd[I]->getMin()
-               << ".." << DiffnYEnd[I]->getMax() << "]"
-               << " present=" << (DiffnPresent[I].isFixed()
-                                      ? (DiffnPresent[I].isTrue() ? "T" : "F")
-                                      : "?")
-               << "\n";
-    });
-    new MOSDiffnProp(DiffnX, DiffnW, DiffnYStart, DiffnYEnd, DiffnPresent,
-                     NumRegUnits);
-  }
-}
-
-void RegAllocProblem::configureBranching() {
-  // Branch on register variables first (most constrained), then issue.
-  vec<IntVar *> RegVars;
-  for (unsigned I = 0, E = MRI.getNumVirtRegs(); I != E; ++I) {
-    Register VReg = Register::index2VirtReg(I);
-    if (RegVar[VReg])
-      RegVars.push(RegVar[VReg]);
-  }
-  branch(RegVars, VAR_SIZE_MIN, VAL_MIN);
-
-  // Issue variables in original block order for deterministic branching.
-  if (IssueOrder.size() > 0)
-    branch(IssueOrder, VAR_SIZE_MIN, VAL_MIN);
+  LLVM_DEBUG(dbgs() << "  NoOverlap2D: " << RectCount << " rectangles, "
+                    << NumRegUnits << " reg units\n");
 }
 
 /// Minimize total copy cost. For each COPY with at least one vreg
 /// operand, the cost depends on the vreg's assignment (0 when coalesced).
 void RegAllocProblem::configureObjective(MachineBasicBlock &MBB) {
   const auto &MOSTRI = static_cast<const MOSRegisterInfo &>(TRI);
-  vec<IntVar *> CostVars;
+  std::vector<sat::IntVar> CostVars;
 
   for (MachineInstr &MI : MBB) {
     if (!MI.isCopy())
@@ -778,29 +742,30 @@ void RegAllocProblem::configureObjective(MachineBasicBlock &MBB) {
 
     // Identify the variable operand (vreg with a CP variable) and the
     // set of possible physical registers for each side.
-    IntVar *IndexVar = nullptr;
+    sat::IntVar IndexVar;
     const TargetRegisterClass *IndexRC = nullptr;
     bool IndexIsSrc = true;
     auto DstPhysRegs = SmallVector<MCPhysReg>();
     auto SrcPhysRegs = SmallVector<MCPhysReg>();
 
-    if (SrcReg.isVirtual() && RegVar[SrcReg] && DstReg.isPhysical()) {
-      // vreg → physreg: index by source vreg.
+    if (SrcReg.isVirtual() && isValidVar(RegVar[SrcReg]) &&
+        DstReg.isPhysical()) {
+      // vreg -> physreg: index by source vreg.
       IndexVar = RegVar[SrcReg];
       IndexRC = MRI.getRegClass(SrcReg);
       SrcPhysRegs = getClassPhysRegs(IndexRC);
       DstPhysRegs.push_back(static_cast<MCPhysReg>(DstReg.asMCReg()));
-    } else if (DstReg.isVirtual() && RegVar[DstReg] &&
+    } else if (DstReg.isVirtual() && isValidVar(RegVar[DstReg]) &&
                SrcReg.isPhysical()) {
-      // physreg → vreg: index by dest vreg.
+      // physreg -> vreg: index by dest vreg.
       IndexVar = RegVar[DstReg];
       IndexRC = MRI.getRegClass(DstReg);
       IndexIsSrc = false;
       DstPhysRegs = getClassPhysRegs(IndexRC);
       SrcPhysRegs.push_back(static_cast<MCPhysReg>(SrcReg.asMCReg()));
-    } else if (DstReg.isVirtual() && RegVar[DstReg] &&
-               SrcReg.isVirtual() && RegVar[SrcReg]) {
-      // vreg → vreg: cost depends on both variables. Use a table
+    } else if (DstReg.isVirtual() && isValidVar(RegVar[DstReg]) &&
+               SrcReg.isVirtual() && isValidVar(RegVar[SrcReg])) {
+      // vreg -> vreg: cost depends on both variables. Use a table
       // constraint over (SrcVar, DstVar, CostVar) with one tuple per
       // (src_phys, dst_phys) pair.
       const TargetRegisterClass *SrcRC = MRI.getRegClass(SrcReg);
@@ -809,7 +774,7 @@ void RegAllocProblem::configureObjective(MachineBasicBlock &MBB) {
       auto DstRegs = getClassPhysRegs(DstRC);
 
       int MaxCost = 0;
-      vec<vec<int>> Tuples;
+      std::vector<std::vector<int64_t>> Tuples;
       for (MCPhysReg S : SrcRegs) {
         for (MCPhysReg D : DstRegs) {
           int Cost = 0;
@@ -817,10 +782,9 @@ void RegAllocProblem::configureObjective(MachineBasicBlock &MBB) {
             const TargetRegisterClass *Clobber = nullptr;
             Cost = MOSTRI.copyCost(D, S, STI, &Clobber).value(CostMode);
           }
-          Tuples.push();
-          Tuples.last().push(static_cast<int>(S));
-          Tuples.last().push(static_cast<int>(D));
-          Tuples.last().push(Cost);
+          Tuples.push_back({static_cast<int64_t>(S),
+                            static_cast<int64_t>(D),
+                            static_cast<int64_t>(Cost)});
           MaxCost = std::max(MaxCost, Cost);
         }
       }
@@ -830,24 +794,23 @@ void RegAllocProblem::configureObjective(MachineBasicBlock &MBB) {
 
       LLVM_DEBUG(dbgs() << "  copy cost (vreg-vreg, max=" << MaxCost
                         << "): " << MI);
-      IntVar *CostVar = newIntVar(0, MaxCost);
-      vec<IntVar *> TableVars;
-      TableVars.push(RegVar[SrcReg]);
-      TableVars.push(RegVar[DstReg]);
-      TableVars.push(CostVar);
-      table(TableVars, Tuples);
-      CostVars.push(CostVar);
+      sat::IntVar CostVar = Model.NewIntVar(Domain(0, MaxCost));
+      std::vector<sat::IntVar> TableVars = {RegVar[SrcReg], RegVar[DstReg],
+                                            CostVar};
+      TableConstraint TC = Model.AddAllowedAssignments(TableVars);
+      for (const auto &Tuple : Tuples)
+        TC.AddTuple(Tuple);
+      CostVars.push_back(CostVar);
       continue;
     } else {
       continue;
     }
 
-    // Build cost table indexed by IndexVar's physreg (vreg↔phys cases).
+    // Build cost table indexed by IndexVar's physreg (vreg<->phys cases).
     int Lo = *llvm::min_element(getClassPhysRegs(IndexRC));
     int Hi = *llvm::max_element(getClassPhysRegs(IndexRC));
 
-    vec<int> CostTable;
-    CostTable.growTo(Hi - Lo + 1, 0);
+    std::vector<int64_t> CostTable(Hi - Lo + 1, 0);
 
     for (MCPhysReg IdxReg : *IndexRC) {
       if (Reserved[IdxReg])
@@ -871,22 +834,20 @@ void RegAllocProblem::configureObjective(MachineBasicBlock &MBB) {
     }
 
     int MaxCost = 0;
-    for (unsigned I = 0; I < CostTable.size(); ++I)
-      MaxCost = std::max(MaxCost, CostTable[I]);
+    for (size_t I = 0; I < CostTable.size(); ++I)
+      MaxCost = std::max(MaxCost, static_cast<int>(CostTable[I]));
     if (MaxCost == 0)
       continue; // All paths are free, nothing to optimize.
 
     LLVM_DEBUG(dbgs() << "  copy cost (max=" << MaxCost << "): " << MI);
-    IntVar *CostVar = newIntVar(0, MaxCost);
-    array_int_element(IndexVar, CostTable, CostVar, Lo);
-    CostVars.push(CostVar);
+    sat::IntVar CostVar = Model.NewIntVar(Domain(0, MaxCost));
+    Model.AddElement(LinearExpr(IndexVar) - Lo, CostTable, CostVar);
+    CostVars.push_back(CostVar);
   }
 
-  if (CostVars.size() == 0)
+  if (CostVars.empty())
     return;
-  IntVar *TotalCost = newIntVar(0, 10000);
-  int_linear(CostVars, IRT_EQ, TotalCost);
-  optimize(TotalCost, OPT_MIN);
+  Model.Minimize(LinearExpr::Sum(CostVars));
 }
 
 // ============================================================================

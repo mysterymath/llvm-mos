@@ -36,10 +36,8 @@ echo "****************************************"
 echo "Step 2: Apply patches"
 echo "****************************************"
 
-# Fix: missing #ifdef USE_GUROBI guards in model_builder_helper.cc
-# (causes link errors when building with -DUSE_GUROBI=OFF on main branch)
-# No patches needed — we only build the proto generation target,
-# which doesn't link and therefore doesn't hit Gurobi/Xpress issues.
+# No upstream patches needed for the build step — we only build protos.
+# Post-copy patches are applied in Step 7b below.
 
 # =========================================================================
 echo "****************************************"
@@ -147,6 +145,13 @@ echo "****************************************"
 echo "Step 7: Install LLVM CMakeLists.txt"
 echo "****************************************"
 cp "${SCRIPT_DIR}/ortools_CMakeLists.txt" "${DEST}/CMakeLists.txt"
+
+# =========================================================================
+echo "****************************************"
+echo "Step 7b: Apply source patches"
+echo "****************************************"
+
+patch -d "${DEST}" -p1 < "${SCRIPT_DIR}/ortools_portable_file.patch"
 
 # =========================================================================
 echo "****************************************"

@@ -1377,14 +1377,11 @@ add_subdirectory(utils/TableGen)
 
 add_subdirectory(include)
 
-# Chuffed CP solver (used by MOS register allocator).
+# OR-Tools CP-SAT solver (used by MOS register allocator).
 # Must come before add_subdirectory(lib) so the target exists when
 # LLVMMOSCodeGen links against it.
-set(CP_PROFILER OFF CACHE BOOL "Disable CP profiler in Chuffed" FORCE)
-set(CHUFFED_LIBRARY_ONLY ON CACHE BOOL "Only build Chuffed libraries" FORCE)
-add_subdirectory(${LLVM_THIRD_PARTY_DIR}/chuffed
-  ${CMAKE_CURRENT_BINARY_DIR}/third-party/chuffed)
-set_target_properties(chuffed PROPERTIES FOLDER "Third-Party/Chuffed")
+add_subdirectory(${LLVM_THIRD_PARTY_DIR}/ortools
+  ${CMAKE_CURRENT_BINARY_DIR}/third-party/ortools)
 
 add_subdirectory(lib)
 
