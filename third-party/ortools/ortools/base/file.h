@@ -14,6 +14,11 @@
 #ifndef OR_TOOLS_BASE_FILE_H_
 #define OR_TOOLS_BASE_FILE_H_
 
+#if defined(__PORTABLE_PLATFORM__)
+// Under portable platform, drat_writer.h provides a minimal File stub.
+// Skip the full File class to avoid zlib and other system dependencies.
+#else
+
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -165,5 +170,7 @@ absl::Status Delete(absl::string_view path, Options options);
 absl::Status Exists(absl::string_view path, Options options);
 
 }  // namespace file
+
+#endif  // !__PORTABLE_PLATFORM__
 
 #endif  // OR_TOOLS_BASE_FILE_H_

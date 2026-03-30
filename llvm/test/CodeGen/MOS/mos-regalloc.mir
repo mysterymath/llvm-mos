@@ -14,9 +14,9 @@ registers:
 body: |
   bb.0:
     ; CHECK-LABEL: name: gpr_conflict
-    ; CHECK: $a = LDImm 1
+    ; CHECK: $y = LDImm 3
     ; CHECK-NEXT: $x = LDImm 2
-    ; CHECK-NEXT: $y = LDImm 3
+    ; CHECK-NEXT: $a = LDImm 1
     ; CHECK-NEXT: RTS implicit killed $a, implicit killed $x, implicit killed $y
     %0:gpr = LDImm 1
     %1:gpr = LDImm 2
@@ -132,12 +132,12 @@ tracksRegLiveness: true
 body: |
   bb.0:
     ; CHECK-LABEL: name: earlyclobber
-    ; CHECK: $x = LDImm 2
-    ; CHECK-NEXT: $rs1, dead early-clobber $a = LDImm16 42
+    ; CHECK: $rs14, dead early-clobber $a = LDImm16 42
+    ; CHECK-NEXT: $x = LDImm 2
     ; CHECK-NEXT: $a = LDImm 1
-    ; CHECK-NEXT: $x = LDImag8 $rc2
+    ; CHECK-NEXT: $x = LDImag8 $rc28
     ; CHECK-NEXT: $rc0 = STImag8 $x
-    ; CHECK-NEXT: $x = LDImag8 $rc3
+    ; CHECK-NEXT: $x = LDImag8 $rc29
     ; CHECK-NEXT: $rc1 = STImag8 $x
     ; CHECK-NEXT: RTS implicit killed $a, implicit killed $x, implicit $rs0
     %0:gpr = LDImm 1
@@ -195,13 +195,11 @@ tracksRegLiveness: true
 body: |
   bb.0:
     ; CHECK-LABEL: name: copy_forced
-    ; CHECK: $a = LDImm 1
-    ; CHECK-NEXT: $y = TA $a
-    ; CHECK-NEXT: $a = LDImm 99
+    ; CHECK: $a = LDImm 99
     ; CHECK-NEXT: $a = ANDImm killed $a, 42
-    ; CHECK-NEXT: $x = TA $a
+    ; CHECK-NEXT: $x = COPY killed $a
+    ; CHECK-NEXT: $a = LDImm 1
     ; CHECK-NEXT: $c = LDImm1 0
-    ; CHECK-NEXT: $x = COPY $a
     ; CHECK-NEXT: $a, dead $c, dead $v = ADCImm killed $a, 42, killed $c
     ; CHECK-NEXT: RTS implicit killed $a, implicit killed $x
     %0:ac = LDImm 1
@@ -296,12 +294,11 @@ tracksRegLiveness: true
 body: |
   bb.0:
     ; CHECK-LABEL: name: scheduling_reorder
-    ; CHECK: $a = LDImm 1
-    ; CHECK-NEXT: $x = TA $a
+    ; CHECK: $x = LDImm 1
     ; CHECK-NEXT: dead $c = ASLIdx 42, killed $x
+    ; CHECK-NEXT: $a = LDImm 0
     ; CHECK-NEXT: $x = LDImm 2
     ; CHECK-NEXT: dead $c = ASLIdx 43, killed $x
-    ; CHECK-NEXT: $a = LDImm 0
     ; CHECK-NEXT: RTS implicit killed $a
     $a = LDImm 0
     %0:xc = LDImm 1

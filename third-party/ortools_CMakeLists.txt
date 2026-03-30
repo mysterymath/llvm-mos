@@ -19,6 +19,16 @@ list(FILTER _DEFS EXCLUDE REGEX "_LIBCPP_HARDENING_MODE")
 set_directory_properties(PROPERTIES COMPILE_DEFINITIONS "${_DEFS}")
 
 # ======================================================================
+# Always build in release mode. The CP-SAT solver is unusably slow in
+# debug mode, and we never need to debug into third-party code.
+# ======================================================================
+if(NOT MSVC)
+  add_compile_options(-O2 -DNDEBUG)
+else()
+  add_compile_options(/O2 /DNDEBUG)
+endif()
+
+# ======================================================================
 # Suppress warnings from third-party code under LLVM's strict flags.
 # ======================================================================
 if(NOT MSVC)
@@ -66,25 +76,65 @@ set(protobuf_ABSL_PROVIDER "package" CACHE STRING "" FORCE)
 add_subdirectory(protobuf EXCLUDE_FROM_ALL)
 
 # ======================================================================
+# Add all abseil/protobuf targets to the LLVM export set.
+# LLVMMOSCodeGen (an exported LLVM library) depends on ortools, which
+# depends on these. CMake requires all transitive deps of exported
+# targets to also be exported.
+# ======================================================================
+function(export_directory_targets_to_llvm dir)
+  get_property(_targets DIRECTORY ${dir} PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(_tgt IN LISTS _targets)
+    get_target_property(_type ${_tgt} TYPE)
+    get_target_property(_aliased ${_tgt} ALIASED_TARGET)
+    get_target_property(_imported ${_tgt} IMPORTED)
+    if(_aliased OR _imported)
+      continue()
+    endif()
+    # Only export real library targets (STATIC, OBJECT, INTERFACE).
+    if(_type MATCHES "STATIC_LIBRARY|OBJECT_LIBRARY|INTERFACE_LIBRARY")
+      set_property(GLOBAL APPEND PROPERTY LLVM_EXPORTS ${_tgt})
+      install(TARGETS ${_tgt} EXPORT LLVMExports
+        ARCHIVE DESTINATION "lib${LLVM_LIBDIR_SUFFIX}")
+    endif()
+  endforeach()
+  # Recurse into subdirectories.
+  get_property(_subdirs DIRECTORY ${dir} PROPERTY SUBDIRECTORIES)
+  foreach(_sub IN LISTS _subdirs)
+    export_directory_targets_to_llvm(${_sub})
+  endforeach()
+endfunction()
+
+export_directory_targets_to_llvm(${CMAKE_CURRENT_SOURCE_DIR}/abseil-cpp)
+export_directory_targets_to_llvm(${CMAKE_CURRENT_SOURCE_DIR}/protobuf)
+
+# ======================================================================
 # OR-Tools CP-SAT sources
 # ======================================================================
 
 # Collect source files for each OR-Tools component.
 file(GLOB ORTOOLS_SAT_SRCS ortools/sat/*.cc)
-list(FILTER ORTOOLS_SAT_SRCS EXCLUDE REGEX "(sat_runner|circuit_main|_benchmark)\\.cc$")
+list(FILTER ORTOOLS_SAT_SRCS EXCLUDE REGEX "(sat_runner|circuit_main|swig_helper|_benchmark)\\.cc$")
 file(GLOB ORTOOLS_SAT_CAPI_SRCS ortools/sat/c_api/*.cc)
 file(GLOB ORTOOLS_GLOP_SRCS ortools/glop/*.cc)
+# Exclude file readers not available under __PORTABLE_PLATFORM__.
 file(GLOB ORTOOLS_LP_DATA_SRCS ortools/lp_data/*.cc)
+list(FILTER ORTOOLS_LP_DATA_SRCS EXCLUDE REGEX "(mps_reader|model_reader|sol_reader)")
+# solve_flow_model.cc uses File I/O.
 file(GLOB ORTOOLS_GRAPH_SRCS ortools/graph/*.cc)
+list(FILTER ORTOOLS_GRAPH_SRCS EXCLUDE REGEX "solve_flow_model\\.cc$")
 # graph_base only exists in OR-Tools main, not v9.12.
 file(GLOB ORTOOLS_GRAPH_BASE_SRCS ortools/graph_base/*.cc)
+# set_cover_reader.cc uses File I/O.
 file(GLOB ORTOOLS_ALGORITHMS_SRCS ortools/algorithms/*.cc)
+list(FILTER ORTOOLS_ALGORITHMS_SRCS EXCLUDE REGEX "set_cover_reader\\.cc$")
 # set_cover only exists in OR-Tools main, not v9.12.
 file(GLOB ORTOOLS_SET_COVER_SRCS ortools/set_cover/*.cc)
 file(GLOB ORTOOLS_BASE_SRCS ortools/base/*.cc)
-# file.cc and recordio.cc depend on bzip2/zlib which we don't need.
-list(FILTER ORTOOLS_BASE_SRCS EXCLUDE REGEX "(file|recordio)\\.cc$")
+# Exclude file I/O and related utilities (not available under __PORTABLE_PLATFORM__).
+list(FILTER ORTOOLS_BASE_SRCS EXCLUDE REGEX "(file|filesystem|gzipfile|gzipstring|zipfile|recordio|temp_path)\\.cc$")
+# Exclude file I/O utilities not available under __PORTABLE_PLATFORM__.
 file(GLOB ORTOOLS_UTIL_SRCS ortools/util/*.cc)
+list(FILTER ORTOOLS_UTIL_SRCS EXCLUDE REGEX "(file_util|qap_reader)\\.cc$")
 file(GLOB ORTOOLS_PORT_SRCS ortools/port/*.cc)
 
 # Exclude benchmarks and tests from all components.
@@ -101,8 +151,7 @@ endforeach()
 # Generated protobuf sources.
 file(GLOB_RECURSE ORTOOLS_PROTO_SRCS ortools/generated/*.pb.cc)
 
-# Build as a plain static library. We don't use add_llvm_library because
-# our deps (abseil, protobuf) aren't in the LLVM export set.
+# Build as a static library, exported alongside LLVM libraries.
 add_library(ortools STATIC
   ${ORTOOLS_SAT_SRCS}
   ${ORTOOLS_SAT_CAPI_SRCS}
@@ -135,6 +184,7 @@ target_compile_definitions(ortools PUBLIC
   OR_TOOLS_MAJOR=9
   OR_TOOLS_MINOR=12
   OR_TOOLS_PATCH=0
+  __PORTABLE_PLATFORM__  # Disable file I/O (avoids zlib dependency)
 )
 
 # Match upstream compile options.
@@ -150,8 +200,15 @@ set_target_properties(ortools PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
+
 # Link dependencies. PRIVATE so they don't leak into LLVM's export set.
-target_link_libraries(ortools PRIVATE
+# Add ortools to the LLVM export set.
+set_property(GLOBAL APPEND PROPERTY LLVM_EXPORTS ortools)
+install(TARGETS ortools EXPORT LLVMExports
+  ARCHIVE DESTINATION "lib${LLVM_LIBDIR_SUFFIX}")
+
+# PUBLIC because ortools headers include protobuf/abseil headers.
+target_link_libraries(ortools PUBLIC
   absl::base
   absl::flags
   absl::flags_parse
