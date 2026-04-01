@@ -564,22 +564,26 @@ void RegAllocProblem::createIssueVariables(MachineBasicBlock &MBB) {
       Model.AddLessThan(IssueVar[&MI], static_cast<int64_t>(TermStart));
   }
 
-  // Physical register ordering: def before use.
-  DenseMap<MCPhysReg, MachineInstr *> PhysRegDef;
+  // Physical register ordering: def before use, keyed by reg-unit
+  // to catch aliased registers (e.g., $rs0 def → $rc0 use).
+  DenseMap<unsigned, MachineInstr *> RegUnitDef;
   for (MachineInstr &MI : MBB) {
     if (MI.isDebugInstr() || isConstraintMarker(MI))
       continue;
     for (const MachineOperand &MO : MI.operands()) {
       if (!MO.isReg() || !MO.isUse() || !MO.getReg().isPhysical())
         continue;
-      MCPhysReg Reg = MO.getReg().asMCReg();
-      if (auto It = PhysRegDef.find(Reg); It != PhysRegDef.end())
-        Model.AddGreaterThan(IssueVar[&MI], IssueVar[It->second]);
+      for (MCRegUnit U : TRI.regunits(MO.getReg().asMCReg()))
+        if (auto It = RegUnitDef.find(static_cast<unsigned>(U));
+            It != RegUnitDef.end())
+          if (It->second != &MI)
+            Model.AddGreaterThan(IssueVar[&MI], IssueVar[It->second]);
     }
     for (const MachineOperand &MO : MI.operands()) {
       if (!MO.isReg() || !MO.isDef() || !MO.getReg().isPhysical())
         continue;
-      PhysRegDef[MO.getReg().asMCReg()] = &MI;
+      for (MCRegUnit U : TRI.regunits(MO.getReg().asMCReg()))
+        RegUnitDef[static_cast<unsigned>(U)] = &MI;
     }
   }
 
@@ -734,19 +738,8 @@ void RegAllocProblem::createVariables() {
       Model.AddGreaterThan(EV, StartVar[VReg]);
     }
 
-    // Extend lane EndVars past each real use point. Uses by constraint
-    // markers are resolved by tracing through the structural DAG.
-    for (MachineOperand &MO : MRI.use_nodbg_operands(VReg)) {
-      MachineInstr *UseMI = MO.getParent();
-      if (isConstraintMarker(*UseMI))
-        continue;
-      // A full-register use extends all lanes.
-      for (unsigned Bit : LaneBits) {
-        sat::IntVar EV = getEndVar(VReg, Bit);
-        if (isValidVar(EV))
-          Model.AddGreaterThan(EV, UsePoint[UseMI]);
-      }
-    }
+    // EndVar extension is handled entirely by resolveUseToSegments
+    // in the pass below — no per-vreg extension here.
 
     LLVM_DEBUG(dbgs() << "  " << printReg(VReg, &TRI) << " ("
                       << TRI.getRegClassName(RC) << "): "
@@ -838,29 +831,6 @@ void RegAllocProblem::createVariables() {
     }
   }
 
-  // Third pass: for each real instruction that uses a structural vreg,
-  // resolve the use back through the DAG to extend real segments.
-  for (unsigned I = 0; I < NumVRegs; ++I) {
-    Register VReg = Register::index2VirtReg(I);
-    if (MRI.reg_nodbg_empty(VReg))
-      continue;
-    MachineInstr *DefMI = MRI.getVRegDef(VReg);
-    if (!DefMI || !isConstraintMarker(*DefMI))
-      continue;
-
-    // For each real use of this structural vreg, trace back to the
-    // real segments that provide the value.
-    for (MachineOperand &MO : MRI.use_nodbg_operands(VReg)) {
-      MachineInstr *UseMI = MO.getParent();
-      if (isConstraintMarker(*UseMI))
-        continue;
-      SmallVector<BoolVar> CoalescePath;
-      // Use the full lane mask of the vreg — a real use of a structural
-      // vreg keeps all its lanes alive.
-      LaneBitmask UseMask = MRI.getMaxLaneMaskForVReg(VReg);
-      resolveUseToSegments(VReg, UseMask, UseMI, CoalescePath);
-    }
-  }
 }
 
 /// Build interference constraints using CP-SAT NoOverlap2D.
@@ -911,6 +881,30 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
 
     LLVM_DEBUG(dbgs() << "  coalesce: " << printReg(SrcReg, &TRI) << " -> "
                       << printReg(DstReg, &TRI) << "\n");
+  }
+
+  // --- Resolve uses: extend EndVars through coalesce/structural chains ---
+  //
+  // For every use of every vreg, resolveUseToSegments traces back to
+  // extend the real segment's EndVar. This is the sole mechanism for
+  // EndVar extension — it handles unconditional (direct) and conditional
+  // (coalesced) extensions uniformly.
+  {
+  unsigned NumVRegs = MRI.getNumVirtRegs();
+  for (unsigned I = 0; I < NumVRegs; ++I) {
+    Register VReg = Register::index2VirtReg(I);
+    if (MRI.reg_nodbg_empty(VReg))
+      continue;
+
+    for (MachineOperand &MO : MRI.use_nodbg_operands(VReg)) {
+      MachineInstr *UseMI = MO.getParent();
+      if (isConstraintMarker(*UseMI))
+        continue;
+      SmallVector<BoolVar> CoalescePath;
+      LaneBitmask UseMask = MRI.getMaxLaneMaskForVReg(VReg);
+      resolveUseToSegments(VReg, UseMask, UseMI, CoalescePath);
+    }
+  }
   }
 
   // --- Build NoOverlap2D rectangles ---
@@ -1064,13 +1058,20 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
           ClobberedUnits.set(static_cast<unsigned>(U));
       }
 
+      LLVM_DEBUG({
+        dbgs() << "  regmask clobber: "
+               << ClobberedUnits.count() << " reg-units [";
+        for (int U = ClobberedUnits.find_first(); U != -1;
+             U = ClobberedUnits.find_next(U))
+          dbgs() << U << " ";
+        dbgs() << "] from " << MI;
+      });
       // Clobber point = UsePoint + 1 = 3*issue + 1.
       sat::IntVar S = Model.NewIntVar(Domain(0, MaxSubPoint));
       sat::IntVar E = Model.NewIntVar(Domain(0, MaxSubPoint));
       Model.AddEquality(S, LinearExpr(UsePoint[&MI]) + 1);
-      Model.AddEquality(E, LinearExpr(UsePoint[&MI]) + 1);
-      // S == E, so size is 0 — point clobber.
-      sat::IntVar ClobSize = Model.NewConstant(0);
+      Model.AddEquality(E, LinearExpr(UsePoint[&MI]) + 2);
+      sat::IntVar ClobSize = Model.NewConstant(1);
       int RangeStart = -1, Prev = -1;
       for (int U = ClobberedUnits.find_first(); U != -1;
            U = ClobberedUnits.find_next(U)) {
@@ -1104,18 +1105,25 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
       if (Reserved[Reg])
         continue;
       OpenSegment.erase(Reg);
-      if (MO.isDead())
-        continue;
       // Physreg def: start at def point (or use point if earlyclobber).
+      // Even dead defs clobber the register and must block it.
       sat::IntVar Start =
           MO.isEarlyClobber() ? UsePoint[&MI] : DefPoint[&MI];
       sat::IntVar S = Model.NewIntVar(Domain(0, MaxSubPoint));
       sat::IntVar E = Model.NewIntVar(Domain(0, MaxSubPoint));
       Model.AddEquality(S, Start);
-      Model.AddGreaterOrEqual(E, Start);
+      Model.AddGreaterThan(E, Start);
       unsigned Idx = PhysSegments.size();
       PhysSegments.push_back({Reg, S, E});
-      OpenSegment[Reg] = Idx;
+      if (!MO.isDead())
+        OpenSegment[Reg] = Idx;
+      LLVM_DEBUG({
+        dbgs() << "  physseg[" << Idx << "] "
+               << TRI.getName(Reg) << " units=[";
+        for (MCRegUnit U : TRI.regunits(Reg))
+          dbgs() << static_cast<int>(U) << " ";
+        dbgs() << "] def by " << MI;
+      });
     }
   }
 
@@ -1152,51 +1160,168 @@ void RegAllocProblem::buildConstraints(MachineBasicBlock &MBB) {
   } // end physreg segments
   }
 
-  LLVM_DEBUG(dbgs() << "  NoOverlap2D: " << RectCount << " rectangles, "
-                    << NumRegUnits << " reg units\n");
-
-  // --- Adjacency constraints for REG_SEQUENCE ---
+  // --- COPY clobber rectangles ---
   //
-  // For each REG_SEQUENCE composing an Imag16 from two Imag8 inputs:
-  // RegVar(hi_input) == RegVar(lo_input) + 1, and lo must be even.
+  // When a COPY can't coalesce and the copy path requires a GPR
+  // temporary (determined by copyCost), block that GPR's reg-units at
+  // the COPY's clobber sub-point.  The clobber is active when:
+  //   !coalesced AND src ≠ clobber_reg AND dst ≠ clobber_reg
+  // (If src or dst IS the clobber register, no intermediate is needed.)
+  {
+  const auto &MOSTRI = static_cast<const MOSRegisterInfo &>(TRI);
   for (MachineInstr &MI : MBB) {
-    if (MI.getOpcode() != TargetOpcode::REG_SEQUENCE)
+    if (!MI.isCopy())
+      continue;
+    Register DstReg = MI.getOperand(0).getReg();
+    Register SrcReg = MI.getOperand(1).getReg();
+
+    bool HasVRegSrc = SrcReg.isVirtual() && isValidVar(RegVar[SrcReg]);
+    bool HasVRegDst = DstReg.isVirtual() && isValidVar(RegVar[DstReg]);
+    if (!HasVRegSrc && !HasVRegDst)
       continue;
 
-    Register LoReg, HiReg;
-    for (unsigned OpIdx = 1, E = MI.getNumOperands(); OpIdx < E;
-         OpIdx += 2) {
-      Register SrcReg = MI.getOperand(OpIdx).getReg();
-      unsigned SubIdx = MI.getOperand(OpIdx + 1).getImm();
-      if (SubIdx == MOS::sublo)
-        LoReg = SrcReg;
-      else if (SubIdx == MOS::subhi)
-        HiReg = SrcReg;
+    // Collect possible physregs for each side.
+    SmallVector<MCPhysReg> SrcPhysRegs, DstPhysRegs;
+    if (HasVRegSrc)
+      SrcPhysRegs = getClassPhysRegs(MRI.getRegClass(SrcReg));
+    else
+      SrcPhysRegs.push_back(static_cast<MCPhysReg>(SrcReg.asMCReg()));
+    if (HasVRegDst)
+      DstPhysRegs = getClassPhysRegs(MRI.getRegClass(DstReg));
+    else
+      DstPhysRegs.push_back(static_cast<MCPhysReg>(DstReg.asMCReg()));
+
+    // Find the clobber register: pick the first allocatable register in
+    // the clobber class returned by copyCost for any non-coalesced pair.
+    MCPhysReg ClobberPhys = 0;
+    for (MCPhysReg S : SrcPhysRegs) {
+      for (MCPhysReg D : DstPhysRegs) {
+        if (S == D)
+          continue;
+        const TargetRegisterClass *C = nullptr;
+        MOSTRI.copyCost(D, S, STI, &C);
+        if (C) {
+          for (MCPhysReg R : *C)
+            if (!Reserved[R]) {
+              ClobberPhys = R;
+              break;
+            }
+          break;
+        }
+      }
+      if (ClobberPhys)
+        break;
+    }
+    if (!ClobberPhys)
+      continue;
+
+    // Build the "clobber active" BoolVar.
+    // Start with "not coalesced".
+    BoolVar NotCoal;
+    if (HasVRegSrc && HasVRegDst && CoalesceBool[DstReg].index() >= 0) {
+      NotCoal = CoalesceBool[DstReg].Not();
+    } else if (HasVRegSrc && !HasVRegDst) {
+      NotCoal = Model.NewBoolVar();
+      Model.AddNotEqual(RegVar[SrcReg],
+                        static_cast<int64_t>(DstReg.asMCReg()))
+          .OnlyEnforceIf(NotCoal);
+      Model.AddEquality(RegVar[SrcReg],
+                        static_cast<int64_t>(DstReg.asMCReg()))
+          .OnlyEnforceIf(NotCoal.Not());
+    } else if (!HasVRegSrc && HasVRegDst) {
+      NotCoal = Model.NewBoolVar();
+      Model.AddNotEqual(RegVar[DstReg],
+                        static_cast<int64_t>(SrcReg.asMCReg()))
+          .OnlyEnforceIf(NotCoal);
+      Model.AddEquality(RegVar[DstReg],
+                        static_cast<int64_t>(SrcReg.asMCReg()))
+          .OnlyEnforceIf(NotCoal.Not());
+    } else {
+      continue;
     }
 
-    if (LoReg.isValid() && HiReg.isValid() && LoReg.isVirtual() &&
-        HiReg.isVirtual() && isValidVar(RegVar[LoReg]) &&
-        isValidVar(RegVar[HiReg])) {
-      // hi = lo + 1
-      Model.AddEquality(RegVar[HiReg], LinearExpr(RegVar[LoReg]) + 1);
+    // Check if the clobber register is reachable from src/dst domains.
+    bool SrcCanBeClobber = llvm::is_contained(SrcPhysRegs, ClobberPhys);
+    bool DstCanBeClobber = llvm::is_contained(DstPhysRegs, ClobberPhys);
 
-      // lo must be the sublo of a valid RS pair (even-aligned RC).
-      Register OutReg = MI.getOperand(0).getReg();
-      const TargetRegisterClass *OutRC = MRI.getRegClass(OutReg);
-      std::vector<int64_t> ValidLo;
-      for (MCPhysReg R : *OutRC) {
-        if (Reserved[R])
-          continue;
-        if (MCPhysReg Lo = TRI.getSubReg(R, MOS::sublo))
-          ValidLo.push_back(static_cast<int64_t>(Lo));
+    BoolVar ClobberActive;
+    if (!SrcCanBeClobber && !DstCanBeClobber) {
+      // Neither side can be the clobber → active whenever not coalesced.
+      ClobberActive = NotCoal;
+    } else {
+      // Need: !Coal AND src ≠ clobber AND dst ≠ clobber.
+      SmallVector<BoolVar> Conds = {NotCoal};
+
+      if (SrcCanBeClobber && HasVRegSrc) {
+        BoolVar SrcNotClob = Model.NewBoolVar();
+        Model.AddNotEqual(RegVar[SrcReg],
+                          static_cast<int64_t>(ClobberPhys))
+            .OnlyEnforceIf(SrcNotClob);
+        Model.AddEquality(RegVar[SrcReg],
+                          static_cast<int64_t>(ClobberPhys))
+            .OnlyEnforceIf(SrcNotClob.Not());
+        Conds.push_back(SrcNotClob);
       }
-      Model.AddLinearConstraint(RegVar[LoReg],
-                                Domain::FromValues(ValidLo));
+      if (DstCanBeClobber && HasVRegDst) {
+        BoolVar DstNotClob = Model.NewBoolVar();
+        Model.AddNotEqual(RegVar[DstReg],
+                          static_cast<int64_t>(ClobberPhys))
+            .OnlyEnforceIf(DstNotClob);
+        Model.AddEquality(RegVar[DstReg],
+                          static_cast<int64_t>(ClobberPhys))
+            .OnlyEnforceIf(DstNotClob.Not());
+        Conds.push_back(DstNotClob);
+      }
 
-      LLVM_DEBUG(dbgs() << "  adjacency: " << printReg(LoReg, &TRI)
-                        << " + 1 == " << printReg(HiReg, &TRI) << "\n");
+      ClobberActive = Model.NewBoolVar();
+      // ClobberActive => all conditions
+      for (BoolVar C : Conds)
+        Model.AddImplication(ClobberActive, C);
+      // all conditions => ClobberActive
+      SmallVector<BoolVar> Clause = {ClobberActive};
+      for (BoolVar C : Conds)
+        Clause.push_back(C.Not());
+      Model.AddBoolOr(Clause);
+    }
+
+    // Create clobber rectangle at ClobberPhys's reg-units.
+    sat::IntVar ClobS = Model.NewIntVar(Domain(0, MaxSubPoint));
+    sat::IntVar ClobE = Model.NewIntVar(Domain(0, MaxSubPoint));
+    Model.AddEquality(ClobS, LinearExpr(UsePoint[&MI]) + 1);
+    Model.AddEquality(ClobE, LinearExpr(UsePoint[&MI]) + 2);
+    sat::IntVar ClobSize = Model.NewConstant(1);
+
+    int ClobRangeStart = -1, ClobPrev = -1;
+    for (MCRegUnit U : TRI.regunits(ClobberPhys)) {
+      int UInt = static_cast<int>(U);
+      if (ClobPrev >= 0 && UInt != ClobPrev + 1) {
+        int Width = ClobPrev - ClobRangeStart + 1;
+        IntervalVar XIv = Model.NewOptionalFixedSizeIntervalVar(
+            ClobRangeStart, Width, ClobberActive);
+        IntervalVar YIv = Model.NewOptionalIntervalVar(ClobS, ClobSize,
+                                                       ClobE, ClobberActive);
+        NoOverlap->AddRectangle(XIv, YIv);
+        ++RectCount;
+        ClobRangeStart = UInt;
+      } else if (ClobPrev < 0) {
+        ClobRangeStart = UInt;
+      }
+      ClobPrev = UInt;
+    }
+    if (ClobRangeStart >= 0) {
+      int Width = ClobPrev - ClobRangeStart + 1;
+      IntervalVar XIv = Model.NewOptionalFixedSizeIntervalVar(
+          ClobRangeStart, Width, ClobberActive);
+      IntervalVar YIv = Model.NewOptionalIntervalVar(ClobS, ClobSize, ClobE,
+                                                     ClobberActive);
+      NoOverlap->AddRectangle(XIv, YIv);
+      ++RectCount;
     }
   }
+  }
+
+  LLVM_DEBUG(dbgs() << "  NoOverlap2D: " << RectCount << " rectangles, "
+                    << NumRegUnits << " reg units\n");
 }
 
 /// Minimize total copy cost. For each COPY with at least one vreg
