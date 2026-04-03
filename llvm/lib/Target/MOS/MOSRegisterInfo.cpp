@@ -1019,13 +1019,13 @@ MOSInstrCost MOSRegisterInfo::copyCost(Register DestReg, Register SrcReg,
       SrcReg = SrcReg8;
       if (DestReg8) {
         DestReg = DestReg8;
-        return copyCost(DestReg, SrcReg, STI);
+        return copyCost(DestReg, SrcReg, STI, Clobber);
       }
       if (DestReg == MOS::C) {
         // Cmp #1
         MOSInstrCost Cost = AluImmCost;
         if (!MOS::GPRRegClass.contains(SrcReg))
-          Cost += copyCost(MOS::A, SrcReg, STI);
+          Cost += copyCost(MOS::A, SrcReg, STI, Clobber);
         return Cost;
       }
 
@@ -1043,19 +1043,25 @@ MOSInstrCost MOSRegisterInfo::copyCost(Register DestReg, Register SrcReg,
         return PushCost + PopCost + BranchCost + BitCost + JumpCost + ClvCost;
       }
       // [PHA]; COPY; BNE; BIT setv; JMP; CLV; [PLA]
-      return copyCost(MOS::A, SrcReg, STI) + BranchCost + BitCost + JumpCost +
-             ClvCost;
+      // Uses a GPR temporary to hold the copied value.
+      if (Clobber)
+        *Clobber = &MOS::GPRRegClass;
+      return copyCost(MOS::A, SrcReg, STI, Clobber) + BranchCost + BitCost +
+             JumpCost + ClvCost;
     }
     if (DestReg8) {
       DestReg = DestReg8;
 
       Register Tmp = DestReg;
-      if (!MOS::GPRRegClass.contains(Tmp))
+      if (!MOS::GPRRegClass.contains(Tmp)) {
         Tmp = MOS::A;
+        if (Clobber)
+          *Clobber = &MOS::AcRegClass;
+      }
       // LDImm; BNE; LDImm;
       MOSInstrCost Cost = LoadImmCost * 2 + BranchCost;
       if (Tmp != DestReg)
-        Cost += copyCost(DestReg, Tmp, STI);
+        Cost += copyCost(DestReg, Tmp, STI, Clobber);
       return Cost;
     }
     if (STI.hasSPC700()) {

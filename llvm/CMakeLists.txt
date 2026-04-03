@@ -1377,12 +1377,6 @@ add_subdirectory(utils/TableGen)
 
 add_subdirectory(include)
 
-# OR-Tools CP-SAT solver (used by MOS register allocator).
-# Must come before add_subdirectory(lib) so the target exists when
-# LLVMMOSCodeGen links against it.
-add_subdirectory(${LLVM_THIRD_PARTY_DIR}/ortools
-  ${CMAKE_CURRENT_BINARY_DIR}/third-party/ortools)
-
 add_subdirectory(lib)
 
 if( LLVM_INCLUDE_UTILS )
