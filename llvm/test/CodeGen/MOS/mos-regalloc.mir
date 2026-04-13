@@ -8,8 +8,30 @@ registers:
 body: |
   bb.0:
     ; CHECK-LABEL: name: simple_load_store
-    ; CHECK: $x = LDAbs 1234
-    ; CHECK-NEXT: STAbs killed $x, 4567
+    ; CHECK: $a = LDAbs 1234
+    ; CHECK-NEXT: STAbs killed $a, 4567
     %0:gpr = LDAbs 1234
     STAbs killed %0, 4567
+...
+
+# Narrowing: COPY %0 defines %1:Ac while %0:GPR is still live (non-kill use).
+# GPR overlaps Ac (both contain A), so %0's effective class is narrowed
+# from {A,X,Y} to {X,Y} to prove colorability.
+---
+name: narrowing
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr }
+  - { id: 1, class: ac }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: narrowing
+    ; CHECK: $x = LDAbs 1000
+    ; CHECK-NEXT: $a = COPY $x
+    ; CHECK-NEXT: STAbs killed $x, 3000
+    ; CHECK-NEXT: STAbs killed $a, 2000
+    %0:gpr = LDAbs 1000
+    %1:ac = COPY %0
+    STAbs %1, 2000
+    STAbs %0, 3000
 ...
