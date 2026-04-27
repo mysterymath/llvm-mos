@@ -90,22 +90,25 @@ private:
   /// already-dead adversary's contribution by narrowing it). Used by
   /// assignRegisters to pick physregs.
   IndexedMap<BitVector, VirtReg2IndexFunctor> EffectiveRC;
-  /// Per-vreg interference: V's def-time
-  ///   Σ_{U live at V's def} maxRegInterference(V, U)
-  /// minus contributions later freed when an adversary U was narrowed out
-  /// of V's alias set. V's slack is EffectiveRC[V].count() − Interference[V];
-  /// colorable so far iff ≥ 1. Persists past V's death for the same reason
-  /// as EffectiveRC.
-  IndexedMap<unsigned, VirtReg2IndexFunctor> Interference;
+  /// Per-vreg interferences: the set of vregs live at V's definition. V's
+  /// total interference (and thus slack) is computed on demand by summing
+  /// maxRegInterference(V, EffectiveRC[U]) over each U in this set against
+  /// U's current EffectiveRC — so any later narrowing of a U is reflected
+  /// automatically. Persists past V's death (chained narrowing may revisit
+  /// V).
+  IndexedMap<SmallVector<Register, 8>, VirtReg2IndexFunctor> Interferences;
 
   void allocate(iterator_range<MBBIterator> MIs, LiveSet &Live);
   int getSlack(Register V) const { return getSlack(V, EffectiveRC[V]); }
   int getSlack(Register V, const BitVector &EffRC) const {
-    return (int)EffRC.count() - (int)Interference[V];
+    int Slack = EffRC.count();
+    for (Register U : Interferences[V])
+      Slack -= maxRegInterference(EffRC, EffectiveRC[U]);
+    return Slack;
   }
   BitVector allocatableRegs(const TargetRegisterClass *RC);
   unsigned maxRegInterference(const BitVector &DefRegs,
-                              const BitVector &LiveRegs);
+                              const BitVector &LiveRegs) const;
   BitVector aliasSet(const BitVector &Regs);
 
   void mergeClusters(MachineBasicBlock &MBB);
@@ -170,8 +173,8 @@ void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
   MICluster.clear();
   EffectiveRC.clear();
   EffectiveRC.resize(MRI->getNumVirtRegs());
-  Interference.clear();
-  Interference.resize(MRI->getNumVirtRegs());
+  Interferences.clear();
+  Interferences.resize(MRI->getNumVirtRegs());
   for (MachineInstr &MI : MBB) {
     MICluster[&MI] = Clusters.size();
     Cluster C(make_range(MI.getIterator(), std::next(MI.getIterator())));
@@ -181,17 +184,18 @@ void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
 }
 
 /// Allocate register space for instructions in the given range. For each new
-/// def, computes the def-time interference against currently-live values; if
-/// the resulting slack is below 1, narrows live values out of the new def's
-/// alias set until it recovers. Updates this->EffectiveRC and
-/// this->Interference; Live tracks the currently-live vreg set.
+/// def, snapshots the live set as the def's interferences and ensures
+/// slack >= 1, narrowing live values out of the new def's alias set until it
+/// recovers. Updates this->EffectiveRC and this->Interferences; Live tracks
+/// the currently-live vreg set.
 ///
-/// Slack model: for any vreg V, slack(V) = EffectiveRC[V].count() −
-/// Interference[V]. Interference[V] is set at V's def from things live then
-/// and is only nudged when an adversary is later narrowed out of V's alias
-/// set (top-down assignment colors V before any later def, so later defs
-/// must work around V; they do not consume V's slack). Narrowing of V is
-/// the one event that charges V — it directly shrinks EffectiveRC[V].
+/// Slack model: each vreg V's interferences (the set of vregs live at V's
+/// def) are fixed at V's def. V's slack is computed on demand by getSlack
+/// against the current EffectiveRC of each interferer, so any later
+/// narrowing of an interferer is reflected automatically. Top-down
+/// assignment colors V before any later def, so later defs are constrained
+/// to avoid V; they do not consume V's slack. Narrowing of V is the one
+/// event that charges V — it directly shrinks EffectiveRC[V].
 void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
   for (MachineInstr &MI : MIs) {
     for (const MachineOperand &MO : MI.all_uses()) {
@@ -203,15 +207,7 @@ void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
     for (const MachineOperand &MO : MI.all_defs()) {
       Register R = MO.getReg();
       EffectiveRC[R] = allocatableRegs(MRI->getRegClass(R));
-
-      // R's interference: each currently-live V can block up to
-      // maxRegInterference(R, V) of R's options. V's own interference is
-      // not touched — V was already colorable when defined and will be
-      // colored before R, so it is R's job to fit around V.
-      unsigned I = 0;
-      for (Register V : Live)
-        I += maxRegInterference(EffectiveRC[R], EffectiveRC[V]);
-      Interference[R] = I;
+      Interferences[R].assign(Live.begin(), Live.end());
       Live.insert(R);
 
       // Slack < 1 means R's worst-case interference has eaten its whole
@@ -224,8 +220,7 @@ void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
         // Pick the smallest V whose post-narrow effective set
         // EffectiveRC[V] \ RAlias is both:
         //   - strictly smaller than EffectiveRC[V] (so narrowing helps R),
-        //   - large enough to keep V colorable, i.e.
-        //       NewEffRC.count() − Interference[V] >= 1.
+        //   - large enough to keep V colorable.
         // Apply the colorability filter before the tie-break: picking the
         // smallest V outright could land on a victim that loses
         // colorability when a slightly larger V could absorb the narrow
@@ -249,18 +244,14 @@ void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
         assert(NarrowReg.isValid() &&
                "Allocation failed: no colorably-narrowable live value");
 
-        // V's interference stays as-is: we keep V_old's contribution to
-        // past pairings baked in (sound lower bound on V's true post-narrow
-        // interference). V's slack drops naturally as EffectiveRC shrinks.
-        //
-        // For R, V's contribution to R's interference goes from
-        // maxRegInterference(R, V_old) (just charged above) down to 0
-        // (V_new is disjoint from RAlias, so no V register overlaps any R
-        // register). Decrement R's interference by that amount.
-        unsigned Restored =
-            maxRegInterference(EffectiveRC[R], EffectiveRC[NarrowReg]);
+        // V's interferences set stays as-is. Its slack drops naturally
+        // since EffectiveRC[V] shrinks. R's slack rises naturally on the
+        // next getSlack call: V's contribution
+        // maxRegInterference(R, EffectiveRC[V]) is recomputed against the
+        // new (smaller, RAlias-disjoint) EffectiveRC[V] and goes to 0. Any
+        // other vreg that has V in its interferences is updated the same
+        // way the next time its slack is queried.
         EffectiveRC[NarrowReg] = std::move(NarrowEffRC);
-        Interference[R] -= Restored;
 
         LLVM_DEBUG(dbgs() << "    Narrow " << printReg(NarrowReg, TRI) << " to "
                           << EffectiveRC[NarrowReg].count() << " regs (slack "
@@ -286,7 +277,7 @@ BitVector MOSRegAlloc::allocatableRegs(const TargetRegisterClass *RC) {
 /// The max number of registers in DefRegs that a single register from
 /// LiveRegs can block via aliasing.
 unsigned MOSRegAlloc::maxRegInterference(const BitVector &DefRegs,
-                                         const BitVector &LiveRegs) {
+                                         const BitVector &LiveRegs) const {
   unsigned Max = 0;
   for (unsigned LReg : LiveRegs.set_bits()) {
     unsigned Blocked = 0;
