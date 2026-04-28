@@ -63,3 +63,20 @@ body: |
     STAbs killed %0, 4000
     STAbs killed %1, 5000
 ...
+
+# Livein: $a is live at MBB entry, COPY'd into %0:Ac. K_livein cluster
+# publishes $a; the COPY's cluster merges with K_livein.
+---
+name: livein
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $a
+    ; CHECK-LABEL: name: livein
+    ; CHECK: liveins: $a
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: $a = COPY killed $a
+    ; CHECK-NEXT: STAbs killed $a, 1000
+    %0:ac = COPY $a
+    STAbs killed %0, 1000
+...
