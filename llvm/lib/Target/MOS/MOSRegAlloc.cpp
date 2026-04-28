@@ -79,6 +79,9 @@ private:
   void validate(MachineBasicBlock &MBB);
 
   /// All clusters; indexed by cluster ID. Emptied clusters have empty Range.
+  /// Cluster 0 is the livein cluster: an empty cluster whose LiveOut
+  /// publishes the block's livein physregs to consumers via merging.
+  static constexpr unsigned LiveInClusterIdx = 0;
   SmallVector<Cluster, 0> Clusters;
   /// Maps each instruction to the ID of the cluster that contains it.
   DenseMap<MachineInstr *, unsigned> MICluster;
@@ -90,28 +93,35 @@ private:
   /// already-dead adversary's contribution by narrowing it). Used by
   /// assignRegisters to pick physregs.
   IndexedMap<BitVector, VirtReg2IndexFunctor> EffectiveRC;
-  /// Per-vreg interferences: the set of vregs live at V's definition. V's
-  /// total interference (and thus slack) is computed on demand by summing
-  /// maxRegInterference(V, EffectiveRC[U]) over each U in this set against
-  /// U's current EffectiveRC — so any later narrowing of a U is reflected
+  /// Per-vreg interferences: the set of values (vregs or physregs) live at
+  /// V's definition. V's total interference (and thus slack) is computed on
+  /// demand by summing each interferer's contribution against V's current
+  /// EffectiveRC — so any later narrowing of an interferer is reflected
   /// automatically. Persists past V's death (chained narrowing may revisit
   /// V).
   IndexedMap<SmallVector<Register, 8>, VirtReg2IndexFunctor> Interferences;
 
   void allocate(iterator_range<MBBIterator> MIs, LiveSet &Live);
-  int getSlack(Register V) const { return getSlack(V, EffectiveRC[V]); }
-  int getSlack(Register V, const BitVector &EffRC) const {
+  void narrowToFit(Register Def, const BitVector &DefEff,
+                   ArrayRef<Register> DefInters, const LiveSet &Live);
+  int getSlack(const BitVector &EffRC, ArrayRef<Register> Inters) const {
     int Slack = EffRC.count();
-    for (Register U : Interferences[V])
-      Slack -= maxRegInterference(EffRC, EffectiveRC[U]);
+    for (Register U : Inters)
+      Slack -= maxInterference(EffRC, U);
     return Slack;
   }
+  /// Worst-case number of EffRC's registers that adversary U can block when
+  /// U is colored. U is colored to one register from its own effective set
+  /// (the singleton {U} for a physreg, or EffectiveRC[U] for a vreg); the
+  /// answer is the max over that set of |{r ∈ EffRC : aliases U's color}|.
+  unsigned maxInterference(const BitVector &EffRC, Register U) const;
   BitVector allocatableRegs(const TargetRegisterClass *RC);
-  unsigned maxRegInterference(const BitVector &DefRegs,
-                              const BitVector &LiveRegs) const;
   BitVector aliasSet(const BitVector &Regs);
 
-  void mergeClusters(MachineBasicBlock &MBB);
+  void schedule(MachineBasicBlock &MBB);
+  void schedulePhysRegs(MachineBasicBlock &MBB);
+  void scheduleVRegs(MachineBasicBlock &MBB);
+  void mergeClusters(MachineBasicBlock &MBB, unsigned DefC, unsigned UseC);
   void setKillFlags(iterator_range<MBBIterator> MIs, unsigned ClusterIdx);
 
   void assignRegisters(MachineBasicBlock &MBB);
@@ -132,7 +142,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   MachineBasicBlock &MBB = MF.front();
   validate(MBB);
   initClusters(MBB);
-  mergeClusters(MBB);
+  schedule(MBB);
   assignRegisters(MBB);
   MRI->clearVirtRegs();
   LLVM_DEBUG(dbgs() << "MOS RegAlloc: done\n");
@@ -140,8 +150,6 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 }
 
 void MOSRegAlloc::validate(MachineBasicBlock &MBB) {
-  assert(MBB.livein_empty() && "Block liveins not yet supported");
-
   for (MachineInstr &MI : MBB) {
     assert(!MI.isTerminator() && "Terminators not yet supported");
     assert(MI.getOpcode() != TargetOpcode::REG_SEQUENCE &&
@@ -155,19 +163,20 @@ void MOSRegAlloc::validate(MachineBasicBlock &MBB) {
       assert(!MO.isRegMask() && "Regmasks not yet supported");
       if (!MO.isReg())
         continue;
-      assert(!MO.getReg().isPhysical() &&
-             "Physical register operands not yet supported");
       assert(!MO.isEarlyClobber() && "Earlyclobber not yet supported");
       assert(!MO.isTied() && "Tied operands not yet supported");
       if (MO.isUse())
         assert(!MO.isUndef() && "Undef uses not yet supported");
       if (MO.isDef())
-        assert(!MO.isDead() && "Dead virtual reg defs not yet supported");
+        assert(!MO.isDead() && "Dead defs not yet supported");
     }
   }
 }
 
-/// Create one singleton cluster per instruction and allocate it.
+/// Create one singleton cluster per instruction and allocate it. Cluster 0
+/// (LiveInClusterIdx) is an empty cluster whose LiveOut publishes the
+/// block's livein physregs; consumers of liveins are merged into it later
+/// by schedule, exactly like any other physreg def/use.
 void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
   Clusters.clear();
   MICluster.clear();
@@ -175,6 +184,12 @@ void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
   EffectiveRC.resize(MRI->getNumVirtRegs());
   Interferences.clear();
   Interferences.resize(MRI->getNumVirtRegs());
+
+  Cluster LiveIns(make_range(MBB.begin(), MBB.begin()));
+  for (const auto &LI : MBB.liveins())
+    LiveIns.LiveOut.insert(LI.PhysReg);
+  Clusters.push_back(std::move(LiveIns));
+
   for (MachineInstr &MI : MBB) {
     MICluster[&MI] = Clusters.size();
     Cluster C(make_range(MI.getIterator(), std::next(MI.getIterator())));
@@ -206,63 +221,88 @@ void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
 
     for (const MachineOperand &MO : MI.all_defs()) {
       Register R = MO.getReg();
-      EffectiveRC[R] = allocatableRegs(MRI->getRegClass(R));
-      Interferences[R].assign(Live.begin(), Live.end());
-      Live.insert(R);
+      if (R.isVirtual()) {
+        EffectiveRC[R] = allocatableRegs(MRI->getRegClass(R));
+        Interferences[R].assign(Live.begin(), Live.end());
+        Live.insert(R);
+        narrowToFit(R, EffectiveRC[R], Interferences[R], Live);
 
-      // Slack < 1 means R's worst-case interference has eaten its whole
-      // effective set: we can't guarantee a free register. Narrow live
-      // values out of R's alias set until R recovers, picking each victim
-      // so that it also remains colorable after losing those registers.
-      while (getSlack(R) < 1) {
-        BitVector RAlias = aliasSet(EffectiveRC[R]);
+        LLVM_DEBUG(dbgs() << "    Slack for " << printReg(R, TRI) << " ("
+                          << TRI->getRegClassName(MRI->getRegClass(R))
+                          << "): " << getSlack(EffectiveRC[R], Interferences[R])
+                          << " (eff=" << EffectiveRC[R].count() << ")\n");
+      } else {
+        // Physreg def: nothing to store in EffectiveRC / Interferences (a
+        // physreg has a fixed singleton effective and no allocation choice).
+        // Run the same colorability check against scratch values so that any
+        // live vreg overlapping R is narrowed out of its alias set.
+        BitVector PhysEff(TRI->getNumRegs());
+        PhysEff.set(R);
+        SmallVector<Register, 8> PhysInters(Live.begin(), Live.end());
+        Live.insert(R);
+        narrowToFit(R, PhysEff, PhysInters, Live);
 
-        // Pick the smallest V whose post-narrow effective set
-        // EffectiveRC[V] \ RAlias is both:
-        //   - strictly smaller than EffectiveRC[V] (so narrowing helps R),
-        //   - large enough to keep V colorable.
-        // Apply the colorability filter before the tie-break: picking the
-        // smallest V outright could land on a victim that loses
-        // colorability when a slightly larger V could absorb the narrow
-        // safely.
-        Register NarrowReg;
-        BitVector NarrowEffRC;
-        for (Register V : Live) {
-          if (V == R)
-            continue;
-          BitVector NewEffRC = EffectiveRC[V];
-          NewEffRC.reset(RAlias);
-          if (NewEffRC == EffectiveRC[V])
-            continue;
-          if (getSlack(V, NewEffRC) < 1)
-            continue;
-          if (!NarrowReg.isValid() || V < NarrowReg) {
-            NarrowReg = V;
-            NarrowEffRC = std::move(NewEffRC);
-          }
-        }
-        assert(NarrowReg.isValid() &&
-               "Allocation failed: no colorably-narrowable live value");
-
-        // V's interferences set stays as-is. Its slack drops naturally
-        // since EffectiveRC[V] shrinks. R's slack rises naturally on the
-        // next getSlack call: V's contribution
-        // maxRegInterference(R, EffectiveRC[V]) is recomputed against the
-        // new (smaller, RAlias-disjoint) EffectiveRC[V] and goes to 0. Any
-        // other vreg that has V in its interferences is updated the same
-        // way the next time its slack is queried.
-        EffectiveRC[NarrowReg] = std::move(NarrowEffRC);
-
-        LLVM_DEBUG(dbgs() << "    Narrow " << printReg(NarrowReg, TRI) << " to "
-                          << EffectiveRC[NarrowReg].count() << " regs (slack "
-                          << getSlack(NarrowReg) << ")\n");
+        LLVM_DEBUG(dbgs() << "    Physreg def " << printReg(R, TRI) << "\n");
       }
-
-      LLVM_DEBUG(dbgs() << "    Slack for " << printReg(R, TRI) << " ("
-                        << TRI->getRegClassName(MRI->getRegClass(R))
-                        << "): " << getSlack(R)
-                        << " (eff=" << EffectiveRC[R].count() << ")\n");
     }
+  }
+}
+
+/// Ensure Def is colorable given DefEff and DefInters by repeatedly narrowing
+/// overlapping live vregs out of Def's alias set. Def is the new value (vreg
+/// or physreg); DefEff is its effective register set; DefInters is the set
+/// of values live at Def's definition.
+void MOSRegAlloc::narrowToFit(Register Def, const BitVector &DefEff,
+                              ArrayRef<Register> DefInters,
+                              const LiveSet &Live) {
+  // Slack < 1 means Def's worst-case interference has eaten its whole
+  // effective set: we can't guarantee a free register. Narrow live vregs
+  // out of Def's alias set until it recovers, picking each victim so that
+  // it also remains colorable after losing those registers.
+  while (getSlack(DefEff, DefInters) < 1) {
+    BitVector RAlias = aliasSet(DefEff);
+
+    // Pick the smallest V whose post-narrow effective set
+    // EffectiveRC[V] \ RAlias is both:
+    //   - strictly smaller than EffectiveRC[V] (so narrowing helps Def),
+    //   - large enough to keep V colorable.
+    // Apply the colorability filter before the tie-break: picking the
+    // smallest V outright could land on a victim that loses colorability
+    // when a slightly larger V could absorb the narrow safely.
+    Register NarrowReg;
+    BitVector NarrowEffRC;
+    for (Register V : Live) {
+      if (V == Def)
+        continue;
+      if (V.isPhysical())
+        continue; // physregs have a fixed singleton effective; not narrowable
+      BitVector NewEffRC = EffectiveRC[V];
+      NewEffRC.reset(RAlias);
+      if (NewEffRC == EffectiveRC[V])
+        continue;
+      if (getSlack(NewEffRC, Interferences[V]) < 1)
+        continue;
+      if (!NarrowReg.isValid() || V < NarrowReg) {
+        NarrowReg = V;
+        NarrowEffRC = std::move(NewEffRC);
+      }
+    }
+    assert(NarrowReg.isValid() &&
+           "Allocation failed: no colorably-narrowable live value");
+
+    // V's interferences set stays as-is. Its slack drops naturally since
+    // EffectiveRC[V] shrinks. Def's slack rises on the next getSlack call:
+    // V's contribution to Def's interference is recomputed against the new
+    // (smaller, RAlias-disjoint) EffectiveRC[V] and goes to 0. Any other
+    // vreg that has V in its interferences is updated the same way the
+    // next time its slack is queried.
+    EffectiveRC[NarrowReg] = std::move(NarrowEffRC);
+
+    LLVM_DEBUG(dbgs() << "    Narrow " << printReg(NarrowReg, TRI) << " to "
+                      << EffectiveRC[NarrowReg].count() << " regs (slack "
+                      << getSlack(EffectiveRC[NarrowReg],
+                                  Interferences[NarrowReg])
+                      << ")\n");
   }
 }
 
@@ -274,18 +314,18 @@ BitVector MOSRegAlloc::allocatableRegs(const TargetRegisterClass *RC) {
   return BV;
 }
 
-/// The max number of registers in DefRegs that a single register from
-/// LiveRegs can block via aliasing.
-unsigned MOSRegAlloc::maxRegInterference(const BitVector &DefRegs,
-                                         const BitVector &LiveRegs) const {
-  unsigned Max = 0;
-  for (unsigned LReg : LiveRegs.set_bits()) {
+unsigned MOSRegAlloc::maxInterference(const BitVector &EffRC,
+                                      Register U) const {
+  if (U.isPhysical()) {
     unsigned Blocked = 0;
-    for (unsigned DReg : DefRegs.set_bits())
-      if (TRI->regsOverlap(MCPhysReg(LReg), MCPhysReg(DReg)))
+    for (unsigned R : EffRC.set_bits())
+      if (TRI->regsOverlap(MCPhysReg(R), U.asMCReg()))
         Blocked++;
-    Max = std::max(Max, Blocked);
+    return Blocked;
   }
+  unsigned Max = 0;
+  for (unsigned R : EffectiveRC[U].set_bits())
+    Max = std::max(Max, maxInterference(EffRC, Register(MCPhysReg(R))));
   return Max;
 }
 
@@ -300,8 +340,60 @@ BitVector MOSRegAlloc::aliasSet(const BitVector &Regs) {
   return Result;
 }
 
-void MOSRegAlloc::mergeClusters(MachineBasicBlock &MBB) {
-  // For each vreg, merge the def cluster with each use cluster.
+void MOSRegAlloc::schedule(MachineBasicBlock &MBB) {
+  schedulePhysRegs(MBB);
+  scheduleVRegs(MBB);
+
+  assert(llvm::count_if(Clusters,
+                        [](const Cluster &C) { return !C.empty(); }) == 1 &&
+         "Not all clusters merged into one");
+
+  // MBB is now in final schedule order.
+  LLVM_DEBUG({
+    dbgs() << "  Final schedule:\n";
+    for (MachineInstr &MI : MBB)
+      dbgs() << "    " << MI;
+  });
+}
+
+/// Walk MBB in original order, tracking which cluster currently "owns" each
+/// live physreg. Liveins start owned by the livein cluster; physreg defs
+/// update ownership to the defining instruction's cluster. Each physreg
+/// use merges the using instruction's cluster into its owner. This handles
+/// liveins, implicit-defs, and explicit physreg defs uniformly.
+void MOSRegAlloc::schedulePhysRegs(MachineBasicBlock &MBB) {
+  DenseMap<MCPhysReg, unsigned> PhysRegOwner;
+  for (const auto &LI : MBB.liveins())
+    PhysRegOwner[LI.PhysReg] = LiveInClusterIdx;
+
+  // Each merge here only relocates MI itself (its cluster is still a
+  // singleton when we visit it), so MI's original successor is untouched.
+  // make_early_inc_range captures the successor before the merge runs.
+  for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
+    for (const MachineOperand &MO : MI.all_uses()) {
+      if (!MO.getReg().isPhysical())
+        continue;
+      auto It = PhysRegOwner.find(MO.getReg().asMCReg());
+      assert(It != PhysRegOwner.end() &&
+             "Physreg use has no prior def or livein");
+      unsigned DefC = It->second;
+      unsigned UseC = MICluster[&MI];
+      if (UseC == DefC)
+        continue;
+      LLVM_DEBUG(dbgs() << "  Merge cluster " << UseC << " into " << DefC
+                        << " for " << printReg(MO.getReg(), TRI) << "\n");
+      mergeClusters(MBB, DefC, UseC);
+    }
+    for (const MachineOperand &MO : MI.all_defs()) {
+      if (!MO.getReg().isPhysical())
+        continue;
+      PhysRegOwner[MO.getReg().asMCReg()] = MICluster[&MI];
+    }
+  }
+}
+
+/// For each vreg, merge the def cluster with each use cluster.
+void MOSRegAlloc::scheduleVRegs(MachineBasicBlock &MBB) {
   for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
     Register R = Register::index2VirtReg(I);
     LLVM_DEBUG(dbgs() << "  Considering " << printReg(R, TRI) << "\n");
@@ -321,41 +413,45 @@ void MOSRegAlloc::mergeClusters(MachineBasicBlock &MBB) {
 
       LLVM_DEBUG(dbgs() << "    Merge cluster " << UseC << " into " << DefC
                         << " for " << printReg(R, TRI) << "\n");
-
-      // Merge UseC into DefC right after DefC's last instruction.
-      Cluster &Def = Clusters[DefC];
-      Cluster &Use = Clusters[UseC];
-      auto UseBegin = Use.begin();
-      for (MachineInstr &MI : Use)
-        MICluster[&MI] = DefC;
-      if (UseBegin != Def.end()) {
-        // Fix the predecessor cluster whose end sentinel is Use.begin().
-        unsigned PredC = MICluster[&*std::prev(UseBegin)];
-        Clusters[PredC].Range = make_range(Clusters[PredC].begin(), Use.end());
-        MBB.splice(Def.end(), &MBB, UseBegin, Use.end());
-      } else {
-        Def.Range = make_range(Def.begin(), Use.end());
-      }
-      Use.Range = make_range(Use.end(), Use.end());
-      Use.LiveOut.clear();
-
-      // Update kill flags and allocate only the new (use) instructions.
-      auto NewMIs = make_range(UseBegin, Def.end());
-      setKillFlags(NewMIs, DefC);
-      allocate(NewMIs, Def.LiveOut);
+      mergeClusters(MBB, DefC, UseC);
     }
   }
+}
 
-  assert(llvm::count_if(Clusters,
-                        [](const Cluster &C) { return !C.empty(); }) == 1 &&
-         "Not all clusters merged into one");
+/// Merge cluster UseC into cluster DefC: relocate UseC's instructions to
+/// directly follow DefC's last instruction, transfer their MICluster
+/// mapping to DefC, set kill flags on the relocated instructions, and
+/// allocate them against DefC's running LiveOut. UseC is left empty.
+void MOSRegAlloc::mergeClusters(MachineBasicBlock &MBB, unsigned DefC,
+                                unsigned UseC) {
+  Cluster &Def = Clusters[DefC];
+  Cluster &Use = Clusters[UseC];
+  auto UseBegin = Use.begin();
+  for (MachineInstr &MI : Use)
+    MICluster[&MI] = DefC;
+  if (UseBegin != Def.end()) {
+    // Fix the predecessor cluster whose end sentinel is Use.begin().
+    unsigned PredC = MICluster[&*std::prev(UseBegin)];
+    Clusters[PredC].Range = make_range(Clusters[PredC].begin(), Use.end());
+    MBB.splice(Def.end(), &MBB, UseBegin, Use.end());
+    // For non-empty Def, the splice naturally extends Def.Range: Def.end()
+    // is a stable iterator and the list path from Def.begin() to Def.end()
+    // now traverses the spliced instructions. For empty Def, begin == end
+    // and the spliced nodes land *before* begin, outside the range. Set
+    // begin to the freshly-spliced first instruction (UseBegin still points
+    // to it after splice).
+    if (Def.empty())
+      Def.Range = make_range(UseBegin, Def.end());
+  } else {
+    Def.Range = make_range(Def.begin(), Use.end());
+  }
+  Use.Range = make_range(Use.end(), Use.end());
+  Use.LiveOut.clear();
 
-  // MBB is now in final schedule order.
-  LLVM_DEBUG({
-    dbgs() << "  Final schedule:\n";
-    for (MachineInstr &MI : MBB)
-      dbgs() << "    " << MI;
-  });
+  // Update kill flags and allocate only the new (use) instructions.
+  auto NewMIs = make_range(UseBegin, Def.end());
+  setKillFlags(NewMIs, DefC);
+  allocate(NewMIs, Def.LiveOut);
 }
 
 /// Set kill flags for new instructions added to a cluster. A use of V is a
@@ -383,6 +479,11 @@ void MOSRegAlloc::setKillFlags(iterator_range<MBBIterator> MIs,
 void MOSRegAlloc::assignRegisters(MachineBasicBlock &MBB) {
   BitVector LiveUnits(TRI->getNumRegUnits());
 
+  // Liveins occupy their physregs at MBB entry.
+  for (const auto &LI : MBB.liveins())
+    for (MCRegUnit Unit : TRI->regunits(MCPhysReg(LI.PhysReg)))
+      LiveUnits.set(static_cast<unsigned>(Unit));
+
   for (MachineInstr &MI : MBB) {
     // Free killed uses. Prior defs' replaceRegWith already made these physregs.
     for (const MachineOperand &MO : MI.all_uses()) {
@@ -393,28 +494,32 @@ void MOSRegAlloc::assignRegisters(MachineBasicBlock &MBB) {
         LiveUnits.reset(static_cast<unsigned>(Unit));
     }
 
-    // Assign defs: pick first free physreg from the effective set.
+    // Assign defs: pick first free physreg from the effective set. Physreg
+    // defs (e.g. implicit-def $c) keep their fixed register; just mark it
+    // live.
     for (const MachineOperand &MO : MI.all_defs()) {
       Register Reg = MO.getReg();
-      assert(Reg.isVirtual() && "Def already replaced");
-
-      const BitVector &Eff = EffectiveRC[Reg];
-
       MCPhysReg Assigned = 0;
-      for (unsigned PhysReg : Eff.set_bits()) {
-        bool Free =
-            llvm::none_of(TRI->regunits(MCPhysReg(PhysReg)), [&](MCRegUnit U) {
-              return LiveUnits.test(static_cast<unsigned>(U));
-            });
-        if (Free) {
-          Assigned = MCPhysReg(PhysReg);
-          break;
+      if (Reg.isPhysical()) {
+        Assigned = Reg.asMCReg();
+      } else {
+        const BitVector &Eff = EffectiveRC[Reg];
+        for (unsigned PhysReg : Eff.set_bits()) {
+          bool Free = llvm::none_of(TRI->regunits(MCPhysReg(PhysReg)),
+                                    [&](MCRegUnit U) {
+                                      return LiveUnits.test(
+                                          static_cast<unsigned>(U));
+                                    });
+          if (Free) {
+            Assigned = MCPhysReg(PhysReg);
+            break;
+          }
         }
+        assert(Assigned && "No free register in effective set");
+        LLVM_DEBUG(dbgs() << "    Assign " << printReg(Reg, TRI) << " -> "
+                          << printReg(Assigned, TRI) << "\n");
+        MRI->replaceRegWith(Reg, Assigned);
       }
-      assert(Assigned && "No free register in effective set");
-      LLVM_DEBUG(dbgs() << "    Assign " << printReg(Reg, TRI) << " -> "
-                        << printReg(Assigned, TRI) << "\n");
-      MRI->replaceRegWith(Reg, Assigned);
       for (MCRegUnit Unit : TRI->regunits(Assigned))
         LiveUnits.set(static_cast<unsigned>(Unit));
     }
