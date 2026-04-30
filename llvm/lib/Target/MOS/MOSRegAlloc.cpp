@@ -121,6 +121,7 @@ private:
   void schedule(MachineBasicBlock &MBB);
   void schedulePhysRegs(MachineBasicBlock &MBB);
   void scheduleVRegs(MachineBasicBlock &MBB);
+  void linearizeClusters(MachineBasicBlock &MBB);
   void mergeClusters(MachineBasicBlock &MBB, unsigned DefC, unsigned UseC);
   void setKillFlags(iterator_range<MBBIterator> MIs, unsigned ClusterIdx);
 
@@ -343,6 +344,7 @@ BitVector MOSRegAlloc::aliasSet(const BitVector &Regs) {
 void MOSRegAlloc::schedule(MachineBasicBlock &MBB) {
   schedulePhysRegs(MBB);
   scheduleVRegs(MBB);
+  linearizeClusters(MBB);
 
   assert(llvm::count_if(Clusters,
                         [](const Cluster &C) { return !C.empty(); }) == 1 &&
@@ -415,6 +417,27 @@ void MOSRegAlloc::scheduleVRegs(MachineBasicBlock &MBB) {
                         << " for " << printReg(R, TRI) << "\n");
       mergeClusters(MBB, DefC, UseC);
     }
+  }
+}
+
+/// Final linearization. Anything left disconnected after physreg / vreg
+/// scheduling — independent def-use components, plus an empty K_livein —
+/// gets merged adjacently in MBB order. Walk MBB; whenever MICluster
+/// changes, merge the new cluster into the running current cluster. Each
+/// merge hits mergeClusters' else-branch (UseBegin == Def.end()) since the
+/// walk is in current layout order, so no splice happens — only Range and
+/// LiveOut bookkeeping.
+void MOSRegAlloc::linearizeClusters(MachineBasicBlock &MBB) {
+  if (MBB.empty())
+    return;
+  unsigned CurC = MICluster[&MBB.front()];
+  for (MachineInstr &MI : MBB) {
+    unsigned C = MICluster[&MI];
+    if (C == CurC)
+      continue;
+    LLVM_DEBUG(dbgs() << "  Linearize: merge cluster " << C << " into "
+                      << CurC << "\n");
+    mergeClusters(MBB, CurC, C);
   }
 }
 
