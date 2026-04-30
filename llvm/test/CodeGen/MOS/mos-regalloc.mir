@@ -80,3 +80,51 @@ body: |
     %0:ac = COPY $a
     STAbs killed %0, 1000
 ...
+
+# Livein, non-first consumer: a non-livein-using instruction comes first;
+# the livein use at I1 triggers the if-branch into an empty K_livein.
+# Without K_livein.Range bookkeeping, K_livein would silently absorb I1
+# but its Range would stay empty.
+---
+name: livein_non_first
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr }
+  - { id: 1, class: ac }
+body: |
+  bb.0:
+    liveins: $a
+    ; CHECK-LABEL: name: livein_non_first
+    ; CHECK: liveins: $a
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: $a = COPY killed $a
+    ; CHECK-NEXT: STAbs killed $a, 3000
+    ; CHECK-NEXT: $a = LDAbs 1000
+    ; CHECK-NEXT: STAbs killed $a, 2000
+    %0:gpr = LDAbs 1000
+    %1:ac = COPY $a
+    STAbs killed %0, 2000
+    STAbs killed %1, 3000
+...
+
+# Linearization: two independent load-store pairs share no def-use, so
+# neither schedulePhysRegs nor scheduleVRegs merges them. The final
+# linearize pass walks MBB in order and merges adjacent clusters.
+---
+name: linearize_disconnected
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr }
+  - { id: 1, class: gpr }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: linearize_disconnected
+    ; CHECK: $a = LDAbs 1000
+    ; CHECK-NEXT: STAbs killed $a, 2000
+    ; CHECK-NEXT: $a = LDAbs 3000
+    ; CHECK-NEXT: STAbs killed $a, 4000
+    %0:gpr = LDAbs 1000
+    STAbs killed %0, 2000
+    %1:gpr = LDAbs 3000
+    STAbs killed %1, 4000
+...
