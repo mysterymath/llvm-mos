@@ -24,8 +24,10 @@
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/MachineFunction.h"
+#include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/RegisterClassInfo.h"
+#include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/Debug.h"
@@ -101,6 +103,19 @@ private:
   /// V).
   IndexedMap<SmallVector<Register, 8>, VirtReg2IndexFunctor> Interferences;
 
+  /// Maps a tied def D to the root vreg of its slot — i.e. the original tied
+  /// use's vreg that owns the slot's EffectiveRC / Interferences / Live entry.
+  /// Always stores the resolved root, so lookups are one level deep.
+  DenseMap<Register, Register> TiedRoot;
+  Register tiedRoot(Register R) const {
+    if (R.isPhysical())
+      return R;
+    auto It = TiedRoot.find(R);
+    return It == TiedRoot.end() ? R : It->second;
+  }
+
+  void normalizeTiedRegs(MachineBasicBlock &MBB);
+
   void allocate(iterator_range<MBBIterator> MIs, LiveSet &Live);
   void narrowToFit(Register Def, const BitVector &DefEff,
                    ArrayRef<Register> DefInters, const LiveSet &Live);
@@ -142,6 +157,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   assert(MF.size() == 1 && "Multiple basic blocks not yet supported");
   MachineBasicBlock &MBB = MF.front();
   validate(MBB);
+  normalizeTiedRegs(MBB);
   initClusters(MBB);
   schedule(MBB);
   assignRegisters(MBB);
@@ -165,11 +181,45 @@ void MOSRegAlloc::validate(MachineBasicBlock &MBB) {
       if (!MO.isReg())
         continue;
       assert(!MO.isEarlyClobber() && "Earlyclobber not yet supported");
-      assert(!MO.isTied() && "Tied operands not yet supported");
       if (MO.isUse())
         assert(!MO.isUndef() && "Undef uses not yet supported");
       if (MO.isDef())
         assert(!MO.isDead() && "Dead defs not yet supported");
+    }
+  }
+}
+
+/// Normalize tied uses so the allocator's core sees every tie as
+/// single-use + class-matching the tied def. For each tied use that is
+/// either multi-use or whose vreg class differs from the tied def's,
+/// insert `V' = COPY V` before MI and rewire the tied use to V'. V' is
+/// given the tied def's register class, so after this pass every tied
+/// pair has matching classes and the tied use is kill.
+void MOSRegAlloc::normalizeTiedRegs(MachineBasicBlock &MBB) {
+  const TargetInstrInfo *TII = MBB.getParent()->getSubtarget().getInstrInfo();
+  for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
+    for (unsigned I = 0, E = MI.getNumOperands(); I != E; ++I) {
+      MachineOperand &MO = MI.getOperand(I);
+      if (!MO.isReg() || !MO.isUse() || !MO.isTied())
+        continue;
+      Register V = MO.getReg();
+      assert(V.isVirtual() && "Tied physreg operands not supported");
+
+      unsigned DefIdx = MI.findTiedOperandIdx(I);
+      const TargetRegisterClass *VRC = MRI->getRegClass(V);
+      const TargetRegisterClass *DRC =
+          MRI->getRegClass(MI.getOperand(DefIdx).getReg());
+
+      // No COPY needed only when V already matches the def's class and is
+      // single-use (tied destruction lands on its natural last use).
+      if (VRC == DRC && MRI->hasOneNonDBGUse(V))
+        continue;
+
+      Register VPrime = MRI->createVirtualRegister(DRC);
+      BuildMI(MBB, MI, MI.getDebugLoc(), TII->get(TargetOpcode::COPY), VPrime)
+          .addReg(V, getKillRegState(MO.isKill()));
+      MO.setReg(VPrime);
+      MO.setIsKill(true);
     }
   }
 }
@@ -185,6 +235,7 @@ void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
   EffectiveRC.resize(MRI->getNumVirtRegs());
   Interferences.clear();
   Interferences.resize(MRI->getNumVirtRegs());
+  TiedRoot.clear();
 
   Cluster LiveIns(make_range(MBB.begin(), MBB.begin()));
   for (const auto &LI : MBB.liveins())
@@ -217,11 +268,30 @@ void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
     for (const MachineOperand &MO : MI.all_uses()) {
       if (!MO.isKill())
         continue;
-      Live.erase(MO.getReg());
+      // Tied uses don't end the slot — the tied def reuses it. The def loop
+      // below records the new vreg's identity in TiedRoot. For other uses,
+      // Live holds the slot's root, which may be the tied use's vreg behind
+      // an intermediate tied def — redirect via tiedRoot.
+      if (!MO.isTied())
+        Live.erase(tiedRoot(MO.getReg()));
     }
 
     for (const MachineOperand &MO : MI.all_defs()) {
       Register R = MO.getReg();
+      if (MO.isTied()) {
+        assert(R.isVirtual() && "Tied physreg operands not supported");
+        unsigned UseIdx = MI.findTiedOperandIdx(MO.getOperandNo());
+        const MachineOperand &UseMO = MI.getOperand(UseIdx);
+        assert(UseMO.getReg().isVirtual() &&
+               "Tied physreg operands not supported");
+        assert(UseMO.isKill() && "Tied use must be killed (normalizeTiedRegs)");
+        assert(MRI->getRegClass(R) == MRI->getRegClass(UseMO.getReg()) &&
+               "Tied operands must have matching register classes");
+        TiedRoot[R] = tiedRoot(UseMO.getReg());
+        LLVM_DEBUG(dbgs() << "    Tied def " << printReg(R, TRI) << " -> slot "
+                          << printReg(TiedRoot[R], TRI) << "\n");
+        continue;
+      }
       if (R.isVirtual()) {
         EffectiveRC[R] = allocatableRegs(MRI->getRegClass(R));
         Interferences[R].assign(Live.begin(), Live.end());
@@ -525,6 +595,13 @@ void MOSRegAlloc::assignRegisters(MachineBasicBlock &MBB) {
       MCPhysReg Assigned = 0;
       if (Reg.isPhysical()) {
         Assigned = Reg.asMCReg();
+      } else if (MO.isTied()) {
+        // Tied def inherits its slot's physreg from the tied use, which has
+        // already been rewritten to a physreg by the slot root's
+        // replaceRegWith (or it was a livein physreg).
+        unsigned UseIdx = MI.findTiedOperandIdx(MO.getOperandNo());
+        Assigned = MI.getOperand(UseIdx).getReg().asMCReg();
+        MRI->replaceRegWith(Reg, Assigned);
       } else {
         const BitVector &Eff = EffectiveRC[Reg];
         for (unsigned PhysReg : Eff.set_bits()) {
