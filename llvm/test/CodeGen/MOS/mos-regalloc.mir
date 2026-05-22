@@ -185,7 +185,7 @@ body: |
   bb.0:
     ; CHECK-LABEL: name: tied_multi_use
     ; CHECK: $a = LDAbs 1000
-    ; CHECK-NEXT: STAbs killed $a, 2000
+    ; CHECK-NEXT: STAbs $a, 2000
     ; CHECK-NEXT: $a = COPY killed $a
     ; CHECK-NEXT: $a = INC killed $a
     ; CHECK-NEXT: STAbs killed $a, 3000
@@ -332,7 +332,7 @@ body: |
     ; CHECK: successors: %bb.0(0x80000000)
     ; CHECK-NEXT: {{  $}}
     ; CHECK-NEXT: $a = LDAbs 1000
-    ; CHECK-NEXT: CmpBrImm %bb.0, killed undef $n, 1, killed $a, 5, implicit-def $c
+    ; CHECK-NEXT: CmpBrImm %bb.0, killed undef $n, 1, killed $a, 5, implicit-def dead $c
     ; CHECK-NEXT: RTS
     %0:gpr = LDAbs 1000
     CmpBrImm %bb.0, undef $n, 1, killed %0, 5, implicit-def $c
