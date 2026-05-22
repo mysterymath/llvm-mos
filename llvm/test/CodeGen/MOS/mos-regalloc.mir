@@ -253,3 +253,88 @@ body: |
     %0:cc = LSRAbs 1000 :: (load (s8) from `ptr null`), (store (s8) into `ptr null`)
     dead %1:cc = RORAbs 2000, killed %0 :: (load (s8) from `ptr null`), (store (s8) into `ptr null`)
 ...
+
+# Bare terminator: RTS with no operands. Verifies the basic terminator-
+# cluster path — the trailing RTS is its own atomic cluster, folded in
+# last by linearizeClusters.
+---
+name: terminator_bare
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: terminator_bare
+    ; CHECK: $a = LDAbs 1000
+    ; CHECK-NEXT: STAbs killed $a, 2000
+    ; CHECK-NEXT: RTS
+    %0:gpr = LDAbs 1000
+    STAbs killed %0, 2000
+    RTS
+...
+
+# Terminator with implicit physreg use: RTS reads $a (return value).
+# The COPY into $a must precede RTS.
+---
+name: terminator_return_value
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: ac }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: terminator_return_value
+    ; CHECK: $a = LDAbs 1000
+    ; CHECK-NEXT: $a = COPY killed $a
+    ; CHECK-NEXT: RTS implicit killed $a
+    %0:ac = LDAbs 1000
+    $a = COPY killed %0
+    RTS implicit killed $a
+...
+
+# Interleaved: a non-$a-related cluster sits in MBB order between the
+# $a-producing COPY and the RTS. Verifies that schedulePhysRegs did
+# NOT splice RTS up after the COPY — RTS must stay last.
+---
+name: terminator_interleaved
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: ac }
+  - { id: 1, class: gpr }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: terminator_interleaved
+    ; CHECK: $a = LDAbs 1000
+    ; CHECK-NEXT: $a = COPY killed $a
+    ; CHECK-NEXT: $x = LDAbs 2000
+    ; CHECK-NEXT: STAbs killed $x, 3000
+    ; CHECK-NEXT: RTS implicit killed $a
+    %0:ac = LDAbs 1000
+    $a = COPY killed %0
+    %1:gpr = LDAbs 2000
+    STAbs killed %1, 3000
+    RTS implicit killed $a
+...
+
+# Compare-and-branch with a vreg use: CmpBrImm uses %0:gpr, carries an
+# undef $n flag-tag and implicit-def $c. Targets %bb.0 to keep single-
+# BB form; followed by RTS to provide a fallthrough exit (so the bb is
+# both predecessor and successor of itself, and exits via RTS). The
+# CmpBrImm + RTS span is one atomic terminator cluster.
+---
+name: terminator_cmpbr_vreg
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr }
+body: |
+  bb.0:
+    successors: %bb.0
+    ; CHECK-LABEL: name: terminator_cmpbr_vreg
+    ; CHECK: successors: %bb.0(0x80000000)
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: $a = LDAbs 1000
+    ; CHECK-NEXT: CmpBrImm %bb.0, killed undef $n, 1, killed $a, 5, implicit-def $c
+    ; CHECK-NEXT: RTS
+    %0:gpr = LDAbs 1000
+    CmpBrImm %bb.0, undef $n, 1, killed %0, 5, implicit-def $c
+    RTS
+...
