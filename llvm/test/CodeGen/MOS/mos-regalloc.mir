@@ -194,3 +194,62 @@ body: |
     STAbs killed %0, 2000
     STAbs killed %1, 3000
 ...
+
+# Dead solitary def: a whole instruction's only def is dead. The vreg's
+# slot doesn't extend past MI, so the following load reuses $a.
+---
+name: dead_def_solitary
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr }
+  - { id: 1, class: gpr }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: dead_def_solitary
+    ; CHECK: dead $a = LDAbs 1000
+    ; CHECK-NEXT: $a = LDAbs 2000
+    ; CHECK-NEXT: STAbs killed $a, 3000
+    dead %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 2000
+    STAbs killed %1, 3000
+...
+
+# Dead vreg def alongside a live def: ASL produces a live shifted value
+# (tied to its input) and a carry output we don't care about. The dead
+# carry vreg gets $c, but $c is freed after MI.
+---
+name: dead_def_with_live
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: ac }
+  - { id: 1, class: ac }
+  - { id: 2, class: cc }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: dead_def_with_live
+    ; CHECK: $a = LDAbs 1000
+    ; CHECK-NEXT: $a, dead $c = ASL killed $a
+    ; CHECK-NEXT: STAbs killed $a, 2000
+    %0:ac = LDAbs 1000
+    %1:ac, dead %2:cc = ASL killed %0
+    STAbs killed %1, 2000
+...
+
+# Tied dead def: RORAbs writes memory with a rotate; its carryout is
+# tied to carryin. Marking the carryout dead exercises the tiedRoot
+# redirect in the dead-erase pass — the slot's root is the carryin
+# vreg, not the dead def itself.
+---
+name: dead_def_tied
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: cc }
+  - { id: 1, class: cc }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: dead_def_tied
+    ; CHECK: $c = LSRAbs 1000 :: (load (s8) from `ptr null`), (store (s8) into `ptr null`)
+    ; CHECK-NEXT: dead $c = RORAbs 2000, killed $c :: (load (s8) from `ptr null`), (store (s8) into `ptr null`)
+    %0:cc = LSRAbs 1000 :: (load (s8) from `ptr null`), (store (s8) into `ptr null`)
+    dead %1:cc = RORAbs 2000, killed %0 :: (load (s8) from `ptr null`), (store (s8) into `ptr null`)
+...
