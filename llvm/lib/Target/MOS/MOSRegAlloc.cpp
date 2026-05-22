@@ -71,6 +71,10 @@ public:
     return MachineFunctionProperties().setIsSSA();
   }
 
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    MachineFunctionPass::getAnalysisUsage(AU);
+  }
+
   bool runOnMachineFunction(MachineFunction &MF) override;
 
 private:
@@ -114,6 +118,7 @@ private:
     return It == TiedRoot.end() ? R : It->second;
   }
 
+  void initKillDeadFlags(MachineBasicBlock &MBB);
   void normalizeTiedRegs(MachineBasicBlock &MBB);
 
   void allocate(iterator_range<MBBIterator> MIs, LiveSet &Live);
@@ -157,6 +162,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   assert(MF.size() == 1 && "Multiple basic blocks not yet supported");
   MachineBasicBlock &MBB = MF.front();
   validate(MBB);
+  initKillDeadFlags(MBB);
   normalizeTiedRegs(MBB);
   initClusters(MBB);
   schedule(MBB);
@@ -190,12 +196,52 @@ void MOSRegAlloc::validate(MachineBasicBlock &MBB) {
   }
 }
 
+/// Reset register flags to a trustworthy baseline. Incoming kill flags
+/// describe the input instruction order; scheduling reorders instructions,
+/// so they cannot be trusted and are cleared. The pass instead sets each
+/// kill flag itself at the moment the kill fact is established:
+/// normalizeTiedRegs marks tied uses (single-use by construction), and
+/// setKillFlags marks each value's last use once a merge gathers all its
+/// uses into one cluster — a fact no later merge can falsify, since merges
+/// only append. Deadness, by contrast, is order-stable — a register with no
+/// uses — so it is derived and set once here.
+void MOSRegAlloc::initKillDeadFlags(MachineBasicBlock &MBB) {
+  for (MachineInstr &MI : MBB) {
+    for (MachineOperand &MO : MI.all_uses())
+      MO.setIsKill(false);
+    for (MachineOperand &MO : MI.all_defs()) {
+      if (MO.isDead())
+        continue;
+      Register R = MO.getReg();
+      // A def is dead iff nothing reads it. A register read nowhere —
+      // including through an aliasing register (a use of $p reads $c) — has
+      // only dead defs under any schedule; this is the one order-independent
+      // physreg deadness fact. Finer deadness is per-def (a def unread before
+      // the next write is dead even if the register has other uses) and thus
+      // schedule-dependent. That case is conservatively missed, consistent
+      // with the kill handling, which is also register-keyed: a physreg
+      // defined more than once in the block is treated as a single value,
+      // live from its first def to its last use. Over-extending liveness this
+      // way can cost colorability, but never correctness.
+      bool NoUses = MRI->use_nodbg_empty(R);
+      if (R.isPhysical())
+        for (MCRegAliasIterator AI(R.asMCReg(), TRI, /*IncludeSelf=*/false);
+             AI.isValid() && NoUses; ++AI)
+          NoUses = MRI->use_nodbg_empty(*AI);
+      if (NoUses)
+        MO.setIsDead(true);
+    }
+  }
+}
+
 /// Normalize tied uses so the allocator's core sees every tie as
 /// single-use + class-matching the tied def. For each tied use that is
 /// either multi-use or whose vreg class differs from the tied def's,
 /// insert `V' = COPY V` before MI and rewire the tied use to V'. V' is
 /// given the tied def's register class, so after this pass every tied
-/// pair has matching classes and the tied use is kill.
+/// pair has matching classes and the tied use is single-use. That makes
+/// every tied use its value's last use by construction, so its kill flag
+/// is set here, at the moment the invariant is established.
 void MOSRegAlloc::normalizeTiedRegs(MachineBasicBlock &MBB) {
   const TargetInstrInfo *TII = MBB.getParent()->getSubtarget().getInstrInfo();
   for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
@@ -216,12 +262,16 @@ void MOSRegAlloc::normalizeTiedRegs(MachineBasicBlock &MBB) {
 
       // No COPY needed only when V already matches the def's class and is
       // single-use (tied destruction lands on its natural last use).
-      if (VRC == DRC && MRI->hasOneNonDBGUse(V))
+      if (VRC == DRC && MRI->hasOneNonDBGUse(V)) {
+        MO.setIsKill(true);
         continue;
+      }
 
+      // V's own kill is established later, once a merge gathers all its
+      // uses, so the COPY's use of V carries no flag.
       Register VPrime = MRI->createVirtualRegister(DRC);
       BuildMI(MBB, MI, MI.getDebugLoc(), TII->get(TargetOpcode::COPY), VPrime)
-          .addReg(V, getKillRegState(MO.isKill()));
+          .addReg(V);
       MO.setReg(VPrime);
       MO.setIsKill(true);
     }
@@ -282,6 +332,9 @@ void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
 void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
   for (MachineInstr &MI : MIs) {
     for (const MachineOperand &MO : MI.all_uses()) {
+      // Kill flags are trustworthy here: incoming ones were cleared
+      // (initKillDeadFlags), and the pass sets one only as each kill fact is
+      // established (normalizeTiedRegs, setKillFlags).
       if (!MO.isKill() || MO.isUndef())
         continue;
       // Tied uses don't end the slot — the tied def reuses it. The def loop
@@ -458,6 +511,16 @@ void MOSRegAlloc::schedule(MachineBasicBlock &MBB) {
 /// update ownership to the defining instruction's cluster. Each physreg
 /// use merges the using instruction's cluster into its owner. This handles
 /// liveins, implicit-defs, and explicit physreg defs uniformly.
+///
+/// TODO: Physreg def-use bindings are fixed by the input order: a use must
+/// stay after its reaching def and before the next write of any aliasing
+/// register. That is preserved here only by construction — this sweep runs
+/// in input order and merges each use into its owner immediately, sealing
+/// def+use groups before any other reordering — not by any modeled
+/// constraint. A scheduler that picks merges in a different order must
+/// enforce these barriers explicitly; allocate validates only defs, so
+/// nothing stops an unrelated merge from relocating a physreg use ahead of
+/// its def.
 void MOSRegAlloc::schedulePhysRegs(MachineBasicBlock &MBB) {
   DenseMap<MCPhysReg, unsigned> PhysRegOwner;
   for (const auto &LI : MBB.liveins())
@@ -588,7 +651,9 @@ void MOSRegAlloc::mergeClusters(MachineBasicBlock &MBB, unsigned DefC,
 
 /// Set kill flags for new instructions added to a cluster. A use of V is a
 /// kill iff it is the last use of V in MIs and all of V's uses are in the
-/// cluster. Existing kill flags in the cluster are not affected.
+/// cluster. Existing kill flags in the cluster are not affected. A kill set
+/// here never goes stale: merges only append, so once V's uses are all
+/// gathered, the last of them remains V's last use in any final order.
 void MOSRegAlloc::setKillFlags(iterator_range<MBBIterator> MIs,
                                unsigned ClusterIdx) {
   DenseMap<Register, MachineOperand *> LastUse;
@@ -676,7 +741,9 @@ void MOSRegAlloc::assignRegisters(MachineBasicBlock &MBB) {
 
 char MOSRegAlloc::ID = 0;
 
-INITIALIZE_PASS(MOSRegAlloc, DEBUG_TYPE, "MOS Register Allocation", false,
-                false)
+INITIALIZE_PASS_BEGIN(MOSRegAlloc, DEBUG_TYPE, "MOS Register Allocation", false,
+                      false)
+INITIALIZE_PASS_END(MOSRegAlloc, DEBUG_TYPE, "MOS Register Allocation", false,
+                    false)
 
 MachineFunctionPass *llvm::createMOSRegAllocPass() { return new MOSRegAlloc; }
