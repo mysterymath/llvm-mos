@@ -183,8 +183,6 @@ void MOSRegAlloc::validate(MachineBasicBlock &MBB) {
       assert(!MO.isEarlyClobber() && "Earlyclobber not yet supported");
       if (MO.isUse())
         assert(!MO.isUndef() && "Undef uses not yet supported");
-      if (MO.isDef())
-        assert(!MO.isDead() && "Dead defs not yet supported");
     }
   }
 }
@@ -316,6 +314,14 @@ void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
         LLVM_DEBUG(dbgs() << "    Physreg def " << printReg(R, TRI) << "\n");
       }
     }
+
+    // Dead defs' slots don't extend past this MI. Run after the full def
+    // loop so intra-MI later defs still saw the dead def as an interferer.
+    // Redirect through tiedRoot for tied + dead defs (rare): the slot's
+    // root is the original tied use's vreg, not the tied def itself.
+    for (const MachineOperand &MO : MI.all_defs())
+      if (MO.isDead())
+        Live.erase(tiedRoot(MO.getReg()));
   }
 }
 
@@ -623,6 +629,13 @@ void MOSRegAlloc::assignRegisters(MachineBasicBlock &MBB) {
       for (MCRegUnit Unit : TRI->regunits(Assigned))
         LiveUnits.set(static_cast<unsigned>(Unit));
     }
+
+    // Free dead defs' physregs after the full def loop so intra-MI later
+    // defs still saw them as occupied for their free-physreg search.
+    for (const MachineOperand &MO : MI.all_defs())
+      if (MO.isDead())
+        for (MCRegUnit Unit : TRI->regunits(MO.getReg().asMCReg()))
+          LiveUnits.reset(static_cast<unsigned>(Unit));
   }
 }
 
