@@ -168,7 +168,6 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
 void MOSRegAlloc::validate(MachineBasicBlock &MBB) {
   for (MachineInstr &MI : MBB) {
-    assert(!MI.isTerminator() && "Terminators not yet supported");
     assert(MI.getOpcode() != TargetOpcode::REG_SEQUENCE &&
            "REG_SEQUENCE not yet supported");
     assert(MI.getOpcode() != TargetOpcode::INSERT_SUBREG &&
@@ -181,8 +180,12 @@ void MOSRegAlloc::validate(MachineBasicBlock &MBB) {
       if (!MO.isReg())
         continue;
       assert(!MO.isEarlyClobber() && "Earlyclobber not yet supported");
-      if (MO.isUse())
-        assert(!MO.isUndef() && "Undef uses not yet supported");
+      // No vreg defs in terminators: this makes any tied operand pair on
+      // a terminator necessarily physreg-tied, so normalizeTiedRegs never
+      // has to insert a COPY inside the terminator span.
+      if (MI.isTerminator() && MO.isDef())
+        assert(!MO.getReg().isVirtual() &&
+               "Vreg defs on terminators not yet supported");
     }
   }
 }
@@ -201,7 +204,10 @@ void MOSRegAlloc::normalizeTiedRegs(MachineBasicBlock &MBB) {
       if (!MO.isReg() || !MO.isUse() || !MO.isTied())
         continue;
       Register V = MO.getReg();
-      assert(V.isVirtual() && "Tied physreg operands not supported");
+      // Tied physreg pairs need no normalization: the slot is just
+      // "this physreg stays live through the MI."
+      if (V.isPhysical())
+        continue;
 
       unsigned DefIdx = MI.findTiedOperandIdx(I);
       const TargetRegisterClass *VRC = MRI->getRegClass(V);
@@ -240,11 +246,23 @@ void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
     LiveIns.LiveOut.insert(LI.PhysReg);
   Clusters.push_back(std::move(LiveIns));
 
-  for (MachineInstr &MI : MBB) {
+  auto FirstTerm = MBB.getFirstTerminator();
+  for (auto It = MBB.begin(); It != FirstTerm; ++It) {
+    MachineInstr &MI = *It;
     MICluster[&MI] = Clusters.size();
     Cluster C(make_range(MI.getIterator(), std::next(MI.getIterator())));
     allocate(C.Range, C.LiveOut);
     Clusters.push_back(std::move(C));
+  }
+
+  // Terminator span: one atomic cluster, never split. Its contiguity is
+  // load-bearing — nothing may be inserted between its MIs.
+  if (FirstTerm != MBB.end()) {
+    Cluster Term(make_range(FirstTerm, MBB.end()));
+    for (MachineInstr &MI : Term)
+      MICluster[&MI] = Clusters.size();
+    allocate(Term.Range, Term.LiveOut);
+    Clusters.push_back(std::move(Term));
   }
 }
 
@@ -264,7 +282,7 @@ void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
 void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
   for (MachineInstr &MI : MIs) {
     for (const MachineOperand &MO : MI.all_uses()) {
-      if (!MO.isKill())
+      if (!MO.isKill() || MO.isUndef())
         continue;
       // Tied uses don't end the slot — the tied def reuses it. The def loop
       // below records the new vreg's identity in TiedRoot. For other uses,
@@ -277,7 +295,8 @@ void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
     for (const MachineOperand &MO : MI.all_defs()) {
       Register R = MO.getReg();
       if (MO.isTied()) {
-        assert(R.isVirtual() && "Tied physreg operands not supported");
+        if (R.isPhysical())
+          continue;  // Slot is just "physreg stays live through MI."
         unsigned UseIdx = MI.findTiedOperandIdx(MO.getOperandNo());
         const MachineOperand &UseMO = MI.getOperand(UseIdx);
         assert(UseMO.getReg().isVirtual() &&
@@ -448,6 +467,12 @@ void MOSRegAlloc::schedulePhysRegs(MachineBasicBlock &MBB) {
   // singleton when we visit it), so MI's original successor is untouched.
   // make_early_inc_range captures the successor before the merge runs.
   for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
+    // Terminators live in the terminator cluster — an atomic cluster
+    // anchored at MBB.end(). Driving a merge from a terminator's physreg
+    // use would splice the terminator cluster mid-block; linearizeClusters
+    // folds it in last instead.
+    if (MI.isTerminator())
+      continue;
     for (const MachineOperand &MO : MI.all_uses()) {
       if (!MO.getReg().isPhysical())
         continue;
@@ -478,7 +503,15 @@ void MOSRegAlloc::scheduleVRegs(MachineBasicBlock &MBB) {
     if (MRI->reg_nodbg_empty(R))
       continue;
 
-    for (MachineInstr &UseMI : MRI->use_nodbg_instructions(R)) {
+    for (MachineOperand &MO : MRI->use_nodbg_operands(R)) {
+      if (MO.isUndef())
+        continue;
+      MachineInstr &UseMI = *MO.getParent();
+      // Terminator vreg uses don't drive merges — a merge involving the
+      // terminator cluster would splice it mid-block; linearizeClusters
+      // folds it in last.
+      if (UseMI.isTerminator())
+        continue;
       unsigned DefC = MICluster[MRI->getVRegDef(R)];
       unsigned UseC = MICluster[&UseMI];
 
@@ -586,7 +619,7 @@ void MOSRegAlloc::assignRegisters(MachineBasicBlock &MBB) {
   for (MachineInstr &MI : MBB) {
     // Free killed uses. Prior defs' replaceRegWith already made these physregs.
     for (const MachineOperand &MO : MI.all_uses()) {
-      if (!MO.isKill())
+      if (!MO.isKill() || MO.isUndef())
         continue;
       assert(MO.getReg().isPhysical() && "Use not yet replaced");
       for (MCRegUnit Unit : TRI->regunits(MO.getReg().asMCReg()))
