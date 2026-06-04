@@ -338,3 +338,35 @@ body: |
     CmpBrImm %bb.0, undef $n, 1, killed %0, 5, implicit-def $c
     RTS
 ...
+
+# Cost-aware deferral + re-cost between commits. %0:Ac is COPY'd to the gpr
+# connector %1 (so %1's def cluster keeps %0 live), then %0 dies, then %2:Ac
+# is derived from %1 after %0 is dead. Input order is colorable: %0 and %2
+# never overlap, so both can take $a. But the %1 edge offers a merge that
+# would splice %2's $a def up next to %1's def while %0 (also $a, and Ac is
+# not narrowable) is still live — an uncolorable $a/$a overlap. The scheduler
+# costs that merge at 1 and instead commits the cost-0 merge that kills %0;
+# once %0 is dead the same %1-edge merge re-costs to 0 and commits cleanly.
+# A scheduler that committed merges greedily by edge order would take the
+# cost-1 merge and trip commitMerge's colorability check.
+---
+name: cost_aware_deferral
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: ac }
+  - { id: 1, class: gpr }
+  - { id: 2, class: ac }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: cost_aware_deferral
+    ; CHECK: $a = LDAbs 1000
+    ; CHECK-NEXT: $x = COPY $a
+    ; CHECK-NEXT: STAbs killed $a, 2000
+    ; CHECK-NEXT: $a = COPY killed $x
+    ; CHECK-NEXT: STAbs killed $a, 3000
+    %0:ac = LDAbs 1000
+    %1:gpr = COPY %0
+    STAbs killed %0, 2000
+    %2:ac = COPY killed %1
+    STAbs killed %2, 3000
+...

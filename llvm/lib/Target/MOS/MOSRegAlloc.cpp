@@ -31,6 +31,7 @@
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
 
 #define DEBUG_TYPE "mos-regalloc"
 
@@ -138,12 +139,46 @@ private:
   BitVector allocatableRegs(const TargetRegisterClass *RC);
   BitVector aliasSet(const BitVector &Regs);
 
+  /// Count of defs in the last allocate() pass that could not be colored
+  /// without inserting a copy. allocate() resets it to 0 at entry and
+  /// narrowToFit bumps it when a def has no colorably-narrowable victim, so
+  /// it is purely the output of the most recent allocate(). Callers inspect
+  /// it after: tryMerge scores the trial by it, while non-merge callers
+  /// (initClusters) and commitMerge assert it is 0 because their allocations
+  /// must be colorable.
+  unsigned Cost = 0;
+
+  /// A merge trial's outcome plus the post-merge state needed to make it
+  /// real. tryMerge fills this in for the cheapest trial seen so far;
+  /// commitMerge swaps the saved maps into the live state directly, without
+  /// re-running allocate(). Cost == ~0u means "no candidate yet".
+  struct PendingMerge {
+    unsigned DefC = 0;
+    unsigned UseC = 0;
+    unsigned Cost = ~0u;
+
+    // Post-merge state, captured from the live maps at the end of a winning
+    // trial (before tryMerge reverts them).
+    IndexedMap<BitVector, VirtReg2IndexFunctor> EffectiveRC;
+    IndexedMap<SmallVector<Register, 8>, VirtReg2IndexFunctor> Interferences;
+    DenseMap<Register, Register> TiedRoot;
+    DenseMap<MachineInstr *, unsigned> MICluster;
+    LiveSet LiveOutAfter;
+    SmallVector<MachineOperand *, 4> KilledMOs;
+
+    void reset() { *this = PendingMerge(); }
+  };
+  /// The cheapest merge trial seen in the current scheduleClusters scan.
+  PendingMerge BestMerge;
+
   void schedule(MachineBasicBlock &MBB);
-  void schedulePhysRegs(MachineBasicBlock &MBB);
-  void scheduleVRegs(MachineBasicBlock &MBB);
+  void scheduleClusters(MachineBasicBlock &MBB);
   void linearizeClusters(MachineBasicBlock &MBB);
   void mergeClusters(MachineBasicBlock &MBB, unsigned DefC, unsigned UseC);
-  void setKillFlags(iterator_range<MBBIterator> MIs, unsigned ClusterIdx);
+  void tryMerge(unsigned DefC, unsigned UseC);
+  void commitMerge(MachineBasicBlock &MBB, PendingMerge PM);
+  void setKillFlags(iterator_range<MBBIterator> MIs, unsigned ClusterIdx,
+                    SmallVectorImpl<MachineOperand *> *KilledMOs = nullptr);
 
   void assignRegisters(MachineBasicBlock &MBB);
 };
@@ -159,7 +194,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   LLVM_DEBUG(dbgs() << "MOS RegAlloc: " << MF.getName() << " ("
                     << MRI->getNumVirtRegs() << " vregs)\n");
 
-  assert(MF.size() == 1 && "Multiple basic blocks not yet supported");
+  if (MF.size() != 1)
+    report_fatal_error("multiple basic blocks not yet supported");
   MachineBasicBlock &MBB = MF.front();
   validate(MBB);
   initKillDeadFlags(MBB);
@@ -174,24 +210,25 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
 
 void MOSRegAlloc::validate(MachineBasicBlock &MBB) {
   for (MachineInstr &MI : MBB) {
-    assert(MI.getOpcode() != TargetOpcode::REG_SEQUENCE &&
-           "REG_SEQUENCE not yet supported");
-    assert(MI.getOpcode() != TargetOpcode::INSERT_SUBREG &&
-           "INSERT_SUBREG not yet supported");
-    assert(MI.getOpcode() != TargetOpcode::EXTRACT_SUBREG &&
-           "EXTRACT_SUBREG not yet supported");
+    if (MI.getOpcode() == TargetOpcode::REG_SEQUENCE)
+      report_fatal_error("REG_SEQUENCE not yet supported");
+    if (MI.getOpcode() == TargetOpcode::INSERT_SUBREG)
+      report_fatal_error("INSERT_SUBREG not yet supported");
+    if (MI.getOpcode() == TargetOpcode::EXTRACT_SUBREG)
+      report_fatal_error("EXTRACT_SUBREG not yet supported");
 
     for (const MachineOperand &MO : MI.operands()) {
-      assert(!MO.isRegMask() && "Regmasks not yet supported");
+      if (MO.isRegMask())
+        report_fatal_error("regmasks not yet supported");
       if (!MO.isReg())
         continue;
-      assert(!MO.isEarlyClobber() && "Earlyclobber not yet supported");
+      if (MO.isEarlyClobber())
+        report_fatal_error("earlyclobber not yet supported");
       // No vreg defs in terminators: this makes any tied operand pair on
       // a terminator necessarily physreg-tied, so normalizeTiedRegs never
       // has to insert a COPY inside the terminator span.
-      if (MI.isTerminator() && MO.isDef())
-        assert(!MO.getReg().isVirtual() &&
-               "Vreg defs on terminators not yet supported");
+      if (MI.isTerminator() && MO.isDef() && MO.getReg().isVirtual())
+        report_fatal_error("vreg defs on terminators not yet supported");
     }
   }
 }
@@ -302,6 +339,8 @@ void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
     MICluster[&MI] = Clusters.size();
     Cluster C(make_range(MI.getIterator(), std::next(MI.getIterator())));
     allocate(C.Range, C.LiveOut);
+    if (Cost != 0)
+      report_fatal_error("single-instruction cluster is not colorable");
     Clusters.push_back(std::move(C));
   }
 
@@ -312,6 +351,8 @@ void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
     for (MachineInstr &MI : Term)
       MICluster[&MI] = Clusters.size();
     allocate(Term.Range, Term.LiveOut);
+    if (Cost != 0)
+      report_fatal_error("terminator cluster is not colorable");
     Clusters.push_back(std::move(Term));
   }
 }
@@ -330,6 +371,8 @@ void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
 /// to avoid V; they do not consume V's slack. Narrowing of V is the one
 /// event that charges V — it directly shrinks EffectiveRC[V].
 void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
+  // Cost reflects this pass alone; narrowToFit bumps it per uncolorable def.
+  Cost = 0;
   for (MachineInstr &MI : MIs) {
     for (const MachineOperand &MO : MI.all_uses()) {
       // Kill flags are trustworthy here: incoming ones were cleared
@@ -352,11 +395,11 @@ void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
           continue;  // Slot is just "physreg stays live through MI."
         unsigned UseIdx = MI.findTiedOperandIdx(MO.getOperandNo());
         const MachineOperand &UseMO = MI.getOperand(UseIdx);
-        assert(UseMO.getReg().isVirtual() &&
-               "Tied physreg operands not supported");
-        assert(UseMO.isKill() && "Tied use must be killed (normalizeTiedRegs)");
+        if (!UseMO.getReg().isVirtual())
+          report_fatal_error("tied physreg operands not yet supported");
+        assert(UseMO.isKill() && "tied use must be killed (normalizeTiedRegs)");
         assert(MRI->getRegClass(R) == MRI->getRegClass(UseMO.getReg()) &&
-               "Tied operands must have matching register classes");
+               "tied operands must have matching register classes");
         TiedRoot[R] = tiedRoot(UseMO.getReg());
         LLVM_DEBUG(dbgs() << "    Tied def " << printReg(R, TRI) << " -> slot "
                           << printReg(TiedRoot[R], TRI) << "\n");
@@ -436,8 +479,34 @@ void MOSRegAlloc::narrowToFit(Register Def, const BitVector &DefEff,
         NarrowEffRC = std::move(NewEffRC);
       }
     }
-    assert(NarrowReg.isValid() &&
-           "Allocation failed: no colorably-narrowable live value");
+    if (!NarrowReg.isValid()) {
+      LLVM_DEBUG({
+        dbgs() << "    !!! No narrowable victim for " << printReg(Def, TRI)
+               << " (DefEff=" << DefEff.count()
+               << ", slack=" << getSlack(DefEff, DefInters) << ")\n";
+        dbgs() << "      DefInters: ";
+        for (Register U : DefInters) {
+          dbgs() << printReg(U, TRI);
+          if (U.isVirtual())
+            dbgs() << "(eff=" << EffectiveRC[U].count() << ")";
+          dbgs() << " ";
+        }
+        dbgs() << "\n      Live: ";
+        for (Register V : Live) {
+          dbgs() << printReg(V, TRI);
+          if (V.isVirtual())
+            dbgs() << "(eff=" << EffectiveRC[V].count() << ",iSlk="
+                   << getSlack(EffectiveRC[V], Interferences[V]) << ")";
+          dbgs() << " ";
+        }
+        dbgs() << "\n";
+      });
+      // No colorable victim. Bump Cost (a copy would be needed to color
+      // this def) and stop narrowing for it. Callers inspect Cost: tryMerge
+      // scores the trial by it; initClusters and commitMerge assert it is 0.
+      ++Cost;
+      break;
+    }
 
     // V's interferences set stays as-is. Its slack drops naturally since
     // EffectiveRC[V] shrinks. Def's slack rises on the next getSlack call:
@@ -490,13 +559,12 @@ BitVector MOSRegAlloc::aliasSet(const BitVector &Regs) {
 }
 
 void MOSRegAlloc::schedule(MachineBasicBlock &MBB) {
-  schedulePhysRegs(MBB);
-  scheduleVRegs(MBB);
+  scheduleClusters(MBB);
   linearizeClusters(MBB);
 
   assert(llvm::count_if(Clusters,
                         [](const Cluster &C) { return !C.empty(); }) == 1 &&
-         "Not all clusters merged into one");
+         "not all clusters merged into one");
 
   // MBB is now in final schedule order.
   LLVM_DEBUG({
@@ -506,89 +574,88 @@ void MOSRegAlloc::schedule(MachineBasicBlock &MBB) {
   });
 }
 
-/// Walk MBB in original order, tracking which cluster currently "owns" each
-/// live physreg. Liveins start owned by the livein cluster; physreg defs
-/// update ownership to the defining instruction's cluster. Each physreg
-/// use merges the using instruction's cluster into its owner. This handles
-/// liveins, implicit-defs, and explicit physreg defs uniformly.
+/// Cost-aware merge selection. Each iteration enumerates every candidate
+/// merge — physreg edges (a physreg defined in one cluster, used in another)
+/// and vreg edges (a vreg's def cluster paired with each of its use clusters)
+/// — dry-running each via tryMerge, which scores it by the number of defs that
+/// would need a copy to be colorable and keeps the cheapest in BestMerge. We
+/// then commit that winner and rescan, since a commit can shift other
+/// candidates' costs through narrowing cascades. We stop only when no
+/// cross-cluster edge remains (BestMerge.Cost == ~0u); whatever is left is
+/// independent components that linearizeClusters folds in layout order.
+///
+/// Copy insertion is not implemented yet, so commitMerge requires the winner
+/// to be colorable as-is (Cost 0). Merges with higher cost become committable
+/// once we can insert the copies they need.
 ///
 /// TODO: Physreg def-use bindings are fixed by the input order: a use must
 /// stay after its reaching def and before the next write of any aliasing
-/// register. That is preserved here only by construction — this sweep runs
-/// in input order and merges each use into its owner immediately, sealing
-/// def+use groups before any other reordering — not by any modeled
-/// constraint. A scheduler that picks merges in a different order must
-/// enforce these barriers explicitly; allocate validates only defs, so
-/// nothing stops an unrelated merge from relocating a physreg use ahead of
-/// its def.
-void MOSRegAlloc::schedulePhysRegs(MachineBasicBlock &MBB) {
-  DenseMap<MCPhysReg, unsigned> PhysRegOwner;
-  for (const auto &LI : MBB.liveins())
-    PhysRegOwner[LI.PhysReg] = LiveInClusterIdx;
+/// register. Nothing models those barriers — merges commit in cost order, and
+/// allocate validates only defs — so a committed merge along an unrelated
+/// vreg edge can relocate a physreg use ahead of its def. The next round's
+/// owner walk usually trips the "no prior def or livein" assert, but if an
+/// earlier def of the same register exists (a livein, say), the use silently
+/// rebinds to that stale value instead. These barriers need explicit
+/// modeling.
+void MOSRegAlloc::scheduleClusters(MachineBasicBlock &MBB) {
+  while (true) {
+    BestMerge.reset();
 
-  // Each merge here only relocates MI itself (its cluster is still a
-  // singleton when we visit it), so MI's original successor is untouched.
-  // make_early_inc_range captures the successor before the merge runs.
-  for (MachineInstr &MI : llvm::make_early_inc_range(MBB)) {
-    // Terminators live in the terminator cluster — an atomic cluster
-    // anchored at MBB.end(). Driving a merge from a terminator's physreg
-    // use would splice the terminator cluster mid-block; linearizeClusters
-    // folds it in last instead.
-    if (MI.isTerminator())
-      continue;
-    for (const MachineOperand &MO : MI.all_uses()) {
-      if (!MO.getReg().isPhysical())
+    // Physreg edges. Walk MBB in current layout order, tracking which cluster
+    // currently "owns" each live physreg: liveins start owned by the livein
+    // cluster, physreg defs transfer ownership to the defining instruction's
+    // cluster, and each physreg use is a candidate merge of the using
+    // instruction's cluster into its owner. tryMerge reverts every trial, so a
+    // plain walk (not make_early_inc_range) observes a stable layout.
+    DenseMap<MCPhysReg, unsigned> PhysRegOwner;
+    for (const auto &LI : MBB.liveins())
+      PhysRegOwner[LI.PhysReg] = LiveInClusterIdx;
+    for (MachineInstr &MI : MBB) {
+      // Terminators live in the terminator cluster — an atomic cluster
+      // anchored at MBB.end(). Driving a merge from a terminator's physreg
+      // use would splice the terminator cluster mid-block; linearizeClusters
+      // folds it in last instead.
+      if (MI.isTerminator())
         continue;
-      auto It = PhysRegOwner.find(MO.getReg().asMCReg());
-      assert(It != PhysRegOwner.end() &&
-             "Physreg use has no prior def or livein");
-      unsigned DefC = It->second;
-      unsigned UseC = MICluster[&MI];
-      if (UseC == DefC)
-        continue;
-      LLVM_DEBUG(dbgs() << "  Merge cluster " << UseC << " into " << DefC
-                        << " for " << printReg(MO.getReg(), TRI) << "\n");
-      mergeClusters(MBB, DefC, UseC);
+      for (const MachineOperand &MO : MI.all_uses()) {
+        if (!MO.getReg().isPhysical())
+          continue;
+        auto It = PhysRegOwner.find(MO.getReg().asMCReg());
+        assert(It != PhysRegOwner.end() &&
+               "physreg use has no prior def or livein");
+        if (It->second != MICluster[&MI])
+          tryMerge(It->second, MICluster[&MI]);
+      }
+      for (const MachineOperand &MO : MI.all_defs())
+        if (MO.getReg().isPhysical())
+          PhysRegOwner[MO.getReg().asMCReg()] = MICluster[&MI];
     }
-    for (const MachineOperand &MO : MI.all_defs()) {
-      if (!MO.getReg().isPhysical())
-        continue;
-      PhysRegOwner[MO.getReg().asMCReg()] = MICluster[&MI];
-    }
-  }
-}
 
-/// For each vreg, merge the def cluster with each use cluster.
-void MOSRegAlloc::scheduleVRegs(MachineBasicBlock &MBB) {
-  for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
-    Register R = Register::index2VirtReg(I);
-    LLVM_DEBUG(dbgs() << "  Considering " << printReg(R, TRI) << "\n");
-    if (MRI->reg_nodbg_empty(R))
-      continue;
-
-    for (MachineOperand &MO : MRI->use_nodbg_operands(R)) {
-      if (MO.isUndef())
-        continue;
-      MachineInstr &UseMI = *MO.getParent();
-      // Terminator vreg uses don't drive merges — a merge involving the
-      // terminator cluster would splice it mid-block; linearizeClusters
-      // folds it in last.
-      if (UseMI.isTerminator())
+    // Vreg edges. For each vreg, pair its def's cluster with each use's.
+    for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
+      Register R = Register::index2VirtReg(I);
+      if (MRI->reg_nodbg_empty(R))
         continue;
       unsigned DefC = MICluster[MRI->getVRegDef(R)];
-      unsigned UseC = MICluster[&UseMI];
-
-      LLVM_DEBUG(dbgs() << "    DefC=" << DefC << " UseC=" << UseC);
-      if (DefC == UseC) {
-        LLVM_DEBUG(dbgs() << " — same cluster, skip\n");
-        continue;
+      for (MachineOperand &MO : MRI->use_nodbg_operands(R)) {
+        if (MO.isUndef())
+          continue;
+        MachineInstr &UseMI = *MO.getParent();
+        // Terminator vreg uses don't drive merges — see above.
+        if (UseMI.isTerminator())
+          continue;
+        if (DefC != MICluster[&UseMI])
+          tryMerge(DefC, MICluster[&UseMI]);
       }
-      LLVM_DEBUG(dbgs() << "\n");
-
-      LLVM_DEBUG(dbgs() << "    Merge cluster " << UseC << " into " << DefC
-                        << " for " << printReg(R, TRI) << "\n");
-      mergeClusters(MBB, DefC, UseC);
     }
+
+    // No candidate edge remains: every def-use-connected cluster is merged.
+    if (BestMerge.Cost == ~0u)
+      break;
+    LLVM_DEBUG(dbgs() << "  Commit merge " << BestMerge.UseC << " into "
+                      << BestMerge.DefC << " (cost " << BestMerge.Cost
+                      << ")\n");
+    commitMerge(MBB, std::move(BestMerge));
   }
 }
 
@@ -613,17 +680,111 @@ void MOSRegAlloc::linearizeClusters(MachineBasicBlock &MBB) {
   }
 }
 
-/// Merge cluster UseC into cluster DefC: relocate UseC's instructions to
-/// directly follow DefC's last instruction, transfer their MICluster
-/// mapping to DefC, set kill flags on the relocated instructions, and
-/// allocate them against DefC's running LiveOut. UseC is left empty.
+/// Unconditionally merge cluster UseC into cluster DefC: dry-run it with
+/// tryMerge to capture its effects, then commitMerge them. Used by
+/// linearizeClusters, which folds the remaining independent components in
+/// layout order and so always wants to take the one merge it names (rather
+/// than picking the cheapest among competing candidates, as scheduleClusters
+/// does by calling tryMerge / commitMerge directly).
 void MOSRegAlloc::mergeClusters(MachineBasicBlock &MBB, unsigned DefC,
                                 unsigned UseC) {
+  BestMerge.reset();
+  tryMerge(DefC, UseC);
+  commitMerge(MBB, std::move(BestMerge));
+}
+
+/// Dry-run a merge of cluster UseC into DefC: compute its cost (the number of
+/// defs that would need a copy to be colorable) and, if it is cheaper than
+/// the current BestMerge, capture the resulting post-merge state into
+/// BestMerge for commitMerge to swap in later. Real allocator state is fully
+/// reverted before returning, so trials are independent and repeatable.
+///
+/// No splice happens here: the use instructions are allocated in their
+/// current location against a copy of Def's running live set. allocate()
+/// processes the same MI objects either way, so this yields the same
+/// EffectiveRC / Interferences / Cost as if they had been spliced after Def.
+void MOSRegAlloc::tryMerge(unsigned DefC, unsigned UseC) {
   Cluster &Def = Clusters[DefC];
   Cluster &Use = Clusters[UseC];
-  auto UseBegin = Use.begin();
+
+  // Snapshot every piece of persistent state a trial mutates, so we can
+  // revert after scoring. (allocate touches EffectiveRC / Interferences /
+  // TiedRoot; we reassign MICluster below; setKillFlags flips kill flags,
+  // tracked separately via KilledMOs.)
+  auto SavedERC = EffectiveRC;
+  auto SavedInters = Interferences;
+  auto SavedTiedRoot = TiedRoot;
+  auto SavedMICluster = MICluster;
+
+  // Reassign the use instructions to DefC so setKillFlags sees the merged
+  // cluster membership when deciding which uses die.
   for (MachineInstr &MI : Use)
     MICluster[&MI] = DefC;
+
+  // Compute kill flags as if merged, recording the operands flipped so we
+  // can undo them (commitMerge re-applies BestMerge.KilledMOs).
+  SmallVector<MachineOperand *, 4> KilledMOs;
+  setKillFlags(Use.Range, DefC, &KilledMOs);
+
+  // Allocate the use instructions against a copy of Def's running live set.
+  LiveSet TmpLive = Def.LiveOut;
+  allocate(Use.Range, TmpLive);
+
+  LLVM_DEBUG(dbgs() << "  tryMerge " << UseC << " into " << DefC << ": cost "
+                    << Cost << " (best " << BestMerge.Cost << ")\n");
+
+  // If this trial is the cheapest so far, capture its post-merge state.
+  // Move the mutated maps out (they are restored from the snapshots below).
+  if (Cost < BestMerge.Cost) {
+    BestMerge.DefC = DefC;
+    BestMerge.UseC = UseC;
+    BestMerge.Cost = Cost;
+    BestMerge.EffectiveRC = std::move(EffectiveRC);
+    BestMerge.Interferences = std::move(Interferences);
+    BestMerge.TiedRoot = std::move(TiedRoot);
+    BestMerge.MICluster = std::move(MICluster);
+    BestMerge.LiveOutAfter = std::move(TmpLive);
+    BestMerge.KilledMOs = KilledMOs;
+  }
+
+  // Revert all real state to baseline. On a win the maps were moved out
+  // above, so this reassigns from the snapshots either way. Kill flags are
+  // cleared regardless of win/loss — the real IR returns to baseline and
+  // commitMerge re-sets the winning trial's flags from BestMerge.KilledMOs.
+  EffectiveRC = std::move(SavedERC);
+  Interferences = std::move(SavedInters);
+  TiedRoot = std::move(SavedTiedRoot);
+  MICluster = std::move(SavedMICluster);
+  for (MachineOperand *MO : KilledMOs)
+    MO->setIsKill(false);
+}
+
+/// Make a merge captured by tryMerge real. Swaps the recorded post-merge
+/// maps into the live state (no re-allocation), re-applies the kill flags
+/// the trial computed, then performs the splice and cluster-range
+/// bookkeeping tryMerge deliberately skipped. UseC is left empty.
+void MOSRegAlloc::commitMerge(MachineBasicBlock &MBB, PendingMerge PM) {
+  if (PM.Cost != 0)
+    report_fatal_error("merge requires a copy, which is not yet supported");
+  unsigned DefC = PM.DefC;
+  unsigned UseC = PM.UseC;
+  Cluster &Def = Clusters[DefC];
+  Cluster &Use = Clusters[UseC];
+
+  // Swap the captured post-merge state into the live maps, replacing the
+  // baseline tryMerge reverted to.
+  EffectiveRC = std::move(PM.EffectiveRC);
+  Interferences = std::move(PM.Interferences);
+  TiedRoot = std::move(PM.TiedRoot);
+  MICluster = std::move(PM.MICluster);
+
+  // Re-apply the kill flags the trial computed (tryMerge cleared them).
+  for (MachineOperand *MO : PM.KilledMOs)
+    MO->setIsKill(true);
+
+  // Splice UseC's instructions to follow DefC, mirroring the layout the
+  // dry-run allocation assumed, and fix up the affected cluster ranges.
+  auto UseBegin = Use.begin();
   if (UseBegin != Def.end()) {
     // Fix the predecessor cluster whose end sentinel is Use.begin().
     unsigned PredC = MICluster[&*std::prev(UseBegin)];
@@ -642,20 +803,21 @@ void MOSRegAlloc::mergeClusters(MachineBasicBlock &MBB, unsigned DefC,
   }
   Use.Range = make_range(Use.end(), Use.end());
   Use.LiveOut.clear();
-
-  // Update kill flags and allocate only the new (use) instructions.
-  auto NewMIs = make_range(UseBegin, Def.end());
-  setKillFlags(NewMIs, DefC);
-  allocate(NewMIs, Def.LiveOut);
+  Def.LiveOut = std::move(PM.LiveOutAfter);
 }
 
 /// Set kill flags for new instructions added to a cluster. A use of V is a
 /// kill iff it is the last use of V in MIs and all of V's uses are in the
 /// cluster. Existing kill flags in the cluster are not affected. A kill set
-/// here never goes stale: merges only append, so once V's uses are all
-/// gathered, the last of them remains V's last use in any final order.
+/// by a committed merge never goes stale: merges only append, so once V's
+/// uses are all gathered, the last of them remains V's last use in any final
+/// order. A dry run's kills hold only if its merge commits, so if KilledMOs
+/// is non-null, each operand whose kill flag is flipped false→true is
+/// appended to it (so the caller can undo the writes by clearing the kill
+/// flags on those operands; commitMerge re-applies the winner's).
 void MOSRegAlloc::setKillFlags(iterator_range<MBBIterator> MIs,
-                               unsigned ClusterIdx) {
+                               unsigned ClusterIdx,
+                               SmallVectorImpl<MachineOperand *> *KilledMOs) {
   DenseMap<Register, MachineOperand *> LastUse;
   for (MachineInstr &MI : MIs)
     for (MachineOperand &MO : MI.all_uses())
@@ -666,8 +828,11 @@ void MOSRegAlloc::setKillFlags(iterator_range<MBBIterator> MIs,
         llvm::all_of(MRI->use_nodbg_instructions(V), [&](MachineInstr &U) {
           return MICluster[&U] == ClusterIdx;
         });
-    if (AllInside)
+    if (AllInside && !MO->isKill()) {
       MO->setIsKill(true);
+      if (KilledMOs)
+        KilledMOs->push_back(MO);
+    }
   }
 }
 
@@ -686,7 +851,7 @@ void MOSRegAlloc::assignRegisters(MachineBasicBlock &MBB) {
     for (const MachineOperand &MO : MI.all_uses()) {
       if (!MO.isKill() || MO.isUndef())
         continue;
-      assert(MO.getReg().isPhysical() && "Use not yet replaced");
+      assert(MO.getReg().isPhysical() && "use not yet replaced");
       for (MCRegUnit Unit : TRI->regunits(MO.getReg().asMCReg()))
         LiveUnits.reset(static_cast<unsigned>(Unit));
     }
@@ -719,7 +884,8 @@ void MOSRegAlloc::assignRegisters(MachineBasicBlock &MBB) {
             break;
           }
         }
-        assert(Assigned && "No free register in effective set");
+        if (!Assigned)
+          report_fatal_error("no free register in effective set");
         LLVM_DEBUG(dbgs() << "    Assign " << printReg(Reg, TRI) << " -> "
                           << printReg(Assigned, TRI) << "\n");
         MRI->replaceRegWith(Reg, Assigned);
