@@ -13,6 +13,12 @@
 // cluster remains. The final cluster's schedule is the block's instruction
 // sequence. Physical registers are assigned top-down greedily.
 //
+// A dependence graph fixed by the input order (data, anti, and output edges
+// over registers) constrains the merging: a merge must keep the cluster-level
+// graph acyclic (canMerge), and the final linearization folds clusters in
+// topological order, so every schedule the allocator can produce respects the
+// input's def-use bindings.
+//
 //===----------------------------------------------------------------------===//
 
 #include "MOSRegAlloc.h"
@@ -20,6 +26,7 @@
 #include "MOS.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/IndexedMap.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -42,6 +49,29 @@ namespace {
 using MBBIterator = MachineBasicBlock::iterator;
 using LiveSet = SmallSet<Register, 8>;
 
+/// Dependence kinds, mirroring SDep's vocabulary; an Order kind is reserved
+/// for future memory/barrier edges. Stored as bits: a cluster-level edge
+/// carries the union of the kinds of all instruction dependencies it stands
+/// for. Kinds encode two independent properties, and consumers filter by
+/// the masks below: whether the edge constrains the final order, and
+/// whether it proposes merging its endpoints (gathering a value's def and
+/// uses into one cluster is the allocator's goal).
+enum DepKinds : unsigned {
+  DepData = 1 << 0,   ///< Regular data dependence (aka true-dependence).
+  DepAnti = 1 << 1,   ///< A register anti-dependence (aka WAR).
+  DepOutput = 1 << 2, ///< A register output-dependence (aka WAW).
+  /// A read of a block livein value, hung off the livein cluster. Drives
+  /// merging — that is how livein liveness reaches the reader's allocation
+  /// — but constrains nothing: block entry precedes every instruction, and
+  /// reads of the same livein commute. The ordering content of a livein is
+  /// carried by its readers' Anti edges to the next aliasing def.
+  DepLiveIn = 1 << 3,
+};
+/// Kinds that constrain the final instruction order.
+constexpr unsigned DepConstraintKinds = DepData | DepAnti | DepOutput;
+/// Kinds that propose merging the edge's endpoints.
+constexpr unsigned DepMergeKinds = DepData | DepLiveIn;
+
 /// A contiguous range of instructions in the MBB, representing a group of
 /// instructions that have been scheduled together.
 struct Cluster {
@@ -50,6 +80,18 @@ struct Cluster {
   iterator_range<MBBIterator> Range;
   /// Registers live at the end of this cluster's allocation.
   LiveSet LiveOut;
+
+  /// A cluster-level dependence edge: every instruction of cluster Succ
+  /// must be scheduled after every instruction of this cluster (clusters
+  /// are atomic). Kinds is a DepKinds bitmask.
+  struct Dep {
+    unsigned Succ;
+    unsigned Kinds;
+  };
+  /// This cluster's dependence successors. Built over the initial singleton
+  /// clusters by computeDepGraph and contracted by commitMerge as clusters
+  /// merge.
+  SmallVector<Dep, 4> Succs;
 
   bool empty() const { return Range.empty(); }
   MBBIterator begin() const { return Range.begin(); }
@@ -89,10 +131,20 @@ private:
   /// Cluster 0 is the livein cluster: an empty cluster whose LiveOut
   /// publishes the block's livein physregs to consumers via merging.
   static constexpr unsigned LiveInClusterIdx = 0;
+  /// The terminator cluster's ID, or ~0u if the block has no terminators.
+  unsigned TermClusterIdx;
   SmallVector<Cluster, 0> Clusters;
+
   /// Maps each instruction to the ID of the cluster that contains it.
   DenseMap<MachineInstr *, unsigned> MICluster;
+
   void initClusters(MachineBasicBlock &MBB);
+  void computeDepGraph(MachineBasicBlock &MBB);
+  void addDep(unsigned Pred, unsigned Succ, unsigned Kinds);
+  void addVRegDeps();
+  void addPhysRegDeps(MachineBasicBlock &MBB);
+  void contractDeps(unsigned DefC, unsigned UseC);
+  bool canMerge(unsigned DefC, unsigned UseC);
 
   /// Effective register sets accumulated across all allocations. Indexed by
   /// virtual register. Persists past V's death because narrowing chains may
@@ -216,6 +268,14 @@ void MOSRegAlloc::validate(MachineBasicBlock &MBB) {
       report_fatal_error("INSERT_SUBREG not yet supported");
     if (MI.getOpcode() == TargetOpcode::EXTRACT_SUBREG)
       report_fatal_error("EXTRACT_SUBREG not yet supported");
+    // These must not reorder with anything, which the dependence graph does
+    // not model. (Terminators are exempt: the terminator span is an atomic
+    // cluster that is always scheduled last, in its input order.)
+    if (MI.isPosition())
+      report_fatal_error("position-like instructions not yet supported");
+    if (!MI.isTerminator() && MI.hasUnmodeledSideEffects())
+      report_fatal_error(
+          "instructions with unmodeled side effects not yet supported");
 
     for (const MachineOperand &MO : MI.operands()) {
       if (MO.isRegMask())
@@ -315,11 +375,13 @@ void MOSRegAlloc::normalizeTiedRegs(MachineBasicBlock &MBB) {
   }
 }
 
-/// Create one singleton cluster per instruction and allocate it. Cluster 0
+/// Create one singleton cluster per instruction, allocate it, and connect
+/// the clusters with their dependence edges (computeDepGraph). Cluster 0
 /// (LiveInClusterIdx) is an empty cluster whose LiveOut publishes the
 /// block's livein physregs; consumers of liveins are merged into it later
 /// by schedule, exactly like any other physreg def/use.
 void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
+  TermClusterIdx = ~0u;
   Clusters.clear();
   MICluster.clear();
   EffectiveRC.clear();
@@ -328,33 +390,217 @@ void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
   Interferences.resize(MRI->getNumVirtRegs());
   TiedRoot.clear();
 
-  Cluster LiveIns(make_range(MBB.begin(), MBB.begin()));
+  Clusters.emplace_back(make_range(MBB.begin(), MBB.begin()));
+  Cluster &LiveIns = Clusters.back();
   for (const auto &LI : MBB.liveins())
     LiveIns.LiveOut.insert(LI.PhysReg);
-  Clusters.push_back(std::move(LiveIns));
 
   auto FirstTerm = MBB.getFirstTerminator();
   for (auto It = MBB.begin(); It != FirstTerm; ++It) {
     MachineInstr &MI = *It;
-    MICluster[&MI] = Clusters.size();
-    Cluster C(make_range(MI.getIterator(), std::next(MI.getIterator())));
+    Clusters.emplace_back(
+        make_range(MI.getIterator(), std::next(MI.getIterator())));
+    Cluster &C = Clusters.back();
+    MICluster[&MI] = &C - Clusters.begin();
     allocate(C.Range, C.LiveOut);
     if (Cost != 0)
       report_fatal_error("single-instruction cluster is not colorable");
-    Clusters.push_back(std::move(C));
   }
 
   // Terminator span: one atomic cluster, never split. Its contiguity is
   // load-bearing — nothing may be inserted between its MIs.
   if (FirstTerm != MBB.end()) {
-    Cluster Term(make_range(FirstTerm, MBB.end()));
+    TermClusterIdx = Clusters.size();
+    Clusters.emplace_back(make_range(FirstTerm, MBB.end()));
+    Cluster &Term = Clusters.back();
     for (MachineInstr &MI : Term)
-      MICluster[&MI] = Clusters.size();
+      MICluster[&MI] = &Term - Clusters.begin();
     allocate(Term.Range, Term.LiveOut);
     if (Cost != 0)
       report_fatal_error("terminator cluster is not colorable");
-    Clusters.push_back(std::move(Term));
   }
+
+  computeDepGraph(MBB);
+}
+
+/// Build the initial dependence graph: the ordering facts the input order
+/// imposes, which any final schedule must respect. Cluster merging preserves
+/// these WRT the original instructions.
+///
+///   - Vreg Data edges: def -> each non-undef use
+///   - Physreg Data edges: reaching def -> use, per regunit. This binds each
+///     physreg use to the one def (or livein) whose value it reads — the
+///     binding is never recomputed, so no later layout can rebind it.
+///   - Physreg Anti edges: each use since the last aliasing def -> that next
+///     def (the use must read before the new value clobbers).
+///   - Physreg Output edges: aliasing def -> next def. Dead defs included;
+///     their writes still clobber.
+///
+/// Block liveins contribute DepLiveIn edges from the livein cluster to
+/// their readers. These drive merges but do not constrain order (see DepKinds).
+///
+/// Edges are recorded at cluster level (Cluster::Succs) over the initial
+/// singleton clusters. All dependencies point forward in input order, so
+/// the graph starts as a DAG; canMerge keeps its constraint edges acyclic
+/// as commitMerge contracts merged clusters.
+///
+/// TODO: Memory dependencies are not modeled — the scheduler can reorder
+/// aliasing loads and stores. They belong here as Order edges (store->load,
+/// load->store, store->store), but with no MMOs on MOS memory ops,
+/// MachineInstr::mayAlias is conservatively true and the edges would
+/// serialize all memory traffic. Needs alias precision (MMOs from ISel or a
+/// target-specific absolute-address disambiguator) first.
+///
+/// TODO: Anti and Output edges have no positive test yet. Register-keyed
+/// liveness treats a multiply-written physreg as one value spanning first
+/// def to last use, so every shape whose ordering they would constrain is
+/// uncolorable today (the gathering merge costs 1 and commitMerge reports
+/// "merge requires a copy"). Once copy insertion makes such shapes
+/// colorable, add MIR tests pinning use-before-next-write and
+/// def-before-next-def order.
+void MOSRegAlloc::computeDepGraph(MachineBasicBlock &MBB) {
+  addVRegDeps();
+  addPhysRegDeps(MBB);
+}
+
+/// Record the cluster-level dependence edge Pred -> Succ, unioning Kinds
+/// into the existing edge if there is one (each successor list stays
+/// duplicate-free). Self-edges are dropped: order within a cluster is
+/// already fixed, so an edge from a cluster to itself records nothing.
+/// They come up in a few cases, e.g. dependencies between terminators.
+void MOSRegAlloc::addDep(unsigned Pred, unsigned Succ, unsigned Kinds) {
+  if (Pred == Succ)
+    return;
+  for (Cluster::Dep &E : Clusters[Pred].Succs) {
+    if (E.Succ == Succ) {
+      E.Kinds |= Kinds;
+      return;
+    }
+  }
+  Clusters[Pred].Succs.push_back({Succ, Kinds});
+}
+
+/// Add each vreg's Data edges: def -> each non-undef use. SSA's single def
+/// means vregs have no Anti or Output edges.
+void MOSRegAlloc::addVRegDeps() {
+  for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
+    Register R = Register::index2VirtReg(I);
+    if (MRI->reg_nodbg_empty(R))
+      continue;
+    unsigned DefC = MICluster[MRI->getVRegDef(R)];
+    for (MachineOperand &MO : MRI->use_nodbg_operands(R))
+      if (!MO.isUndef())
+        addDep(DefC, MICluster[MO.getParent()], DepData);
+  }
+}
+
+/// Add the physreg Data, Anti, and Output edges by walking instructions
+/// forward. Uses of liveins get DepLiveIn edges from the livein cluster.
+void MOSRegAlloc::addPhysRegDeps(MachineBasicBlock &MBB) {
+  struct UnitState {
+    MachineInstr *LastDef = nullptr;
+    SmallVector<MachineInstr *, 4> UsesSinceLastDef;
+  };
+  SmallVector<UnitState, 0> Units(TRI->getNumRegUnits());
+
+  for (MachineInstr &MI : MBB) {
+    unsigned C = MICluster[&MI];
+    for (const MachineOperand &MO : MI.all_uses()) {
+      Register R = MO.getReg();
+      if (!R.isPhysical() || MO.isUndef())
+        continue;
+      for (MCRegUnit Unit : TRI->regunits(R.asMCReg())) {
+        UnitState &S = Units[static_cast<unsigned>(Unit)];
+        if (S.LastDef)
+          addDep(MICluster[S.LastDef], C, DepData);
+        else
+          addDep(LiveInClusterIdx, C, DepLiveIn);
+        S.UsesSinceLastDef.push_back(&MI);
+      }
+    }
+    for (const MachineOperand &MO : MI.all_defs()) {
+      Register R = MO.getReg();
+      if (!R.isPhysical())
+        continue;
+      for (MCRegUnit Unit : TRI->regunits(R.asMCReg())) {
+        UnitState &S = Units[static_cast<unsigned>(Unit)];
+        for (MachineInstr *UseMI : S.UsesSinceLastDef)
+          addDep(MICluster[UseMI], C, DepAnti);
+        if (S.LastDef)
+          addDep(MICluster[S.LastDef], C, DepOutput);
+        S.LastDef = &MI;
+        S.UsesSinceLastDef.clear();
+      }
+    }
+  }
+}
+
+/// Contract UseC into DefC in the cluster dependence graph, mirroring their
+/// merge. Edges between the pair become internal: Def->Use is satisfied by
+/// the append order, and Use->Def cannot exist (canMerge). UseC's external
+/// successors transfer to DefC, and every other cluster's edge to UseC is
+/// remapped to DefC, unioning kinds with any existing edge.
+void MOSRegAlloc::contractDeps(unsigned DefC, unsigned UseC) {
+  llvm::erase_if(Clusters[DefC].Succs,
+                 [&](const Cluster::Dep &E) { return E.Succ == UseC; });
+  for (const Cluster::Dep &E : Clusters[UseC].Succs)
+    addDep(DefC, E.Succ, E.Kinds);
+  Clusters[UseC].Succs.clear();
+  for (unsigned C = 0, End = Clusters.size(); C != End; ++C) {
+    if (C == DefC || C == UseC)
+      continue;
+    auto &Succs = Clusters[C].Succs;
+    auto *It = llvm::find_if(
+        Succs, [&](const Cluster::Dep &E) { return E.Succ == UseC; });
+    if (It == Succs.end())
+      continue;
+    addDep(C, DefC, It->Kinds);
+    Succs.erase(It);
+  }
+
+  LLVM_DEBUG({
+    dbgs() << "    Dep succs of " << DefC << ":";
+    for (const Cluster::Dep &E : Clusters[DefC].Succs) {
+      dbgs() << ' ' << E.Succ << '(';
+      if (E.Kinds & DepData)
+        dbgs() << 'd';
+      if (E.Kinds & DepAnti)
+        dbgs() << 'a';
+      if (E.Kinds & DepOutput)
+        dbgs() << 'o';
+      if (E.Kinds & DepLiveIn)
+        dbgs() << 'l';
+      dbgs() << ')';
+    }
+    dbgs() << '\n';
+  });
+}
+
+/// Would appending UseC to DefC violate an ordering barrier? The merge
+/// permanently commits "all of DefC, then all of UseC, adjacent" — in
+/// dependence-graph terms it contracts the two clusters into one node M. For
+/// this to create a cycle, there would need to be a path from M to some other
+/// part of the graph back to M. There cannot be any paths from UseC to DefC, so
+/// there must be a path from DefC to some other part of the graph to UseC. The
+/// merge is thus legal iff all paths from DefC to UseC are direct.
+bool MOSRegAlloc::canMerge(unsigned DefC, unsigned UseC) {
+  SmallDenseSet<unsigned, 16> Visited;
+  SmallVector<unsigned, 16> Worklist;
+  for (const Cluster::Dep &E : Clusters[DefC].Succs)
+    if ((E.Kinds & DepConstraintKinds) && E.Succ != UseC &&
+        Visited.insert(E.Succ).second)
+      Worklist.push_back(E.Succ);
+  while (!Worklist.empty()) {
+    for (const Cluster::Dep &E : Clusters[Worklist.pop_back_val()].Succs) {
+      if (!(E.Kinds & DepConstraintKinds))
+        continue;
+      if (E.Succ == UseC)
+        return false;
+      if (Visited.insert(E.Succ).second)
+        Worklist.push_back(E.Succ);
+    }
+  }
+  return true;
 }
 
 /// Allocate register space for instructions in the given range. For each new
@@ -392,7 +638,7 @@ void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
       Register R = MO.getReg();
       if (MO.isTied()) {
         if (R.isPhysical())
-          continue;  // Slot is just "physreg stays live through MI."
+          continue; // Slot is just "physreg stays live through MI."
         unsigned UseIdx = MI.findTiedOperandIdx(MO.getOperandNo());
         const MachineOperand &UseMO = MI.getOperand(UseIdx);
         if (!UseMO.getReg().isVirtual())
@@ -495,8 +741,9 @@ void MOSRegAlloc::narrowToFit(Register Def, const BitVector &DefEff,
         for (Register V : Live) {
           dbgs() << printReg(V, TRI);
           if (V.isVirtual())
-            dbgs() << "(eff=" << EffectiveRC[V].count() << ",iSlk="
-                   << getSlack(EffectiveRC[V], Interferences[V]) << ")";
+            dbgs() << "(eff=" << EffectiveRC[V].count()
+                   << ",iSlk=" << getSlack(EffectiveRC[V], Interferences[V])
+                   << ")";
           dbgs() << " ";
         }
         dbgs() << "\n";
@@ -516,11 +763,11 @@ void MOSRegAlloc::narrowToFit(Register Def, const BitVector &DefEff,
     // next time its slack is queried.
     EffectiveRC[NarrowReg] = std::move(NarrowEffRC);
 
-    LLVM_DEBUG(dbgs() << "    Narrow " << printReg(NarrowReg, TRI) << " to "
-                      << EffectiveRC[NarrowReg].count() << " regs (slack "
-                      << getSlack(EffectiveRC[NarrowReg],
-                                  Interferences[NarrowReg])
-                      << ")\n");
+    LLVM_DEBUG(
+        dbgs() << "    Narrow " << printReg(NarrowReg, TRI) << " to "
+               << EffectiveRC[NarrowReg].count() << " regs (slack "
+               << getSlack(EffectiveRC[NarrowReg], Interferences[NarrowReg])
+               << ")\n");
   }
 }
 
@@ -575,81 +822,44 @@ void MOSRegAlloc::schedule(MachineBasicBlock &MBB) {
 }
 
 /// Cost-aware merge selection. Each iteration enumerates every candidate
-/// merge — physreg edges (a physreg defined in one cluster, used in another)
-/// and vreg edges (a vreg's def cluster paired with each of its use clusters)
-/// — dry-running each via tryMerge, which scores it by the number of defs that
-/// would need a copy to be colorable and keeps the cheapest in BestMerge. We
-/// then commit that winner and rescan, since a commit can shift other
-/// candidates' costs through narrowing cascades. We stop only when no
-/// cross-cluster edge remains (BestMerge.Cost == ~0u); whatever is left is
-/// independent components that linearizeClusters folds in layout order.
+/// merge — the graph's merge-driving edges (DepMergeKinds): Data edges,
+/// physreg and vreg alike, plus the livein cluster's DepLiveIn edges —
+/// dry-running each legal one via tryMerge, which scores it by the
+/// number of defs that would need a copy to be colorable and keeps the
+/// cheapest in BestMerge. We then commit that winner and rescan, since a
+/// commit can shift other candidates' costs through narrowing cascades and
+/// can turn ordering-illegal candidates legal (canMerge) once an intervening
+/// cluster merges into one side. We stop when no committable edge remains
+/// (BestMerge.Cost == ~0u); whatever is left, linearizeClusters folds in
+/// dependence-respecting topological order.
 ///
 /// Copy insertion is not implemented yet, so commitMerge requires the winner
 /// to be colorable as-is (Cost 0). Merges with higher cost become committable
 /// once we can insert the copies they need.
-///
-/// TODO: Physreg def-use bindings are fixed by the input order: a use must
-/// stay after its reaching def and before the next write of any aliasing
-/// register. Nothing models those barriers — merges commit in cost order, and
-/// allocate validates only defs — so a committed merge along an unrelated
-/// vreg edge can relocate a physreg use ahead of its def. The next round's
-/// owner walk usually trips the "no prior def or livein" assert, but if an
-/// earlier def of the same register exists (a livein, say), the use silently
-/// rebinds to that stale value instead. These barriers need explicit
-/// modeling.
 void MOSRegAlloc::scheduleClusters(MachineBasicBlock &MBB) {
   while (true) {
     BestMerge.reset();
 
-    // Physreg edges. Walk MBB in current layout order, tracking which cluster
-    // currently "owns" each live physreg: liveins start owned by the livein
-    // cluster, physreg defs transfer ownership to the defining instruction's
-    // cluster, and each physreg use is a candidate merge of the using
-    // instruction's cluster into its owner. tryMerge reverts every trial, so a
-    // plain walk (not make_early_inc_range) observes a stable layout.
-    DenseMap<MCPhysReg, unsigned> PhysRegOwner;
-    for (const auto &LI : MBB.liveins())
-      PhysRegOwner[LI.PhysReg] = LiveInClusterIdx;
-    for (MachineInstr &MI : MBB) {
-      // Terminators live in the terminator cluster — an atomic cluster
-      // anchored at MBB.end(). Driving a merge from a terminator's physreg
-      // use would splice the terminator cluster mid-block; linearizeClusters
-      // folds it in last instead.
-      if (MI.isTerminator())
-        continue;
-      for (const MachineOperand &MO : MI.all_uses()) {
-        if (!MO.getReg().isPhysical())
+    for (unsigned C = 0, End = Clusters.size(); C != End; ++C) {
+      for (const Cluster::Dep &E : Clusters[C].Succs) {
+        if (!(E.Kinds & DepMergeKinds))
           continue;
-        auto It = PhysRegOwner.find(MO.getReg().asMCReg());
-        assert(It != PhysRegOwner.end() &&
-               "physreg use has no prior def or livein");
-        if (It->second != MICluster[&MI])
-          tryMerge(It->second, MICluster[&MI]);
-      }
-      for (const MachineOperand &MO : MI.all_defs())
-        if (MO.getReg().isPhysical())
-          PhysRegOwner[MO.getReg().asMCReg()] = MICluster[&MI];
-    }
-
-    // Vreg edges. For each vreg, pair its def's cluster with each use's.
-    for (unsigned I = 0, E = MRI->getNumVirtRegs(); I != E; ++I) {
-      Register R = Register::index2VirtReg(I);
-      if (MRI->reg_nodbg_empty(R))
-        continue;
-      unsigned DefC = MICluster[MRI->getVRegDef(R)];
-      for (MachineOperand &MO : MRI->use_nodbg_operands(R)) {
-        if (MO.isUndef())
+        // The terminator cluster is atomic and anchored at MBB.end(); merging
+        // it as a use side would splice it mid-block. linearizeClusters folds
+        // it in last instead.
+        if (E.Succ == TermClusterIdx)
           continue;
-        MachineInstr &UseMI = *MO.getParent();
-        // Terminator vreg uses don't drive merges — see above.
-        if (UseMI.isTerminator())
+        if (!canMerge(C, E.Succ)) {
+          LLVM_DEBUG(dbgs() << "  Skip merge " << E.Succ << " into " << C
+                            << ": ordering barrier\n");
           continue;
-        if (DefC != MICluster[&UseMI])
-          tryMerge(DefC, MICluster[&UseMI]);
+        }
+        tryMerge(C, E.Succ);
       }
     }
 
-    // No candidate edge remains: every def-use-connected cluster is merged.
+    // No committable edge remains: every def-use-connected cluster that can
+    // legally merge has merged.
     if (BestMerge.Cost == ~0u)
       break;
     LLVM_DEBUG(dbgs() << "  Commit merge " << BestMerge.UseC << " into "
@@ -659,35 +869,59 @@ void MOSRegAlloc::scheduleClusters(MachineBasicBlock &MBB) {
   }
 }
 
-/// Final linearization. Anything left disconnected after physreg / vreg
-/// scheduling — independent def-use components, plus an empty K_livein —
-/// gets merged adjacently in MBB order. Walk MBB; whenever MICluster
-/// changes, merge the new cluster into the running current cluster. Each
-/// merge hits mergeClusters' else-branch (UseBegin == Def.end()) since the
-/// walk is in current layout order, so no splice happens — only Range and
-/// LiveOut bookkeeping.
+/// Final linearization. Whatever scheduleClusters leaves — independent
+/// def-use components and pairs whose merges stayed ordering-illegal — gets
+/// folded into one cluster here. Nodes are merged in topological order; ties go
+/// to the earliest current layout position: when layout is already consistent
+/// (the common case) this reproduces it, and it keeps the terminator cluster —
+/// which has only incoming edges and sits at layout end — last.
+///
+/// Consecutive clusters of a topological order are always legal to fold: any
+/// cluster constrained to sit between them would appear between them in
+/// every topological order.
 void MOSRegAlloc::linearizeClusters(MachineBasicBlock &MBB) {
   if (MBB.empty())
     return;
-  unsigned CurC = MICluster[&MBB.front()];
-  for (MachineInstr &MI : MBB) {
-    unsigned C = MICluster[&MI];
-    if (C == CurC)
-      continue;
-    LLVM_DEBUG(dbgs() << "  Linearize: merge cluster " << C << " into "
-                      << CurC << "\n");
-    mergeClusters(MBB, CurC, C);
+
+  bool MergedAny = true;
+  while (MergedAny) {
+    MergedAny = false;
+    // Merge into the live in block the first cluster that has no predecessors
+    // except the livein block.
+    for (MachineBasicBlock::iterator I = MBB.begin(), E = MBB.end(); I != E;
+         I = Clusters[MICluster[&*I]].end()) {
+      unsigned C = MICluster[&*I];
+      if (C == LiveInClusterIdx)
+        continue;
+
+      bool HasPred = false;
+      for (unsigned OtherC = LiveInClusterIdx + 1, OtherE = Clusters.size();
+           !HasPred && OtherC != OtherE; ++OtherC) {
+        if (llvm::any_of(Clusters[OtherC].Succs, [&](Cluster::Dep &E) {
+              return (E.Kinds & DepConstraintKinds) && E.Succ == C;
+            }))
+          HasPred = true;
+      }
+      if (HasPred)
+        continue;
+
+      LLVM_DEBUG(dbgs() << "  Linearize: merge cluster " << C << " into "
+                        << LiveInClusterIdx << "\n");
+      mergeClusters(MBB, LiveInClusterIdx, C);
+      MergedAny = true;
+    }
   }
 }
 
 /// Unconditionally merge cluster UseC into cluster DefC: dry-run it with
 /// tryMerge to capture its effects, then commitMerge them. Used by
-/// linearizeClusters, which folds the remaining independent components in
-/// layout order and so always wants to take the one merge it names (rather
-/// than picking the cheapest among competing candidates, as scheduleClusters
-/// does by calling tryMerge / commitMerge directly).
+/// linearizeClusters, which folds the remaining clusters in topological
+/// order and so always wants to take the one merge it names (rather than
+/// picking the cheapest among competing candidates, as scheduleClusters does
+/// by calling tryMerge / commitMerge directly).
 void MOSRegAlloc::mergeClusters(MachineBasicBlock &MBB, unsigned DefC,
                                 unsigned UseC) {
+  assert(canMerge(DefC, UseC) && "merge violates an ordering barrier");
   BestMerge.reset();
   tryMerge(DefC, UseC);
   commitMerge(MBB, std::move(BestMerge));
@@ -786,9 +1020,14 @@ void MOSRegAlloc::commitMerge(MachineBasicBlock &MBB, PendingMerge PM) {
   // dry-run allocation assumed, and fix up the affected cluster ranges.
   auto UseBegin = Use.begin();
   if (UseBegin != Def.end()) {
-    // Fix the predecessor cluster whose end sentinel is Use.begin().
-    unsigned PredC = MICluster[&*std::prev(UseBegin)];
-    Clusters[PredC].Range = make_range(Clusters[PredC].begin(), Use.end());
+    // Fix the predecessor cluster whose end sentinel is Use.begin(). At
+    // MBB.begin() there is no predecessor: only empty clusters can be
+    // anchored there, and an empty (it, it) range stays empty wherever its
+    // node moves.
+    if (UseBegin != MBB.begin()) {
+      unsigned PredC = MICluster[&*std::prev(UseBegin)];
+      Clusters[PredC].Range = make_range(Clusters[PredC].begin(), Use.end());
+    }
     MBB.splice(Def.end(), &MBB, UseBegin, Use.end());
     // For non-empty Def, the splice naturally extends Def.Range: Def.end()
     // is a stable iterator and the list path from Def.begin() to Def.end()
@@ -801,9 +1040,22 @@ void MOSRegAlloc::commitMerge(MachineBasicBlock &MBB, PendingMerge PM) {
   } else {
     Def.Range = make_range(Def.begin(), Use.end());
   }
+  // TODO: When UseC is the livein cluster, this clear drops the liveins
+  // from the liveness model: the trial allocated Use.Range against Def's
+  // live set alone, and liveins have no defining instruction in the range
+  // to re-add them. Values allocated afterwards can thus miss their livein
+  // interference. The model only ever errs optimistic here —
+  // assignRegisters' regunit tracking turns any resulting miscoloring into
+  // "no free register in effective set" rather than a silent clobber — but
+  // colorable inputs can be spuriously rejected. The trial should instead
+  // allocate against the union of Def's live set and Use's surviving
+  // liveins.
   Use.Range = make_range(Use.end(), Use.end());
   Use.LiveOut.clear();
   Def.LiveOut = std::move(PM.LiveOutAfter);
+
+  // Mirror the merge in the cluster dependence graph.
+  contractDeps(DefC, UseC);
 }
 
 /// Set kill flags for new instructions added to a cluster. A use of V is a
@@ -874,11 +1126,10 @@ void MOSRegAlloc::assignRegisters(MachineBasicBlock &MBB) {
       } else {
         const BitVector &Eff = EffectiveRC[Reg];
         for (unsigned PhysReg : Eff.set_bits()) {
-          bool Free = llvm::none_of(TRI->regunits(MCPhysReg(PhysReg)),
-                                    [&](MCRegUnit U) {
-                                      return LiveUnits.test(
-                                          static_cast<unsigned>(U));
-                                    });
+          bool Free = llvm::none_of(
+              TRI->regunits(MCPhysReg(PhysReg)), [&](MCRegUnit U) {
+                return LiveUnits.test(static_cast<unsigned>(U));
+              });
           if (Free) {
             Assigned = MCPhysReg(PhysReg);
             break;
