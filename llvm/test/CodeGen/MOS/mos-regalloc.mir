@@ -370,3 +370,53 @@ body: |
     %2:ac = COPY killed %1
     STAbs killed %2, 3000
 ...
+
+# Ordering barrier: the dependence-graph triangle %0's def -> COPY -> store,
+# with the store also using %0 directly. Merging the store's cluster straight
+# into %0's def cluster would trap the COPY between the two halves of an
+# atomic cluster (it must read %0 after its def and produce %1 before the
+# store), so canMerge rejects that direction until the COPY's cluster has
+# merged in. A cost-only scheduler without the legality gate could commit the
+# store-into-def merge first (it is also cost 0), splicing the store's use of
+# %1 ahead of %1's def.
+---
+name: vreg_data_triangle
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: ac }
+  - { id: 1, class: xc }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: vreg_data_triangle
+    ; CHECK: $a = LDImm 1
+    ; CHECK-NEXT: $x = COPY $a
+    ; CHECK-NEXT: STAbsIdx killed $a, 200, killed $x
+    %0:ac = LDImm 1
+    %1:xc = COPY %0
+    STAbsIdx killed %0, 200, killed %1
+...
+
+# The livein-consumer cluster (cluster 0) ends up merged INTO the LDImm's
+# cluster as the use side: the store needs both the livein-derived %0 and the
+# later-defined %1, so cluster 0's instructions are spliced from the front of
+# the block to follow the LDImm. Exercises commitMerge's splice when the use
+# cluster starts at MBB.begin() (no predecessor cluster to fix up).
+---
+name: livein_cluster_spliced
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: ac }
+  - { id: 1, class: xc }
+liveins:
+  - { reg: '$a' }
+body: |
+  bb.0:
+    liveins: $a
+    ; CHECK-LABEL: name: livein_cluster_spliced
+    ; CHECK: $x = LDImm 3
+    ; CHECK-NEXT: $a = COPY killed $a
+    ; CHECK-NEXT: STAbsIdx killed $a, 100, killed $x
+    %0:ac = COPY $a
+    %1:xc = LDImm 3
+    STAbsIdx killed %0, 100, killed %1
+...
