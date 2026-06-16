@@ -52,25 +52,20 @@ using LiveSet = SmallSet<Register, 8>;
 /// Dependence kinds, mirroring SDep's vocabulary; an Order kind is reserved
 /// for future memory/barrier edges. Stored as bits: a cluster-level edge
 /// carries the union of the kinds of all instruction dependencies it stands
-/// for. Kinds encode two independent properties, and consumers filter by
-/// the masks below: whether the edge constrains the final order, and
-/// whether it proposes merging its endpoints (gathering a value's def and
-/// uses into one cluster is the allocator's goal).
+/// for. Kinds encode two independent properties, and consumers filter by the
+/// masks below: whether the edge constrains the final order, and whether it
+/// proposes merging its endpoints (gathering a value's def and uses into one
+/// cluster is the allocator's goal). Data does both; Anti and Output only
+/// constrain.
 enum DepKinds : unsigned {
   DepData = 1 << 0,   ///< Regular data dependence (aka true-dependence).
   DepAnti = 1 << 1,   ///< A register anti-dependence (aka WAR).
   DepOutput = 1 << 2, ///< A register output-dependence (aka WAW).
-  /// A read of a block livein value, hung off the livein cluster. Drives
-  /// merging — that is how livein liveness reaches the reader's allocation
-  /// — but constrains nothing: block entry precedes every instruction, and
-  /// reads of the same livein commute. The ordering content of a livein is
-  /// carried by its readers' Anti edges to the next aliasing def.
-  DepLiveIn = 1 << 3,
 };
 /// Kinds that constrain the final instruction order.
 constexpr unsigned DepConstraintKinds = DepData | DepAnti | DepOutput;
 /// Kinds that propose merging the edge's endpoints.
-constexpr unsigned DepMergeKinds = DepData | DepLiveIn;
+constexpr unsigned DepMergeKinds = DepData;
 
 /// A contiguous range of instructions in the MBB, representing a group of
 /// instructions that have been scheduled together.
@@ -128,8 +123,11 @@ private:
   void validate(MachineBasicBlock &MBB);
 
   /// All clusters; indexed by cluster ID. Emptied clusters have empty Range.
-  /// Cluster 0 is the livein cluster: an empty cluster whose LiveOut
-  /// publishes the block's livein physregs to consumers via merging.
+  /// Cluster 0 is the livein cluster: a source cluster, pinned at the block
+  /// front, whose LiveOut publishes the block's livein physregs. It has no
+  /// dependence edges, so the greedy mergeClusters never touches it;
+  /// linearizeClusters then folds every other cluster into it, allocating
+  /// each against its (livein-carrying) LiveOut.
   static constexpr unsigned LiveInClusterIdx = 0;
   /// The terminator cluster's ID, or ~0u if the block has no terminators.
   unsigned TermClusterIdx;
@@ -220,13 +218,12 @@ private:
 
     void reset() { *this = PendingMerge(); }
   };
-  /// The cheapest merge trial seen in the current scheduleClusters scan.
+  /// The cheapest merge trial seen in the current merge scan.
   PendingMerge BestMerge;
 
   void schedule(MachineBasicBlock &MBB);
-  void scheduleClusters(MachineBasicBlock &MBB);
+  void mergeClusters(MachineBasicBlock &MBB);
   void linearizeClusters(MachineBasicBlock &MBB);
-  void mergeClusters(MachineBasicBlock &MBB, unsigned DefC, unsigned UseC);
   void tryMerge(unsigned DefC, unsigned UseC);
   void commitMerge(MachineBasicBlock &MBB, PendingMerge PM);
   void setKillFlags(iterator_range<MBBIterator> MIs, unsigned ClusterIdx,
@@ -378,8 +375,8 @@ void MOSRegAlloc::normalizeTiedRegs(MachineBasicBlock &MBB) {
 /// Create one singleton cluster per instruction, allocate it, and connect
 /// the clusters with their dependence edges (computeDepGraph). Cluster 0
 /// (LiveInClusterIdx) is an empty cluster whose LiveOut publishes the
-/// block's livein physregs; consumers of liveins are merged into it later
-/// by schedule, exactly like any other physreg def/use.
+/// block's livein physregs; linearizeClusters later folds every other cluster
+/// into it, so liveins reach each allocation through its LiveOut.
 void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
   TermClusterIdx = ~0u;
   Clusters.clear();
@@ -436,8 +433,10 @@ void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
 ///   - Physreg Output edges: aliasing def -> next def. Dead defs included;
 ///     their writes still clobber.
 ///
-/// Block liveins contribute DepLiveIn edges from the livein cluster to
-/// their readers. These drive merges but do not constrain order (see DepKinds).
+/// A physreg use with no reaching def reads a block livein; it gets no edge at
+/// all (the livein cluster has no defining instruction to depend on). Livein
+/// liveness reaches such a use in linearizeClusters, which folds its cluster
+/// into the livein cluster and allocates it against that cluster's LiveOut.
 ///
 /// Edges are recorded at cluster level (Cluster::Succs) over the initial
 /// singleton clusters. All dependencies point forward in input order, so
@@ -495,7 +494,9 @@ void MOSRegAlloc::addVRegDeps() {
 }
 
 /// Add the physreg Data, Anti, and Output edges by walking instructions
-/// forward. Uses of liveins get DepLiveIn edges from the livein cluster.
+/// forward. A use with no reaching def reads a block livein; it gets no Data
+/// edge (liveins have no defining cluster), but is still tracked so a later
+/// aliasing def picks up its Anti edge.
 void MOSRegAlloc::addPhysRegDeps(MachineBasicBlock &MBB) {
   struct UnitState {
     MachineInstr *LastDef = nullptr;
@@ -513,8 +514,6 @@ void MOSRegAlloc::addPhysRegDeps(MachineBasicBlock &MBB) {
         UnitState &S = Units[static_cast<unsigned>(Unit)];
         if (S.LastDef)
           addDep(MICluster[S.LastDef], C, DepData);
-        else
-          addDep(LiveInClusterIdx, C, DepLiveIn);
         S.UsesSinceLastDef.push_back(&MI);
       }
     }
@@ -568,8 +567,6 @@ void MOSRegAlloc::contractDeps(unsigned DefC, unsigned UseC) {
         dbgs() << 'a';
       if (E.Kinds & DepOutput)
         dbgs() << 'o';
-      if (E.Kinds & DepLiveIn)
-        dbgs() << 'l';
       dbgs() << ')';
     }
     dbgs() << '\n';
@@ -805,8 +802,13 @@ BitVector MOSRegAlloc::aliasSet(const BitVector &Regs) {
   return Result;
 }
 
+/// Reduce the block to a single cluster — its final schedule — in two
+/// cost-driven passes over the same merge machinery. mergeClusters greedily
+/// gathers values along data edges; linearizeClusters then folds whatever
+/// remains into the livein cluster. Both pick the cheapest legal merge each
+/// step; they differ only in which candidates they propose.
 void MOSRegAlloc::schedule(MachineBasicBlock &MBB) {
-  scheduleClusters(MBB);
+  mergeClusters(MBB);
   linearizeClusters(MBB);
 
   assert(llvm::count_if(Clusters,
@@ -821,22 +823,21 @@ void MOSRegAlloc::schedule(MachineBasicBlock &MBB) {
   });
 }
 
-/// Cost-aware merge selection. Each iteration enumerates every candidate
-/// merge — the graph's merge-driving edges (DepMergeKinds): Data edges,
-/// physreg and vreg alike, plus the livein cluster's DepLiveIn edges —
-/// dry-running each legal one via tryMerge, which scores it by the
-/// number of defs that would need a copy to be colorable and keeps the
-/// cheapest in BestMerge. We then commit that winner and rescan, since a
-/// commit can shift other candidates' costs through narrowing cascades and
-/// can turn ordering-illegal candidates legal (canMerge) once an intervening
-/// cluster merges into one side. We stop when no committable edge remains
-/// (BestMerge.Cost == ~0u); whatever is left, linearizeClusters folds in
-/// dependence-respecting topological order.
+/// Greedy cost-aware gathering. Each iteration enumerates every candidate
+/// merge — the graph's merge-driving edges (DepMergeKinds, i.e. Data edges,
+/// physreg and vreg alike) — dry-running each legal one via tryMerge, which
+/// scores it by the number of defs that would need a copy to be colorable and
+/// keeps the cheapest in BestMerge. We then commit that winner and rescan,
+/// since a commit can shift other candidates' costs through narrowing cascades
+/// and can turn ordering-illegal candidates legal (canMerge) once an
+/// intervening cluster merges into one side. We stop when no committable edge
+/// remains (BestMerge.Cost == ~0u); whatever is left, linearizeClusters folds
+/// into the livein cluster, by the same cost criterion.
 ///
 /// Copy insertion is not implemented yet, so commitMerge requires the winner
 /// to be colorable as-is (Cost 0). Merges with higher cost become committable
 /// once we can insert the copies they need.
-void MOSRegAlloc::scheduleClusters(MachineBasicBlock &MBB) {
+void MOSRegAlloc::mergeClusters(MachineBasicBlock &MBB) {
   while (true) {
     BestMerge.reset();
 
@@ -869,62 +870,67 @@ void MOSRegAlloc::scheduleClusters(MachineBasicBlock &MBB) {
   }
 }
 
-/// Final linearization. Whatever scheduleClusters leaves — independent
-/// def-use components and pairs whose merges stayed ordering-illegal — gets
-/// folded into one cluster here. Nodes are merged in topological order; ties go
-/// to the earliest current layout position: when layout is already consistent
-/// (the common case) this reproduces it, and it keeps the terminator cluster —
-/// which has only incoming edges and sits at layout end — last.
+/// Final linearization. Whatever mergeClusters leaves — independent def-use
+/// components and pairs whose merges stayed ordering-illegal — gets folded
+/// into the livein cluster here, which is the accumulator: appending at its
+/// end grows the schedule from the block's front. Each round, among the
+/// topologically ready clusters (those whose predecessors are all already
+/// folded in), fold the cheapest, so the same cost criterion that drives
+/// mergeClusters governs these merges too; ties break toward the lower cluster
+/// id, which is input order. Folding consecutive clusters of a topological
+/// order is always legal: any cluster constrained to sit between them would
+/// appear between them in every topological order.
 ///
-/// Consecutive clusters of a topological order are always legal to fold: any
-/// cluster constrained to sit between them would appear between them in
-/// every topological order.
+/// The terminator is held back until everything else is folded: its
+/// instructions must land at the block's end, and the fold appends at the
+/// accumulator's end, so it has to be the last thing appended.
 void MOSRegAlloc::linearizeClusters(MachineBasicBlock &MBB) {
   if (MBB.empty())
     return;
 
-  bool MergedAny = true;
-  while (MergedAny) {
-    MergedAny = false;
-    // Merge into the live in block the first cluster that has no predecessors
-    // except the livein block.
-    for (MachineBasicBlock::iterator I = MBB.begin(), E = MBB.end(); I != E;
-         I = Clusters[MICluster[&*I]].end()) {
-      unsigned C = MICluster[&*I];
-      if (C == LiveInClusterIdx)
-        continue;
+  // commitMerge keeps the livein cluster pinned at the block front, so it is a
+  // valid fold sink here without any re-anchoring.
+  assert(Clusters[LiveInClusterIdx].empty() &&
+         "livein cluster should be untouched by the greedy phase");
 
+  while (true) {
+    BestMerge.reset();
+    for (unsigned C = LiveInClusterIdx + 1, End = Clusters.size(); C != End;
+         ++C) {
+      if (Clusters[C].empty() || C == TermClusterIdx)
+        continue;
+      // Ready iff no other (non-livein) cluster still constrains C to follow
+      // it. The livein cluster is excluded from the scan: it is the sink C
+      // folds into, so an edge from it is what we are resolving, not a barrier.
       bool HasPred = false;
-      for (unsigned OtherC = LiveInClusterIdx + 1, OtherE = Clusters.size();
-           !HasPred && OtherC != OtherE; ++OtherC) {
-        if (llvm::any_of(Clusters[OtherC].Succs, [&](Cluster::Dep &E) {
-              return (E.Kinds & DepConstraintKinds) && E.Succ == C;
-            }))
-          HasPred = true;
-      }
+      for (unsigned P = LiveInClusterIdx + 1, PE = Clusters.size();
+           !HasPred && P != PE; ++P)
+        HasPred = llvm::any_of(Clusters[P].Succs, [&](const Cluster::Dep &E) {
+          return (E.Kinds & DepConstraintKinds) && E.Succ == C;
+        });
       if (HasPred)
         continue;
-
-      LLVM_DEBUG(dbgs() << "  Linearize: merge cluster " << C << " into "
-                        << LiveInClusterIdx << "\n");
-      mergeClusters(MBB, LiveInClusterIdx, C);
-      MergedAny = true;
+      tryMerge(LiveInClusterIdx, C);
     }
+    if (BestMerge.Cost == ~0u)
+      break;
+    LLVM_DEBUG(dbgs() << "  Linearize: merge cluster " << BestMerge.UseC
+                      << " into " << LiveInClusterIdx << " (cost "
+                      << BestMerge.Cost << ")\n");
+    commitMerge(MBB, std::move(BestMerge));
   }
-}
 
-/// Unconditionally merge cluster UseC into cluster DefC: dry-run it with
-/// tryMerge to capture its effects, then commitMerge them. Used by
-/// linearizeClusters, which folds the remaining clusters in topological
-/// order and so always wants to take the one merge it names (rather than
-/// picking the cheapest among competing candidates, as scheduleClusters does
-/// by calling tryMerge / commitMerge directly).
-void MOSRegAlloc::mergeClusters(MachineBasicBlock &MBB, unsigned DefC,
-                                unsigned UseC) {
-  assert(canMerge(DefC, UseC) && "merge violates an ordering barrier");
-  BestMerge.reset();
-  tryMerge(DefC, UseC);
-  commitMerge(MBB, std::move(BestMerge));
+  // Fold the terminator last, into the now-complete accumulator.
+  if (TermClusterIdx != ~0u && !Clusters[TermClusterIdx].empty()) {
+    assert(canMerge(LiveInClusterIdx, TermClusterIdx) &&
+           "terminator fold violates an ordering barrier");
+    BestMerge.reset();
+    tryMerge(LiveInClusterIdx, TermClusterIdx);
+    LLVM_DEBUG(dbgs() << "  Linearize: merge terminator " << TermClusterIdx
+                      << " into " << LiveInClusterIdx << " (cost "
+                      << BestMerge.Cost << ")\n");
+    commitMerge(MBB, std::move(BestMerge));
+  }
 }
 
 /// Dry-run a merge of cluster UseC into DefC: compute its cost (the number of
@@ -961,6 +967,9 @@ void MOSRegAlloc::tryMerge(unsigned DefC, unsigned UseC) {
   setKillFlags(Use.Range, DefC, &KilledMOs);
 
   // Allocate the use instructions against a copy of Def's running live set.
+  // For the livein cluster as Def this is its LiveOut, which carries the block
+  // liveins; the livein cluster is never the Use side (it has no incoming
+  // edges), so Def.LiveOut is always the complete incoming liveness here.
   LiveSet TmpLive = Def.LiveOut;
   allocate(Use.Range, TmpLive);
 
@@ -1040,22 +1049,26 @@ void MOSRegAlloc::commitMerge(MachineBasicBlock &MBB, PendingMerge PM) {
   } else {
     Def.Range = make_range(Def.begin(), Use.end());
   }
-  // TODO: When UseC is the livein cluster, this clear drops the liveins
-  // from the liveness model: the trial allocated Use.Range against Def's
-  // live set alone, and liveins have no defining instruction in the range
-  // to re-add them. Values allocated afterwards can thus miss their livein
-  // interference. The model only ever errs optimistic here —
-  // assignRegisters' regunit tracking turns any resulting miscoloring into
-  // "no free register in effective set" rather than a silent clobber — but
-  // colorable inputs can be spuriously rejected. The trial should instead
-  // allocate against the union of Def's live set and Use's surviving
-  // liveins.
+  // The livein cluster is never the Use side — it has no incoming edges, so
+  // nothing ever folds it into another cluster — so this clear never discards
+  // the block liveins. They live on as the Def.LiveOut of the livein cluster
+  // until linearizeClusters folds everything into it, allocating each cluster
+  // against those liveins.
   Use.Range = make_range(Use.end(), Use.end());
   Use.LiveOut.clear();
   Def.LiveOut = std::move(PM.LiveOutAfter);
 
   // Mirror the merge in the cluster dependence graph.
   contractDeps(DefC, UseC);
+
+  // Keep the livein cluster pinned at the block front. It holds no instruction
+  // to anchor to, and an ilist has no stable front sentinel (only MBB.end()),
+  // so its iterators would drift if this splice relocated the instruction they
+  // happened to point at. Re-derive them from the current front so the position
+  // linearizeClusters folds into stays correct. (Folding into it makes it
+  // non-empty, leaving its real range untouched.)
+  if (Clusters[LiveInClusterIdx].empty())
+    Clusters[LiveInClusterIdx].Range = make_range(MBB.begin(), MBB.begin());
 }
 
 /// Set kill flags for new instructions added to a cluster. A use of V is a

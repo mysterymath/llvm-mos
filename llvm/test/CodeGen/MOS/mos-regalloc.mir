@@ -64,8 +64,9 @@ body: |
     STAbs killed %1, 5000
 ...
 
-# Livein: $a is live at MBB entry, COPY'd into %0:Ac. K_livein cluster
-# publishes $a; the COPY's cluster merges with K_livein.
+# Livein: $a is live at MBB entry, COPY'd into %0:Ac. The livein cluster
+# publishes $a; linearizeClusters folds the COPY's cluster into it, so the
+# COPY is allocated with $a live and reuses it.
 ---
 name: livein
 tracksRegLiveness: true
@@ -81,10 +82,12 @@ body: |
     STAbs killed %0, 1000
 ...
 
-# Livein, non-first consumer: a non-livein-using instruction comes first;
-# the livein use at I1 triggers the if-branch into an empty K_livein.
-# Without K_livein.Range bookkeeping, K_livein would silently absorb I1
-# but its Range would stay empty.
+# Livein consumer that is not the first instruction, alongside an independent
+# load/store chain. linearizeClusters folds both chains into the livein
+# cluster. Because the independent %0 is colored while the livein $a is still
+# live — its consumer, the COPY, is folded later — %0 must avoid $a: it gets
+# $x, not $a, so the livein survives to its use. This is the livein interference
+# being honored at fold time (the COPY chain need not be forced first).
 ---
 name: livein_non_first
 tracksRegLiveness: true
@@ -97,19 +100,19 @@ body: |
     ; CHECK-LABEL: name: livein_non_first
     ; CHECK: liveins: $a
     ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: $x = LDAbs 1000
+    ; CHECK-NEXT: STAbs killed $x, 2000
     ; CHECK-NEXT: $a = COPY killed $a
     ; CHECK-NEXT: STAbs killed $a, 3000
-    ; CHECK-NEXT: $a = LDAbs 1000
-    ; CHECK-NEXT: STAbs killed $a, 2000
     %0:gpr = LDAbs 1000
     %1:ac = COPY $a
     STAbs killed %0, 2000
     STAbs killed %1, 3000
 ...
 
-# Linearization: two independent load-store pairs share no def-use, so
-# neither schedulePhysRegs nor scheduleVRegs merges them. The final
-# linearize pass walks MBB in order and merges adjacent clusters.
+# Linearization: two independent load-store pairs share no def-use, so the
+# greedy mergeClusters pass leaves them as separate clusters. linearizeClusters
+# then folds both into the livein cluster.
 ---
 name: linearize_disconnected
 tracksRegLiveness: true
@@ -292,7 +295,7 @@ body: |
 ...
 
 # Interleaved: a non-$a-related cluster sits in MBB order between the
-# $a-producing COPY and the RTS. Verifies that schedulePhysRegs did
+# $a-producing COPY and the RTS. Verifies that the greedy merge pass did
 # NOT splice RTS up after the COPY — RTS must stay last.
 ---
 name: terminator_interleaved
@@ -419,4 +422,30 @@ body: |
     %0:ac = COPY $a
     %1:xc = LDImm 3
     STAbsIdx killed %0, 100, killed %1
+...
+
+# Cost-aware linearization: two independent clusters become ready at the same
+# time — %0:ac's load/store and a store of the livein $a. %0 needs $a (its only
+# register), but $a is still live, so folding %0's cluster first is uncolorable
+# (costs a copy). The store kills $a; folding it first frees $a, after which %0
+# colors to it. So linearizeClusters must pick by cost, not layout/id order:
+# the cheaper fold (the store) has to go first. A cost-blind linearize folds %0
+# first and dies with "merge requires a copy" — this test guards against that.
+---
+name: cost_aware_linearize
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: ac }
+body: |
+  bb.0:
+    liveins: $a
+    ; CHECK-LABEL: name: cost_aware_linearize
+    ; CHECK: liveins: $a
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: STAbs killed $a, 1000
+    ; CHECK-NEXT: $a = LDImm 5
+    ; CHECK-NEXT: STAbs killed $a, 2000
+    %0:ac = LDImm 5
+    STAbs killed %0, 2000
+    STAbs killed $a, 1000
 ...
