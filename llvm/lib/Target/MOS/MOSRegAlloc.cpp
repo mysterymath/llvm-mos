@@ -13,8 +13,9 @@
 // cluster remains. The final cluster's schedule is the block's instruction
 // sequence. Physical registers are assigned top-down greedily.
 //
-// A dependence graph fixed by the input order (data, anti, and output edges
-// over registers) constrains the merging: a merge must keep the cluster-level
+// A dependence graph fixed by the input order (data edges over registers;
+// register anti/output edges are intentionally not modeled — see
+// computeDepGraph) constrains the merging: a merge must keep the cluster-level
 // graph acyclic (canMerge), and the final linearization folds clusters in
 // topological order, so every schedule the allocator can produce respects the
 // input's def-use bindings.
@@ -23,6 +24,7 @@
 
 #include "MOSRegAlloc.h"
 
+#include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
@@ -49,21 +51,21 @@ namespace {
 using MBBIterator = MachineBasicBlock::iterator;
 using LiveSet = SmallSet<Register, 8>;
 
-/// Dependence kinds, mirroring SDep's vocabulary; an Order kind is reserved
-/// for future memory/barrier edges. Stored as bits: a cluster-level edge
-/// carries the union of the kinds of all instruction dependencies it stands
-/// for. Kinds encode two independent properties, and consumers filter by the
-/// masks below: whether the edge constrains the final order, and whether it
-/// proposes merging its endpoints (gathering a value's def and uses into one
-/// cluster is the allocator's goal). Data does both; Anti and Output only
-/// constrain.
+/// Dependence kinds, mirroring SDep's vocabulary. Stored as bits: a
+/// cluster-level edge carries the union of the kinds of all instruction
+/// dependencies it stands for. Kinds encode two independent properties, and
+/// consumers filter by the masks below: whether the edge constrains the final
+/// order, and whether it proposes merging its endpoints (gathering a value's
+/// def and uses into one cluster is the allocator's goal). Data does both.
+///
+/// Only Data edges exist today. The two masks below are kept distinct so that
+/// constrain-only edges — register anti/output, or future memory/barrier edges
+/// — can be reintroduced without touching the consumers that filter by them.
 enum DepKinds : unsigned {
-  DepData = 1 << 0,   ///< Regular data dependence (aka true-dependence).
-  DepAnti = 1 << 1,   ///< A register anti-dependence (aka WAR).
-  DepOutput = 1 << 2, ///< A register output-dependence (aka WAW).
+  DepData = 1 << 0, ///< Regular data dependence (aka true-dependence).
 };
 /// Kinds that constrain the final instruction order.
-constexpr unsigned DepConstraintKinds = DepData | DepAnti | DepOutput;
+constexpr unsigned DepConstraintKinds = DepData;
 /// Kinds that propose merging the edge's endpoints.
 constexpr unsigned DepMergeKinds = DepData;
 
@@ -171,6 +173,7 @@ private:
 
   void initKillDeadFlags(MachineBasicBlock &MBB);
   void normalizeTiedRegs(MachineBasicBlock &MBB);
+  void fusePhysRegCopies(MachineBasicBlock &MBB);
 
   void allocate(iterator_range<MBBIterator> MIs, LiveSet &Live);
   void narrowToFit(Register Def, const BitVector &DefEff,
@@ -249,6 +252,7 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   validate(MBB);
   initKillDeadFlags(MBB);
   normalizeTiedRegs(MBB);
+  fusePhysRegCopies(MBB);
   initClusters(MBB);
   schedule(MBB);
   assignRegisters(MBB);
@@ -372,6 +376,82 @@ void MOSRegAlloc::normalizeTiedRegs(MachineBasicBlock &MBB) {
   }
 }
 
+/// Replace Run — each a single-def, single-use COPY — with one PCOPY inserted at
+/// Run.front()'s position. Operand layout is all defs in run order followed by
+/// all uses in run order, so def[i] pairs with use[i]; the variadic operands
+/// carry no explicit tie, so the expansion recovers the pairing by position.
+/// Each def/use operand is copied wholesale, so every flag the original COPY
+/// carried (dead/kill/undef/renamable/subreg) survives unchanged.
+static void buildPCopyFromRun(MachineBasicBlock &MBB,
+                              ArrayRef<MachineInstr *> Run,
+                              const TargetInstrInfo &TII) {
+  MachineInstrBuilder MIB =
+      BuildMI(MBB, Run.front()->getIterator(), Run.front()->getDebugLoc(),
+              TII.get(MOS::PCOPY));
+  for (const MachineInstr *MI : Run)
+    MIB.add(MI->getOperand(0));
+  for (MachineInstr *MI : make_early_inc_range(Run)) {
+    MIB.add(MI->getOperand(1));
+    MI->eraseFromParent();
+  }
+}
+
+/// A COPY that moves a value into or out of a physical register: the copies that
+/// liveins, returns, calling conventions, and inline asm use to cross a
+/// register-allocation boundary. Pure vreg-to-vreg copies are left alone for the
+/// cluster coalescer to handle; fusing them would gain nothing, as the register
+/// anti/output edges that PCOPY exists to dissolve are physreg-only.
+static bool isPhysRegCopy(const MachineInstr &MI) {
+  return MI.isCopy() && (MI.getOperand(0).getReg().isPhysical() ||
+                         MI.getOperand(1).getReg().isPhysical());
+}
+
+/// Fuse each maximal run of consecutive physreg copies into one parallel copy
+/// (PCOPY). A parallel copy is the faithful representation of such a run: the
+/// sources are read and the destinations written all at once, with no order
+/// among the moves to model. That is what lets computeDepGraph drop the register
+/// anti/output edges that existed only to sequence them. The run is extended
+/// only while it stays a valid parallel copy — no copy may read or overwrite a
+/// register an earlier copy in the run already wrote, since either would make
+/// the all-at-once reading differ from the original sequential one (e.g.
+/// `$a = COPY $x; $x = COPY $a` is not a swap and must not fuse). Only runs of
+/// length >= 2 are fused; a lone copy has no internal order to lose. The PCOPY
+/// survives as a post-RA pseudo; ExpandPostRAPseudos lowers it to individual
+/// moves once the operands are physregs. assignRegisters biases the operand
+/// assignment so the moves never form a permutation cycle, keeping that lowering
+/// temporary-free.
+void MOSRegAlloc::fusePhysRegCopies(MachineBasicBlock &MBB) {
+  const TargetInstrInfo &TII = *MBB.getParent()->getSubtarget().getInstrInfo();
+
+  for (auto It = MBB.begin(), End = MBB.end(); It != End;) {
+    if (!isPhysRegCopy(*It)) {
+      ++It;
+      continue;
+    }
+
+    // Grab consecutive physreg copies while the run stays a valid parallel copy:
+    // a copy whose source or destination overlaps an earlier copy's destination
+    // would carry a sequential dependence the parallel form can't preserve, so
+    // it ends the run and starts the next one.
+    SmallVector<MachineInstr *, 4> Run;
+    auto WrittenEarlier = [&](Register R) {
+      return llvm::any_of(Run, [&](const MachineInstr *M) {
+        return TRI->regsOverlap(M->getOperand(0).getReg(), R);
+      });
+    };
+    for (; It != End && isPhysRegCopy(*It); ++It) {
+      Register Dst = It->getOperand(0).getReg();
+      Register Src = It->getOperand(1).getReg();
+      if (WrittenEarlier(Src) || WrittenEarlier(Dst))
+        break;
+      Run.push_back(&*It);
+    }
+
+    if (Run.size() >= 2)
+      buildPCopyFromRun(MBB, Run, TII);
+  }
+}
+
 /// Create one singleton cluster per instruction, allocate it, and connect
 /// the clusters with their dependence edges (computeDepGraph). Cluster 0
 /// (LiveInClusterIdx) is an empty cluster whose LiveOut publishes the
@@ -428,10 +508,6 @@ void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
 ///   - Physreg Data edges: reaching def -> use, per regunit. This binds each
 ///     physreg use to the one def (or livein) whose value it reads — the
 ///     binding is never recomputed, so no later layout can rebind it.
-///   - Physreg Anti edges: each use since the last aliasing def -> that next
-///     def (the use must read before the new value clobbers).
-///   - Physreg Output edges: aliasing def -> next def. Dead defs included;
-///     their writes still clobber.
 ///
 /// A physreg use with no reaching def reads a block livein; it gets no edge at
 /// all (the livein cluster has no defining instruction to depend on). Livein
@@ -442,6 +518,17 @@ void MOSRegAlloc::initClusters(MachineBasicBlock &MBB) {
 /// singleton clusters. All dependencies point forward in input order, so
 /// the graph starts as a DAG; canMerge keeps its constraint edges acyclic
 /// as commitMerge contracts merged clusters.
+///
+/// Register anti (WAR) and output (WAW) edges are deliberately not modeled. The
+/// only such hazard in real input is a livein physreg read before it is
+/// overwritten for a return value, and that ordering is preserved structurally:
+/// the livein reader is a dependence source folded at the block front, while
+/// the return writer keeps its Data edge to the terminator, which is folded
+/// last — so the read always precedes the write. fusePhysRegCopies further
+/// collapses each run of physreg copies into one atomic PCOPY. A colorable
+/// interior physreg WAR/WAW ordered only by anti/output would be a real hazard,
+/// but register-keyed liveness makes such a shape cost a copy, which commitMerge
+/// already rejects, so none can be silently misordered.
 ///
 /// TODO: Memory dependencies are not modeled — the scheduler can reorder
 /// aliasing loads and stores. They belong here as Order edges (store->load,
@@ -493,16 +580,13 @@ void MOSRegAlloc::addVRegDeps() {
   }
 }
 
-/// Add the physreg Data, Anti, and Output edges by walking instructions
-/// forward. A use with no reaching def reads a block livein; it gets no Data
-/// edge (liveins have no defining cluster), but is still tracked so a later
-/// aliasing def picks up its Anti edge.
+/// Add the physreg Data edges by walking instructions forward, tracking the
+/// last def of each regunit. A use with a reaching def gets a Data edge from
+/// it; a use with no reaching def reads a block livein and gets no edge (the
+/// livein cluster has no defining instruction). Register anti/output edges are
+/// deliberately not modeled — see computeDepGraph.
 void MOSRegAlloc::addPhysRegDeps(MachineBasicBlock &MBB) {
-  struct UnitState {
-    MachineInstr *LastDef = nullptr;
-    SmallVector<MachineInstr *, 4> UsesSinceLastDef;
-  };
-  SmallVector<UnitState, 0> Units(TRI->getNumRegUnits());
+  SmallVector<MachineInstr *, 0> LastDef(TRI->getNumRegUnits(), nullptr);
 
   for (MachineInstr &MI : MBB) {
     unsigned C = MICluster[&MI];
@@ -510,26 +594,16 @@ void MOSRegAlloc::addPhysRegDeps(MachineBasicBlock &MBB) {
       Register R = MO.getReg();
       if (!R.isPhysical() || MO.isUndef())
         continue;
-      for (MCRegUnit Unit : TRI->regunits(R.asMCReg())) {
-        UnitState &S = Units[static_cast<unsigned>(Unit)];
-        if (S.LastDef)
-          addDep(MICluster[S.LastDef], C, DepData);
-        S.UsesSinceLastDef.push_back(&MI);
-      }
+      for (MCRegUnit Unit : TRI->regunits(R.asMCReg()))
+        if (MachineInstr *Def = LastDef[static_cast<unsigned>(Unit)])
+          addDep(MICluster[Def], C, DepData);
     }
     for (const MachineOperand &MO : MI.all_defs()) {
       Register R = MO.getReg();
       if (!R.isPhysical())
         continue;
-      for (MCRegUnit Unit : TRI->regunits(R.asMCReg())) {
-        UnitState &S = Units[static_cast<unsigned>(Unit)];
-        for (MachineInstr *UseMI : S.UsesSinceLastDef)
-          addDep(MICluster[UseMI], C, DepAnti);
-        if (S.LastDef)
-          addDep(MICluster[S.LastDef], C, DepOutput);
-        S.LastDef = &MI;
-        S.UsesSinceLastDef.clear();
-      }
+      for (MCRegUnit Unit : TRI->regunits(R.asMCReg()))
+        LastDef[static_cast<unsigned>(Unit)] = &MI;
     }
   }
 }
@@ -563,10 +637,6 @@ void MOSRegAlloc::contractDeps(unsigned DefC, unsigned UseC) {
       dbgs() << ' ' << E.Succ << '(';
       if (E.Kinds & DepData)
         dbgs() << 'd';
-      if (E.Kinds & DepAnti)
-        dbgs() << 'a';
-      if (E.Kinds & DepOutput)
-        dbgs() << 'o';
       dbgs() << ')';
     }
     dbgs() << '\n';
@@ -1111,6 +1181,27 @@ void MOSRegAlloc::assignRegisters(MachineBasicBlock &MBB) {
     for (MCRegUnit Unit : TRI->regunits(MCPhysReg(LI.PhysReg)))
       LiveUnits.set(static_cast<unsigned>(Unit));
 
+  // PCOPY pairs def[i] with use[i]. Where one side is a physreg and the other a
+  // vreg, prefer to give that vreg the physreg: the move then collapses to an
+  // identity, so the parallel copy can never become a permutation cycle (a
+  // register swap) — which ExpandPostRAPseudos has no temporary to break. The
+  // hint is keyed by the still-virtual operand, so compute it before the loop
+  // rewrites any vregs.
+  DenseMap<Register, MCPhysReg> Hint;
+  for (const MachineInstr &MI : MBB) {
+    if (MI.getOpcode() != MOS::PCOPY)
+      continue;
+    unsigned Half = MI.getNumOperands() / 2;
+    for (unsigned I = 0; I != Half; ++I) {
+      Register Def = MI.getOperand(I).getReg();
+      Register Use = MI.getOperand(Half + I).getReg();
+      if (Def.isVirtual() && Use.isPhysical())
+        Hint[Def] = Use.asMCReg();
+      else if (Use.isVirtual() && Def.isPhysical())
+        Hint[Use] = Def.asMCReg();
+    }
+  }
+
   for (MachineInstr &MI : MBB) {
     // Free killed uses. Prior defs' replaceRegWith already made these physregs.
     for (const MachineOperand &MO : MI.all_uses()) {
@@ -1138,15 +1229,23 @@ void MOSRegAlloc::assignRegisters(MachineBasicBlock &MBB) {
         MRI->replaceRegWith(Reg, Assigned);
       } else {
         const BitVector &Eff = EffectiveRC[Reg];
+        auto IsFree = [&](MCPhysReg P) {
+          return llvm::none_of(TRI->regunits(P), [&](MCRegUnit U) {
+            return LiveUnits.test(static_cast<unsigned>(U));
+          });
+        };
+        // Take the PCOPY hint when it is allocatable for this slot and free, so
+        // the paired boundary move collapses to an identity (keeps the parallel
+        // copy acyclic). Otherwise fall back to the first free register.
+        auto HintIt = Hint.find(Reg);
+        if (HintIt != Hint.end() && HintIt->second < Eff.size() &&
+            Eff.test(HintIt->second) && IsFree(HintIt->second))
+          Assigned = HintIt->second;
         for (unsigned PhysReg : Eff.set_bits()) {
-          bool Free = llvm::none_of(
-              TRI->regunits(MCPhysReg(PhysReg)), [&](MCRegUnit U) {
-                return LiveUnits.test(static_cast<unsigned>(U));
-              });
-          if (Free) {
-            Assigned = MCPhysReg(PhysReg);
+          if (Assigned)
             break;
-          }
+          if (IsFree(MCPhysReg(PhysReg)))
+            Assigned = MCPhysReg(PhysReg);
         }
         if (!Assigned)
           report_fatal_error("no free register in effective set");

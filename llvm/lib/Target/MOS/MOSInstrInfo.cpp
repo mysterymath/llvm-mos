@@ -816,16 +816,18 @@ const TargetRegisterClass *MOSInstrInfo::canFoldCopy(const MachineInstr &MI,
 
 void MOSInstrInfo::storeRegToStackSlot(
     MachineBasicBlock &MBB, MachineBasicBlock::iterator MI, Register SrcReg,
-    bool isKill, int FrameIndex, const TargetRegisterClass *RC,
-    Register VReg, MachineInstr::MIFlag Flags) const {
+    bool isKill, int FrameIndex, const TargetRegisterClass *RC, Register VReg,
+    MachineInstr::MIFlag Flags) const {
   loadStoreRegStackSlot(MBB, MI, SrcReg, isKill, FrameIndex, RC, Flags,
                         /*IsLoad=*/false);
 }
 
-void MOSInstrInfo::loadRegFromStackSlot(
-    MachineBasicBlock &MBB, MachineBasicBlock::iterator MI, Register DestReg,
-    int FrameIndex, const TargetRegisterClass *RC, Register VReg,
-    unsigned /*SubReg*/, MachineInstr::MIFlag Flags) const {
+void MOSInstrInfo::loadRegFromStackSlot(MachineBasicBlock &MBB,
+                                        MachineBasicBlock::iterator MI,
+                                        Register DestReg, int FrameIndex,
+                                        const TargetRegisterClass *RC,
+                                        Register VReg, unsigned /*SubReg*/,
+                                        MachineInstr::MIFlag Flags) const {
   loadStoreRegStackSlot(MBB, MI, DestReg, false, FrameIndex, RC, Flags,
                         /*IsLoad=*/true);
 }
@@ -976,8 +978,8 @@ void MOSInstrInfo::loadStoreRegStackSlot(
   });
 }
 
-const TargetRegisterClass *
-MOSInstrInfo::getRegClass(const MCInstrDesc &MCID, unsigned OpNum) const {
+const TargetRegisterClass *MOSInstrInfo::getRegClass(const MCInstrDesc &MCID,
+                                                     unsigned OpNum) const {
   auto *RC = TargetInstrInfo::getRegClass(MCID, OpNum);
 
   // On SPC700, LDImm can be used for imaginary registers.
@@ -1005,6 +1007,9 @@ bool MOSInstrInfo::expandPostRAPseudo(MachineInstr &MI) const {
   case MOS::DecPtr:
   case MOS::DecDcpPtr:
     expandIncDecPtr(Builder);
+    break;
+  case MOS::PCOPY:
+    expandPCOPY(Builder);
     break;
   case MOS::LDZpIdx:
     expandLDIdx(Builder, true);
@@ -1274,6 +1279,71 @@ void MOSInstrInfo::expandIncDecPtr(MachineIRBuilder &Builder) const {
   } else {
     Inst->tieOperands(1, 3);
     Inst->tieOperands(2, 4);
+  }
+  MI.eraseFromParent();
+}
+
+void MOSInstrInfo::expandPCOPY(MachineIRBuilder &Builder) const {
+  MachineInstr &MI = *Builder.getInsertPt();
+  MachineBasicBlock &MBB = *MI.getParent();
+  const TargetRegisterInfo &TRI = *Builder.getMRI()->getTargetRegisterInfo();
+
+  // PCOPY operands are all defs followed by all uses, with def[i] paired to
+  // use[i]. The instruction itself is the set of pending moves: repeatedly peel
+  // off a pair whose destination no other pending use still reads, emit it
+  // (dropping identities), and delete the pair from the instruction, until
+  // nothing remains.
+  //
+  // The allocator biases assignment so the pairs never form a permutation cycle
+  // (a register swap); a residual cycle would need a temporary to break, which
+  // is not yet supported, so fail loudly rather than miscompile.
+  assert(MI.getNumOperands() % 2 == 0 &&
+         "PCOPY must have equal numbers of defs and uses");
+  while (MI.getNumOperands() != 0) {
+    unsigned UseBegin = MI.getNumOperands() / 2;
+
+    // No pending use other than the one at UseIdx overlaps R? Used both to test
+    // readiness (R is a destination) and to check source uniqueness below (R is
+    // the source at UseIdx), so R is not always the register at UseIdx.
+    auto OnlyOneUse = [&](unsigned UseIdx, Register R) {
+      assert(MI.getOperand(UseIdx).isUse() && "expected UseIdx to be a use");
+      for (unsigned I = UseBegin, E = MI.getNumOperands(); I != E; ++I)
+        if (I != UseIdx && TRI.regsOverlap(MI.getOperand(I).getReg(), R))
+          return false;
+      return true;
+    };
+
+    // A move is ready when no other pending use reads its destination, so
+    // emitting it cannot clobber a value another move still needs.
+    unsigned ReadyDef = ~0u;
+    for (unsigned I = 0; I != UseBegin; ++I)
+      if (OnlyOneUse(UseBegin + I, MI.getOperand(I).getReg())) {
+        ReadyDef = I;
+        break;
+      }
+    if (ReadyDef == ~0u)
+      report_fatal_error(
+          "parallel copy requires a temporary, which is not yet supported");
+
+    MachineOperand &Def = MI.getOperand(ReadyDef);
+    MachineOperand &Use = MI.getOperand(UseBegin + ReadyDef);
+
+    // Each source is read by exactly one move: distinct sources are live
+    // simultaneously, so they interfere and the allocator never overlaps them.
+    // That is what lets the kill flag come straight from the use operand instead
+    // of being recomputed as "the last read of this source".
+    assert(OnlyOneUse(UseBegin + ReadyDef, Use.getReg()) &&
+           "source read by more than one move; its kill flag would be unsound");
+
+    if (Def.getReg() != Use.getReg())
+      copyPhysReg(MBB, MI.getIterator(), MI.getDebugLoc(), Def.getReg(),
+                  Use.getReg(), Use.isKill(), /*RenamableDest=*/false,
+                  /*RenamableSrc=*/false);
+
+    // Delete the pair; remove the use (higher index) before the def so the def
+    // index stays valid.
+    MI.removeOperand(Use.getOperandNo());
+    MI.removeOperand(Def.getOperandNo());
   }
   MI.eraseFromParent();
 }

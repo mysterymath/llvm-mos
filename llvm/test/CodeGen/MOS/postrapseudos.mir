@@ -365,3 +365,51 @@ body: |
     ; CHECK: $a = LDImm 0
     $a = LDZ
 ...
+---
+name: pcopy_identity
+tracksRegLiveness: true
+body: |
+  bb.0.entry:
+    liveins: $a, $x
+    ; CHECK-LABEL: name: pcopy_identity
+    ; CHECK: liveins: $a, $x
+    $a, $x = PCOPY killed $a, killed $x
+...
+---
+name: pcopy_parallel
+tracksRegLiveness: true
+body: |
+  bb.0.entry:
+    liveins: $a, $x
+    ; CHECK-LABEL: name: pcopy_parallel
+    ; CHECK: liveins: $a, $x
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: $rc0 = STImag8 $a
+    ; CHECK-NEXT: $rc1 = STImag8 $x
+    $rc0, $rc1 = PCOPY killed $a, killed $x
+...
+---
+name: pcopy_ordered
+tracksRegLiveness: true
+body: |
+  bb.0.entry:
+    liveins: $rc2, $a
+    ; CHECK-LABEL: name: pcopy_ordered
+    ; CHECK: liveins: $rc2, $a
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: $rc0 = STImag8 $a
+    ; CHECK-NEXT: $a = LDImag8 $rc2
+    $a, $rc0 = PCOPY killed $rc2, killed $a
+...
+---
+name: pcopy_mixed_identity
+tracksRegLiveness: true
+body: |
+  bb.0.entry:
+    liveins: $a, $x
+    ; CHECK-LABEL: name: pcopy_mixed_identity
+    ; CHECK: liveins: $a, $x
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: $rc0 = STImag8 $x
+    $a, $rc0 = PCOPY killed $a, killed $x
+...
