@@ -37,12 +37,17 @@ class MOSPseudo : Instruction {
 // registers before and after the pseudo.
 //===---------------------------------------------------------------------===//
 
-// Parallel (simulatneous) version of copy. Part of out-of-SSA transition in
-// regalloc.
+// Parallel (simultaneous) version of copy: the destinations are written from
+// the sources all at once, so there is no order among the moves. Emitted by the
+// register allocator (MOSRegAlloc) to represent boundary copy blocks, it
+// survives as a post-RA pseudo and is lowered to individual moves by
+// ExpandPostRAPseudos (MOSInstrInfo::expandPostRAPseudo). Operand layout is all
+// defs followed by all uses, with def[i] paired to use[i]. The allocator biases
+// assignment so the moves never form a permutation cycle, so the expansion can
+// sequentialize them without a temporary.
 def PCOPY : MOSPseudo {
-  dag OutOperandList = (outs Imag16:$scratch_ptr, Imag16:$scratch_reg, variable_ops);
+  dag OutOperandList = (outs variable_ops);
   dag InOperandList = (ins variable_ops);
-  let Constraints = "@earlyclobber $scratch_ptr,@earlyclobber $scratch_reg";
 }
 
 // Abstracts LDAZpIdx and LDYIdx. LDXIdx isn't yet supported, since there's no

@@ -416,7 +416,9 @@ body: |
   bb.0:
     liveins: $a
     ; CHECK-LABEL: name: livein_cluster_spliced
-    ; CHECK: $x = LDImm 3
+    ; CHECK: liveins: $a
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: $x = LDImm 3
     ; CHECK-NEXT: $a = COPY killed $a
     ; CHECK-NEXT: STAbsIdx killed $a, 100, killed $x
     %0:ac = COPY $a
@@ -448,4 +450,48 @@ body: |
     %0:ac = LDImm 5
     STAbs killed %0, 2000
     STAbs killed $a, 1000
+...
+
+# Boundary livein run of length >= 2: the two contiguous livein-reader COPYs
+# fuse into one PCOPY, which persists into the output for ExpandPostRAPseudos.
+# Assignment bias gives each vreg its paired livein register, so the parallel
+# copy is all identities.
+---
+name: pcopy_livein_block
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $a, $x
+    ; CHECK-LABEL: name: pcopy_livein_block
+    ; CHECK: liveins: $a, $x
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: $a, $x = PCOPY killed $a, killed $x
+    ; CHECK-NEXT: STAbs killed $a, 1000
+    ; CHECK-NEXT: STAbs killed $x, 2000
+    %0:gpr = COPY $a
+    %1:gpr = COPY $x
+    STAbs killed %0, 1000
+    STAbs killed %1, 2000
+...
+
+# Boundary return run of length >= 2: the two contiguous return-writer COPYs
+# (read by RTS) fuse into one PCOPY. The naive first-free assignment would cross
+# the values (%0 produced first -> $a, but returned in $x), making the parallel
+# copy a register swap. Assignment bias instead produces each value directly in
+# its return register, so the PCOPY is all identities and no temporary is needed.
+---
+name: pcopy_return_block
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: pcopy_return_block
+    ; CHECK: $a = LDAbs 2000
+    ; CHECK-NEXT: $x = LDAbs 1000
+    ; CHECK-NEXT: $x, $a = PCOPY killed $x, killed $a
+    ; CHECK-NEXT: RTS implicit killed $a, implicit killed $x
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 2000
+    $x = COPY %0
+    $a = COPY %1
+    RTS implicit $a, implicit $x
 ...
