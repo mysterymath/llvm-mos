@@ -26,9 +26,9 @@ registers:
 body: |
   bb.0:
     ; CHECK-LABEL: name: narrowing
-    ; CHECK: $x = LDAbs 1000
-    ; CHECK-NEXT: $a = COPY $x
-    ; CHECK-NEXT: STAbs killed $x, 3000
+    ; CHECK: $a = LDAbs 1000
+    ; CHECK-NEXT: STAbs $a, 3000
+    ; CHECK-NEXT: $a = COPY killed $a
     ; CHECK-NEXT: STAbs killed $a, 2000
     %0:gpr = LDAbs 1000
     %1:ac = COPY %0
@@ -50,11 +50,11 @@ registers:
 body: |
   bb.0:
     ; CHECK-LABEL: name: chained_narrowing
-    ; CHECK: $x = LDAbs 1000
-    ; CHECK-NEXT: $y = COPY $x
-    ; CHECK-NEXT: $a = COPY $x
-    ; CHECK-NEXT: STAbs killed $x, 4000
-    ; CHECK-NEXT: STAbs killed $y, 5000
+    ; CHECK: $a = LDAbs 1000
+    ; CHECK-NEXT: STAbs $a, 4000
+    ; CHECK-NEXT: $x = COPY $a
+    ; CHECK-NEXT: STAbs killed $x, 5000
+    ; CHECK-NEXT: $a = COPY killed $a
     ; CHECK-NEXT: STAbs killed $a, 3000
     %0:gpr = LDAbs 1000
     %1:gpr = COPY %0
@@ -306,10 +306,10 @@ registers:
 body: |
   bb.0:
     ; CHECK-LABEL: name: terminator_interleaved
-    ; CHECK: $a = LDAbs 1000
+    ; CHECK: $a = LDAbs 2000
+    ; CHECK-NEXT: STAbs killed $a, 3000
+    ; CHECK-NEXT: $a = LDAbs 1000
     ; CHECK-NEXT: $a = COPY killed $a
-    ; CHECK-NEXT: $x = LDAbs 2000
-    ; CHECK-NEXT: STAbs killed $x, 3000
     ; CHECK-NEXT: RTS implicit killed $a
     %0:ac = LDAbs 1000
     $a = COPY killed %0
@@ -363,9 +363,9 @@ body: |
   bb.0:
     ; CHECK-LABEL: name: cost_aware_deferral
     ; CHECK: $a = LDAbs 1000
-    ; CHECK-NEXT: $x = COPY $a
-    ; CHECK-NEXT: STAbs killed $a, 2000
-    ; CHECK-NEXT: $a = COPY killed $x
+    ; CHECK-NEXT: STAbs $a, 2000
+    ; CHECK-NEXT: $a = COPY killed $a
+    ; CHECK-NEXT: $a = COPY killed $a
     ; CHECK-NEXT: STAbs killed $a, 3000
     %0:ac = LDAbs 1000
     %1:gpr = COPY %0
@@ -494,4 +494,31 @@ body: |
     $x = COPY %0
     $a = COPY %1
     RTS implicit $a, implicit $x
+...
+
+# Pressure-aware merge tie-break. %0 (gpr, any GPR) is copied into %1 (ac, A-only)
+# and both are stored. Cost alone cannot tell "keep %0 in $x and %1 in $a" (two
+# registers held at once) apart from "route everything through $a" — both are
+# copy-free, cost 0. The slack-aware secondary merge key prefers the lower-
+# pressure schedule: %0 lands in $a and its store is hoisted to free the register
+# before %1 is materialized (the residual $a = COPY $a identity is cleaned up
+# downstream). Without the secondary key the greedy keeps %0 in $x, so these
+# checks fail without it.
+---
+name: pressure_aware_tiebreak
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr }
+  - { id: 1, class: ac }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: pressure_aware_tiebreak
+    ; CHECK: $a = LDAbs 1234
+    ; CHECK-NEXT: STAbs $a, 5000
+    ; CHECK-NEXT: $a = COPY killed $a
+    ; CHECK-NEXT: STAbs killed $a, 6000
+    %0:gpr = LDAbs 1234
+    %1:ac = COPY %0
+    STAbs %0, 5000
+    STAbs %1, 6000
 ...

@@ -201,6 +201,18 @@ private:
   /// must be colorable.
   unsigned Cost = 0;
 
+  /// Minimum residual slack (headroom before a forced copy) over the defs of
+  /// the last allocate() pass — the secondary, pressure-aware merge key under
+  /// Cost. allocate() resets it to INT_MAX and folds in each vreg def's
+  /// post-narrow slack. Among equal-Cost trials tryMerge prefers the one that
+  /// keeps this higher, i.e. the schedule that stays furthest from a copy.
+  /// Because a held register depresses the slack of every later def it
+  /// interferes with, maximizing it also steers toward register-freeing
+  /// merges, so directionality needs no separate heuristic. Class-agnostic:
+  /// tight classes show low slack through their small effective sets, with no
+  /// class named here.
+  int TrialMinSlack = std::numeric_limits<int>::max();
+
   /// A merge trial's outcome plus the post-merge state needed to make it
   /// real. tryMerge fills this in for the cheapest trial seen so far;
   /// commitMerge swaps the saved maps into the live state directly, without
@@ -209,6 +221,9 @@ private:
     unsigned DefC = 0;
     unsigned UseC = 0;
     unsigned Cost = ~0u;
+    /// Secondary key: the captured trial's TrialMinSlack; higher is better.
+    /// INT_MIN until a candidate is captured, so any real trial wins the tie.
+    int MinSlack = std::numeric_limits<int>::min();
 
     // Post-merge state, captured from the live maps at the end of a winning
     // trial (before tryMerge reverts them).
@@ -627,8 +642,12 @@ void MOSRegAlloc::contractDeps(unsigned DefC, unsigned UseC) {
         Succs, [&](const Cluster::Dep &E) { return E.Succ == UseC; });
     if (It == Succs.end())
       continue;
-    addDep(C, DefC, It->Kinds);
+    // Erase before addDep: addDep may push_back onto this same Succs vector
+    // (C -> DefC), reallocating it and invalidating It. Capture the kinds and
+    // drop the C -> UseC edge first, then add the remapped edge.
+    unsigned Kinds = It->Kinds;
     Succs.erase(It);
+    addDep(C, DefC, Kinds);
   }
 
   LLVM_DEBUG({
@@ -684,8 +703,11 @@ bool MOSRegAlloc::canMerge(unsigned DefC, unsigned UseC) {
 /// to avoid V; they do not consume V's slack. Narrowing of V is the one
 /// event that charges V — it directly shrinks EffectiveRC[V].
 void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
-  // Cost reflects this pass alone; narrowToFit bumps it per uncolorable def.
+  // Cost and TrialMinSlack reflect this pass alone; narrowToFit bumps Cost per
+  // uncolorable def, and the def loop folds each colorable def's residual slack
+  // into TrialMinSlack.
   Cost = 0;
+  TrialMinSlack = std::numeric_limits<int>::max();
   for (MachineInstr &MI : MIs) {
     for (const MachineOperand &MO : MI.all_uses()) {
       // Kill flags are trustworthy here: incoming ones were cleared
@@ -724,9 +746,15 @@ void MOSRegAlloc::allocate(iterator_range<MBBIterator> MIs, LiveSet &Live) {
         Live.insert(R);
         narrowToFit(R, EffectiveRC[R], Interferences[R], Live);
 
+        // Fold this def's residual headroom into the trial's min slack. A def
+        // allocated while a register is held sees the held value among its
+        // interferers, so its slack is depressed — that is what penalizes
+        // holding and rewards freeing, with no class named.
+        int Slack = getSlack(EffectiveRC[R], Interferences[R]);
+        TrialMinSlack = std::min(TrialMinSlack, Slack);
         LLVM_DEBUG(dbgs() << "    Slack for " << printReg(R, TRI) << " ("
                           << TRI->getRegClassName(MRI->getRegClass(R))
-                          << "): " << getSlack(EffectiveRC[R], Interferences[R])
+                          << "): " << Slack
                           << " (eff=" << EffectiveRC[R].count() << ")\n");
       } else {
         // Physreg def: nothing to store in EffectiveRC / Interferences (a
@@ -1044,14 +1072,19 @@ void MOSRegAlloc::tryMerge(unsigned DefC, unsigned UseC) {
   allocate(Use.Range, TmpLive);
 
   LLVM_DEBUG(dbgs() << "  tryMerge " << UseC << " into " << DefC << ": cost "
-                    << Cost << " (best " << BestMerge.Cost << ")\n");
+                    << Cost << " minslack " << TrialMinSlack << " (best "
+                    << BestMerge.Cost << "/" << BestMerge.MinSlack << ")\n");
 
-  // If this trial is the cheapest so far, capture its post-merge state.
-  // Move the mutated maps out (they are restored from the snapshots below).
-  if (Cost < BestMerge.Cost) {
+  // Capture this trial if it beats the best so far: lower Cost wins outright,
+  // and among equal Cost the higher TrialMinSlack — more headroom before a
+  // forced copy — wins. Move the mutated maps out (restored from the snapshots
+  // below).
+  if (Cost < BestMerge.Cost ||
+      (Cost == BestMerge.Cost && TrialMinSlack > BestMerge.MinSlack)) {
     BestMerge.DefC = DefC;
     BestMerge.UseC = UseC;
     BestMerge.Cost = Cost;
+    BestMerge.MinSlack = TrialMinSlack;
     BestMerge.EffectiveRC = std::move(EffectiveRC);
     BestMerge.Interferences = std::move(Interferences);
     BestMerge.TiedRoot = std::move(TiedRoot);
