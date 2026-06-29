@@ -627,8 +627,12 @@ void MOSRegAlloc::contractDeps(unsigned DefC, unsigned UseC) {
         Succs, [&](const Cluster::Dep &E) { return E.Succ == UseC; });
     if (It == Succs.end())
       continue;
-    addDep(C, DefC, It->Kinds);
+    // Erase before addDep: addDep may push_back onto this same Succs vector
+    // (C -> DefC), reallocating it and invalidating It. Capture the kinds and
+    // drop the C -> UseC edge first, then add the remapped edge.
+    unsigned Kinds = It->Kinds;
     Succs.erase(It);
+    addDep(C, DefC, Kinds);
   }
 
   LLVM_DEBUG({
