@@ -208,3 +208,105 @@ The old MOSRegAlloc merges clusters until a block is one cluster, using
 colorability/copy-count heuristics, without modeling memory dependencies.
 Reusing that contraction policy would assume the property we are trying to
 investigate. No allocator changes have been made for this manual experiment.
+
+## Survey of overlapping regions
+
+`llvm/utils/mos-region-survey.py` enumerates all nonempty connected,
+dependency-convex subsets of selected block interiors. Connectivity includes
+shared nonconstant inputs as well as producer/consumer links. PHIs and
+terminators are excluded from the candidate sets, but their uses still count
+at region boundaries. The full report can be regenerated with:
+
+```sh
+~/bin/idledo python3 llvm/utils/mos-region-survey.py build/sieve-regions.mir \
+  --block bb.3.for.body6 --block bb.4.if.then \
+  --block bb.6.while.body --block bb.8.for.inc14 \
+  > build/sieve-region-survey.md
+```
+
+This is a structural survey, not an exhaustive search of code implementations.
+Its text reader does not model memory dependencies or physical-register
+dependencies. Convexity refers only to virtual-register def-use paths. These
+regions are not certified atomic scheduling units. Constants are recognized
+at direct immediate definitions, without propagation through copies.
+
+| Block interior | Instructions | Connected convex regions |
+| --- | ---: | ---: |
+| Read flags[i] | 4 | 10 |
+| Compute 3*i+3 for the entry test | 10 | 103 |
+| Clear flags[k] and update k | 10 | 139 |
+| Increment i and update two recurrences | 9 | 26 |
+
+All 278 candidate sets were enumerated. This small sample does not exhibit a
+structural enumeration explosion. It says nothing yet about the number of
+placement/scheduling implementations each set might require.
+
+### Widening can expose a carry and then hide it again
+
+In bb.4, the six instructions implementing the shift and its COPYs have two
+dynamic inputs (i low/high) and two outputs (2*i low/high). Add the next
+low-byte ADC: now three values escape, including its carry. Add the matching
+high-byte ADC: the carry becomes internal and there are two outputs again.
+Adding the final +3 carry chain repeats the same behavior.
+
+| Region size | Computation included | Dynamic inputs + outputs |
+| ---: | --- | ---: |
+| 6 | 2*i | 4 |
+| 7 | Also low byte of 3*i | 5 |
+| 8 | All of 3*i | 4 |
+| 9 | Also low byte of 3*i+3 | 5 |
+| 10 | All of 3*i+3 | 4 |
+
+These are counts of SSA values, not bytes or register pressure. Nevertheless,
+they disprove a monotonic boundary-width stopping rule for this example.
+Widening must sometimes pass through a less attractive boundary to complete
+an internal computation. Consuming an exposed carry is a concrete candidate
+for directed widening rather than considering only one-instruction gains.
+
+### Widening through a shared input changes preservation requirements
+
+The six-instruction address/store region has two dynamic inputs, k low/high,
+and no value outputs. Both inputs are also used by the update outside it.
+The four-instruction update region has four dynamic inputs and two outputs;
+the old k bytes are also used by address construction outside it.
+
+Their ten-instruction union still has four dynamic inputs and two outputs,
+but the old k bytes have no uses outside the union. The prime bytes do. Thus
+the union can consider overwriting k's locations once their last internal
+reads complete, without requiring the enclosing problem to preserve old k.
+
+There is no produced value connecting the two smaller regions. They are
+connected through the shared inputs. A growth algorithm limited to
+producer/consumer edges would miss this union when PHIs are boundary inputs.
+
+The report's general retained-input metric is deliberately conservative: it
+counts any use outside a region, including uses that may execute earlier. It
+does not claim path-sensitive live-out information. For the inner-loop union,
+the absence of any outside uses establishes the particular fact above.
+
+### Resource interaction extends beyond value connectivity
+
+With the shared clear-carry constant treated separately, bb.8 has three value
+components: five instructions around IncMB, two ADCs for the +3 recurrence,
+and two ADCs for the +2 recurrence. The largest connected region therefore
+contains five instructions, even though the block interior contains nine.
+
+The two additions still need A and C; implementation choices for IncMB may
+need overlapping resources. Components that are disconnected in this value
+graph cannot automatically be optimized independently. A later growth
+algorithm may need to unite components when their implementations conflict,
+rather than insist that every region stay connected through values.
+
+### Implications for an algorithm
+
+Starting with single-instruction regions need not mean searching instruction
+pairs or committing to a hierarchy. The candidate sets can overlap, grow
+through shared inputs, and eventually unite separate value components.
+
+These measurements suggest three growth triggers to investigate: close an
+exposed internal dependency such as a carry; include the remaining consumers
+of an input to discharge its preservation requirement; or include another
+computation whose selected implementation conflicts over a machine resource.
+The first two are visible in the SSA graph. The third requires information
+from actual local implementations. None of these is yet a proof of
+quiescence or a complete search algorithm.
