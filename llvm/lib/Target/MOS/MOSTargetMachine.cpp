@@ -36,6 +36,7 @@
 #include "MOS.h"
 #include "MOSCombiner.h"
 #include "MOSCopyOpt.h"
+#include "MOSImagRegAlloc.h"
 #include "MOSIndexIV.h"
 #include "MOSInsertCopies.h"
 #include "MOSInternalize.h"
@@ -62,6 +63,7 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeMOSTarget() {
   initializeGlobalISel(PR);
   initializeMOSCombinerPass(PR);
   initializeMOSCopyOptPass(PR);
+  initializeMOSImagRegAllocPass(PR);
   initializeMOSInsertCopiesPass(PR);
   initializeMOSInternalizePass(PR);
   initializeMOSLateOptimizationPass(PR);
@@ -283,6 +285,7 @@ void MOSPassConfig::addMachineSSAOptimization() {
 }
 
 void MOSPassConfig::addOptimizedRegAlloc() {
+  addPass(createMOSImagRegAllocPass());
   addPass(createMOSRegAllocPass());
   // Perform stack slot coloring and post-ra machine LICM.
   addPass(&StackSlotColoringID);

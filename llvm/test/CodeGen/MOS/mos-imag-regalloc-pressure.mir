@@ -1,0 +1,598 @@
+# RUN: split-file %s %t
+# RUN: llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/valid.mir -o /dev/null
+# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/intact_pair_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=INTACT-PAIR-OVERFLOW
+# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/partial_kill_lo_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PARTIAL-KILL-LO-OVERFLOW
+# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/partial_kill_hi_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PARTIAL-KILL-HI-OVERFLOW
+# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/partial_overwrite_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PARTIAL-OVERWRITE-OVERFLOW
+# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/partial_unused_lo_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PARTIAL-UNUSED-LO-OVERFLOW
+# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/physical_early_clobber_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PHYSICAL-EARLY-CLOBBER-OVERFLOW
+
+# Physical pressure does not constrain backing selection, so test its accounting
+# at the capacity boundary: correct demand fits and one extra value fails.
+# There are 28 Imag8 and 14 Imag16 locations. Copies to reserved rc0/rs0
+# consume values without adding physical backing demand.
+
+#--- valid.mir
+# One physical pair plus thirteen virtual pairs fits; splitting the physical
+# pair into two byte demands would reject the last virtual pair.
+---
+name: intact_pair
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rs1
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:imag16 = COPY $rs1
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    $rs0 = COPY %13
+    RTS
+...
+
+# Killing one half leaves exactly one byte of physical demand. Thirteen
+# virtual pairs and one temporary byte exactly fit.
+---
+name: partial_kill_lo
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rs1
+    $rc0 = COPY $rc2
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:gpr = LDAbs 1000
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    STAbs %13, 2000
+    $rc0 = COPY $rc3
+    RTS
+...
+
+# Killing one half leaves exactly one byte of physical demand. Thirteen
+# virtual pairs and one temporary byte exactly fit.
+---
+name: partial_kill_hi
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rs1
+    $rc0 = COPY $rc3
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:gpr = LDAbs 1000
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    STAbs %13, 2000
+    $rc0 = COPY $rc2
+    RTS
+...
+
+# A dead replacement of the low byte must leave the incoming high byte live.
+# Thirteen virtual pairs and one temporary byte exactly fit.
+---
+name: partial_overwrite
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rs1
+    $rc2 = COPY $rc0
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:gpr = LDAbs 1000
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    STAbs %13, 2000
+    $rc0 = COPY $rc3
+    RTS
+...
+
+# Only the used half of an entry pair contributes pressure. Thirteen virtual
+# pairs and one temporary byte exactly fit.
+---
+name: partial_unused_lo
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rs1
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:gpr = LDAbs 1000
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    STAbs %13, 2000
+    $rc0 = COPY $rc3
+    RTS
+...
+
+# Unused recorded live-ins add no demand: fourteen virtual pairs fit.
+---
+name: unused_liveins
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rc2, $rs2
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:imag16 = COPY $rs0
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    $rs0 = COPY %13
+    RTS
+...
+
+# A use of a later definition must not make the entry value live across
+# fourteen virtual pairs.
+---
+name: overwritten_livein
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rc2
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:imag16 = COPY $rs0
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    $rs0 = COPY %13
+    $rc2 = COPY $rc0
+    $rc0 = COPY $rc2
+    RTS
+...
+
+# Twelve virtual pairs, one byte input, and an early-clobber physical pair
+# fit the conservative pair bound (12 + 1 + 1 = 14).
+---
+name: physical_early_clobber
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:gpr = LDAbs 1000
+    early-clobber $rs1 = STStk %12, $rs0, 0
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    RTS
+...
+
+#--- intact_pair_overflow.mir
+# The same physical pair must prevent a fourteenth virtual pair.
+# INTACT-PAIR-OVERFLOW: MOSImagRegAlloc: cannot prove backing assignability in intact_pair_overflow, bb.0 for Imag16 backing: requires 15, 14 available locations
+# INTACT-PAIR-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+---
+name: intact_pair_overflow
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rs1
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:imag16 = COPY $rs0
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    $rs0 = COPY %13
+    %14:imag16 = COPY $rs1
+    $rs0 = COPY %14
+    RTS
+...
+
+#--- partial_kill_lo_overflow.mir
+# Adding a second temporary byte must exceed capacity; losing the surviving
+# physical byte would incorrectly allow this.
+# PARTIAL-KILL-LO-OVERFLOW: MOSImagRegAlloc: cannot prove backing assignability in partial_kill_lo_overflow, bb.0 for Imag8 backing: requires 29, 28 available locations
+# PARTIAL-KILL-LO-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+---
+name: partial_kill_lo_overflow
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rs1
+    $rc0 = COPY $rc2
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:gpr = LDAbs 1000
+    %14:gpr = LDAbs 1001
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    STAbs %13, 2000
+    $rc0 = COPY $rc3
+    STAbs %14, 2001
+    RTS
+...
+
+#--- partial_kill_hi_overflow.mir
+# Adding a second temporary byte must exceed capacity; losing the surviving
+# physical byte would incorrectly allow this.
+# PARTIAL-KILL-HI-OVERFLOW: MOSImagRegAlloc: cannot prove backing assignability in partial_kill_hi_overflow, bb.0 for Imag8 backing: requires 29, 28 available locations
+# PARTIAL-KILL-HI-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+---
+name: partial_kill_hi_overflow
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rs1
+    $rc0 = COPY $rc3
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:gpr = LDAbs 1000
+    %14:gpr = LDAbs 1001
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    STAbs %13, 2000
+    $rc0 = COPY $rc2
+    STAbs %14, 2001
+    RTS
+...
+
+#--- partial_overwrite_overflow.mir
+# Adding a second temporary byte must exceed capacity; losing the surviving
+# physical byte would incorrectly allow this.
+# PARTIAL-OVERWRITE-OVERFLOW: MOSImagRegAlloc: cannot prove backing assignability in partial_overwrite_overflow, bb.0 for Imag8 backing: requires 29, 28 available locations
+# PARTIAL-OVERWRITE-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+---
+name: partial_overwrite_overflow
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rs1
+    $rc2 = COPY $rc0
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:gpr = LDAbs 1000
+    %14:gpr = LDAbs 1001
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    STAbs %13, 2000
+    $rc0 = COPY $rc3
+    STAbs %14, 2001
+    RTS
+...
+
+#--- partial_unused_lo_overflow.mir
+# Adding a second temporary byte must exceed capacity; losing the surviving
+# physical byte would incorrectly allow this.
+# PARTIAL-UNUSED-LO-OVERFLOW: MOSImagRegAlloc: cannot prove backing assignability in partial_unused_lo_overflow, bb.0 for Imag8 backing: requires 29, 28 available locations
+# PARTIAL-UNUSED-LO-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+---
+name: partial_unused_lo_overflow
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rs1
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:gpr = LDAbs 1000
+    %14:gpr = LDAbs 1001
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    STAbs %13, 2000
+    $rc0 = COPY $rc3
+    STAbs %14, 2001
+    RTS
+...
+
+#--- physical_early_clobber_overflow.mir
+# With thirteen virtual pairs, the early-clobber pair cannot fit until the
+# byte input dies. Releasing that input early would incorrectly allow this.
+# PHYSICAL-EARLY-CLOBBER-OVERFLOW: MOSImagRegAlloc: cannot prove backing assignability in physical_early_clobber_overflow, bb.0 for Imag16 backing: requires 15, 14 available locations
+# PHYSICAL-EARLY-CLOBBER-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+---
+name: physical_early_clobber_overflow
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:gpr = LDAbs 1000
+    early-clobber $rs1 = STStk %13, $rs0, 0
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    RTS
+...

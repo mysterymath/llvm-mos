@@ -1,0 +1,386 @@
+# RUN: split-file %s %t
+# RUN: llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/valid.mir -o %t/valid.out
+# RUN: FileCheck %s --input-file=%t/valid.out
+# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/imag8-overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=IMAG8-OVERFLOW
+# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/imag16-overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=IMAG16-OVERFLOW
+# RUN: llc -mtriple=mos -start-before=mos-imag-regalloc -stop-after=mos-imag-regalloc -verify-machineinstrs %t/debug.mir -o %t/debug.out
+# RUN: FileCheck %s --check-prefix=DEBUG --input-file=%t/debug.out
+
+# Check the pass in isolation: assignments and value origins are serialized from
+# VirtRegMap, while the instruction stream remains in SSA form.
+
+#--- valid.mir
+# Whole COPYs share value origins, but overlapping lifetimes need distinct
+# backing registers.
+---
+name: copy_origins
+tracksRegLiveness: true
+# CHECK-LABEL: name: copy_origins
+# CHECK: isSSA: true
+# CHECK: registers:
+# CHECK-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ], split-from: '%0',
+# CHECK-NEXT: assigned-phys: '$rc3' }
+# CHECK-NEXT: - { id: 2, class: ac, preferred-register: '', flags: [ ], split-from: '%0',
+# CHECK-NEXT: assigned-phys: '$rc4' }
+# CHECK: body: |
+body: |
+  bb.0:
+    %0:gpr = LDAbs 1000
+    %1:gpr = COPY %0
+    %2:ac = COPY %1
+    STAbs %0, 2000
+    STAbs %1, 2001
+    STAbs %2, 2002
+    RTS
+...
+
+# Killed uses release storage; dead definitions need no backing.
+---
+name: reuse
+tracksRegLiveness: true
+# CHECK-LABEL: name: reuse
+# CHECK: isSSA: true
+# CHECK: registers:
+# CHECK-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 2, class: gpr, preferred-register: '', flags: [ ] }
+# CHECK: body: |
+body: |
+  bb.0:
+    %0:gpr = LDAbs 1000
+    STAbs %0, 2000
+    %1:gpr = LDAbs 1001
+    STAbs %1, 2001
+    %2:gpr = LDAbs 1002
+    RTS
+...
+
+# An Imag16 must avoid the pair containing a live Imag8. A later Imag8 can use
+# its other byte.
+---
+name: pair_aliasing
+tracksRegLiveness: true
+# CHECK-LABEL: name: pair_aliasing
+# CHECK: isSSA: true
+# CHECK: registers:
+# CHECK-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 1, class: imag16, preferred-register: '', flags: [ ], assigned-phys: '$rs2' }
+# CHECK-NEXT: - { id: 2, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc3' }
+# CHECK: body: |
+body: |
+  bb.0:
+    %0:gpr = LDAbs 1000
+    %1:imag16 = COPY $rs0
+    %2:gpr = LDAbs 1001
+    STAbs %0, 2000
+    STAbs %2, 2001
+    $rs3 = COPY %1
+    RTS
+...
+
+# The early-clobber scratch cannot reuse either input; ordinary results can.
+---
+name: early_clobber
+tracksRegLiveness: true
+# CHECK-LABEL: name: early_clobber
+# CHECK: isSSA: true
+# CHECK: registers:
+# CHECK-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc3' }
+# CHECK-NEXT: - { id: 2, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc4' }
+# CHECK-NEXT: - { id: 3, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 4, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc3' }
+# CHECK: body: |
+body: |
+  bb.0:
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    early-clobber %2:gpr, %3:gpr, %4:gpr = DecMB %0(tied-def 1), %1(tied-def 2), implicit-def $c, implicit-def $v
+    STAbs %2, 2000
+    STAbs %3, 2001
+    STAbs %4, 2002
+    RTS
+...
+
+# A non-rematerializable flag needs an Imag8 backing register despite its one-
+# bit class.
+---
+name: flag_backing
+tracksRegLiveness: true
+# CHECK-LABEL: name: flag_backing
+# CHECK: isSSA: true
+# CHECK: registers:
+# CHECK-NEXT: - { id: 0, class: cc, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc3' }
+# CHECK: body: |
+body: |
+  bb.0:
+    liveins: $c
+    %0:cc = COPY $c
+    %1:gpr = LDAbs 1000
+    $c = COPY %0
+    STAbs %1, 2000
+    RTS implicit $c
+...
+
+# Sibling blocks inherit the parent state, not the previous sibling's kills or
+# definitions.
+---
+name: dominance
+tracksRegLiveness: true
+# CHECK-LABEL: name: dominance
+# CHECK: isSSA: true
+# CHECK: registers:
+# CHECK-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc3' }
+# CHECK-NEXT: - { id: 2, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc4' }
+# CHECK-NEXT: - { id: 3, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc3' }
+# CHECK-NEXT: - { id: 4, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc4' }
+# CHECK: body: |
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    %2:gpr = LDAbs 1002
+    CmpBrZero %bb.1, undef $z, 1, %2, implicit-def $c
+    JMP %bb.2
+  bb.1:
+    %3:gpr = LDAbs 1003
+    STAbs %3, 2003
+    STAbs %0, 2000
+    RTS
+  bb.2:
+    %4:gpr = LDAbs 1004
+    STAbs %4, 2004
+    STAbs %0, 2000
+    STAbs %1, 2001
+    RTS
+...
+
+# PHI operands are edge uses; the PHI result and killed loop input can reuse
+# backing storage.
+---
+name: loop_phi
+tracksRegLiveness: true
+# CHECK-LABEL: name: loop_phi
+# CHECK: isSSA: true
+# CHECK: registers:
+# CHECK-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 2, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK: body: |
+body: |
+  bb.0:
+    %0:gpr = LDAbs 1000
+    JMP %bb.1
+  bb.1:
+    successors: %bb.1, %bb.2
+    %1:gpr = PHI %0, %bb.0, %2, %bb.1
+    %2:gpr = IncMB %1(tied-def 0), implicit-def $c, implicit-def $v
+    CmpBrZero %bb.2, undef $z, 1, %2, implicit-def $c
+    JMP %bb.1
+  bb.2:
+    STAbs %2, 2000
+    RTS
+...
+
+# Twelve live bytes plus sixteen call-clobbered bytes exactly fit. The Imag16
+# result is defined only after the clobber demand has been released.
+---
+name: call_result
+tracksRegLiveness: true
+# CHECK-LABEL: name: call_result
+# CHECK: isSSA: true
+# CHECK: registers:
+# CHECK-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc3' }
+# CHECK-NEXT: - { id: 2, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc4' }
+# CHECK-NEXT: - { id: 3, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc5' }
+# CHECK-NEXT: - { id: 4, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc6' }
+# CHECK-NEXT: - { id: 5, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc7' }
+# CHECK-NEXT: - { id: 6, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc8' }
+# CHECK-NEXT: - { id: 7, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc9' }
+# CHECK-NEXT: - { id: 8, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc10' }
+# CHECK-NEXT: - { id: 9, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc11' }
+# CHECK-NEXT: - { id: 10, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc12' }
+# CHECK-NEXT: - { id: 11, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc13' }
+# CHECK-NEXT: - { id: 12, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc14' }
+# CHECK-NEXT: - { id: 13, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc15' }
+# CHECK: body: |
+body: |
+  bb.0:
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    %2:gpr = LDAbs 1002
+    %3:gpr = LDAbs 1003
+    %4:gpr = LDAbs 1004
+    %5:gpr = LDAbs 1005
+    %6:gpr = LDAbs 1006
+    %7:gpr = LDAbs 1007
+    %8:gpr = LDAbs 1008
+    %9:gpr = LDAbs 1009
+    %10:gpr = LDAbs 1010
+    %11:gpr = LDAbs 1011
+    JSR &callee, mos_csr, implicit-def $rs1
+    %12:gpr = COPY $rc2
+    %13:gpr = COPY $rc3
+    STAbs %0, 2000
+    STAbs %1, 2001
+    STAbs %2, 2002
+    STAbs %3, 2003
+    STAbs %4, 2004
+    STAbs %5, 2005
+    STAbs %6, 2006
+    STAbs %7, 2007
+    STAbs %8, 2008
+    STAbs %9, 2009
+    STAbs %10, 2010
+    STAbs %11, 2011
+    STAbs %12, 2012
+    STAbs %13, 2013
+    RTS
+...
+
+# Rematerialization propagates through whole COPYs.
+---
+name: no_backing
+tracksRegLiveness: true
+# CHECK-LABEL: name: no_backing
+# CHECK: isSSA: true
+# CHECK: registers:
+# CHECK-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [ ] }
+# CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ], split-from: '%0' }
+# CHECK-NEXT: - { id: 2, class: ac, preferred-register: '', flags: [ ], split-from: '%0' }
+# CHECK-NEXT: - { id: 3, class: cc, preferred-register: '', flags: [ ] }
+# CHECK: body: |
+body: |
+  bb.0:
+    %0:gpr = LDImm 42
+    %1:gpr = COPY %0
+    %2:ac = COPY %1
+    STAbs %2, 2000
+    %3:cc = LDImm1 1
+    $c = COPY %3
+    RTS implicit $c
+...
+
+#--- imag8-overflow.mir
+# Thirteen live bytes and sixteen call clobbers require spilling.
+# IMAG8-OVERFLOW: MOSImagRegAlloc: cannot prove backing assignability in imag8_overflow, bb.0 for Imag8 backing: requires 29, 28 available locations
+# IMAG8-OVERFLOW: JSR &callee
+# IMAG8-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+---
+name: imag8_overflow
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    %2:gpr = LDAbs 1002
+    %3:gpr = LDAbs 1003
+    %4:gpr = LDAbs 1004
+    %5:gpr = LDAbs 1005
+    %6:gpr = LDAbs 1006
+    %7:gpr = LDAbs 1007
+    %8:gpr = LDAbs 1008
+    %9:gpr = LDAbs 1009
+    %10:gpr = LDAbs 1010
+    %11:gpr = LDAbs 1011
+    %12:gpr = LDAbs 1012
+    JSR &callee, mos_csr
+    STAbs %0, 2000
+    STAbs %1, 2001
+    STAbs %2, 2002
+    STAbs %3, 2003
+    STAbs %4, 2004
+    STAbs %5, 2005
+    STAbs %6, 2006
+    STAbs %7, 2007
+    STAbs %8, 2008
+    STAbs %9, 2009
+    STAbs %10, 2010
+    STAbs %11, 2011
+    STAbs %12, 2012
+    RTS
+...
+
+#--- imag16-overflow.mir
+# Fourteen live bytes could occupy all fourteen pairs. The conservative bound
+# therefore rejects a new Imag16, even though the total byte demand fits.
+# IMAG16-OVERFLOW: MOSImagRegAlloc: cannot prove backing assignability in imag16_overflow, bb.0 for Imag16 backing: requires 15, 14 available locations
+# IMAG16-OVERFLOW: %14:imag16 = COPY $rs0
+# IMAG16-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+---
+name: imag16_overflow
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    %2:gpr = LDAbs 1002
+    %3:gpr = LDAbs 1003
+    %4:gpr = LDAbs 1004
+    %5:gpr = LDAbs 1005
+    %6:gpr = LDAbs 1006
+    %7:gpr = LDAbs 1007
+    %8:gpr = LDAbs 1008
+    %9:gpr = LDAbs 1009
+    %10:gpr = LDAbs 1010
+    %11:gpr = LDAbs 1011
+    %12:gpr = LDAbs 1012
+    %13:gpr = LDAbs 1013
+    %14:imag16 = COPY $rs0
+    STAbs %0, 2000
+    STAbs %1, 2001
+    STAbs %2, 2002
+    STAbs %3, 2003
+    STAbs %4, 2004
+    STAbs %5, 2005
+    STAbs %6, 2006
+    STAbs %7, 2007
+    STAbs %8, 2008
+    STAbs %9, 2009
+    STAbs %10, 2010
+    STAbs %11, 2011
+    STAbs %12, 2012
+    STAbs %13, 2013
+    $rs1 = COPY %14
+    RTS
+...
+
+#--- debug.mir
+# Debug-only uses need no backing; debug instructions do not affect pressure.
+# Also exercise the pass through the target pipeline rather than -run-pass.
+--- |
+  define void @debug_info() !dbg !3 {
+    ret void
+  }
+  !llvm.dbg.cu = !{!0}
+  !llvm.module.flags = !{!6}
+  !0 = distinct !DICompileUnit(language: DW_LANG_C99, file: !1, producer: "test", isOptimized: true, runtimeVersion: 0, emissionKind: FullDebug)
+  !1 = !DIFile(filename: "mos-imag-regalloc.c", directory: "")
+  !2 = !DISubroutineType(types: !{})
+  !3 = distinct !DISubprogram(name: "debug_info", scope: !1, file: !1, line: 7, type: !2, scopeLine: 7, spFlags: DISPFlagDefinition, unit: !0)
+  !4 = !DILocalVariable(name: "x", scope: !3, file: !1, line: 8, type: !5)
+  !5 = !DIBasicType(name: "byte", size: 8, encoding: DW_ATE_unsigned)
+  !6 = !{i32 2, !"Debug Info Version", i32 3}
+  !7 = !DILocation(line: 8, column: 1, scope: !3)
+...
+---
+name: debug_info
+tracksRegLiveness: true
+# DEBUG-LABEL: name: debug_info
+# DEBUG: registers:
+# DEBUG-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# DEBUG-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ] }
+# DEBUG: DBG_VALUE %1, $noreg,
+body: |
+  bb.0:
+    %0:gpr = LDAbs 1000, debug-location !7
+    %1:gpr = LDAbs 1001, debug-location !7
+    DBG_VALUE %1, $noreg, !4, !DIExpression(), debug-location !7
+    STAbs %0, 2000, debug-location !7
+    RTS
+...

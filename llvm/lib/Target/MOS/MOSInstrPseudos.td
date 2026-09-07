@@ -37,14 +37,9 @@ class MOSPseudo : Instruction {
 // registers before and after the pseudo.
 //===---------------------------------------------------------------------===//
 
-// Parallel (simultaneous) version of copy: the destinations are written from
-// the sources all at once, so there is no order among the moves. Emitted by the
-// register allocator (MOSRegAlloc) to represent boundary copy blocks, it
-// survives as a post-RA pseudo and is lowered to individual moves by
-// ExpandPostRAPseudos (MOSInstrInfo::expandPostRAPseudo). Operand layout is all
-// defs followed by all uses, with def[i] paired to use[i]. The allocator biases
-// assignment so the moves never form a permutation cycle, so the expansion can
-// sequentialize them without a temporary.
+// Parallel copy: all sources are read before any destination is written.
+// Operands are all defs followed by all uses, with def[i] paired to use[i].
+// ExpandPostRAPseudos requires an acyclic physical move set.
 def PCOPY : MOSPseudo {
   dag OutOperandList = (outs variable_ops);
   dag InOperandList = (ins variable_ops);

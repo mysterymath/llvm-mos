@@ -28,6 +28,7 @@ add_llvm_target(MOSCodeGen
   MOSCopyOpt.cpp
   MOSFrameLowering.cpp
   MOSISelLowering.cpp
+  MOSImagRegAlloc.cpp
   MOSIndexIV.cpp
   MOSInlineAsmLowering.cpp
   MOSInsertCopies.cpp
@@ -81,6 +82,14 @@ add_llvm_target(MOSCodeGen
   MOS
 )
 
+set_property(SOURCE MOSImagRegAlloc.cpp APPEND PROPERTY COMPILE_OPTIONS
+  -fprofile-instr-generate
+  -fcoverage-mapping
+)
+
+set_property(TARGET LLVMMOSCodeGen APPEND PROPERTY INTERFACE_LINK_OPTIONS
+  -fprofile-instr-generate
+)
 
 add_subdirectory(AsmParser)
 add_subdirectory(Disassembler)
