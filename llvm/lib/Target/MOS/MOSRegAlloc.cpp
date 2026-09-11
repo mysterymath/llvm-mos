@@ -9,8 +9,10 @@
 /// \file
 /// Realize SSA instructions by repairing their operand placement constraints.
 /// MOSImagRegAlloc supplies backing registers through VirtRegMap. A block-local
-/// dynamic program tracks valid copies in hardware and imaginary registers,
-/// charging for the instructions and transfers needed for each operation.
+/// dynamic program tracks hardware contents and backing validity, charging for
+/// the instructions and transfers needed for each operation. A retained state
+/// guarantees backing copies for live values absent from hardware. Instruction
+/// repairs may use other imaginary locations temporarily.
 /// Value numbers derived from split ancestry and REG_SEQUENCE identify equal
 /// contents independently of SSA live ranges and their backing assignments.
 /// Ordinary eviction uses a live range's backing register; a constrained access
@@ -19,12 +21,12 @@
 /// contents that can be rematerialized.
 ///
 /// This initial implementation retains the input schedule and supports the
-/// Imag8/Imag16 operations used by sieve. Equal states retain only their cheapest
-/// path; there is no beam pruning. Transfer construction chooses scratch locally,
-/// so this is not an exhaustive search of instruction sequences. Actual spills,
-/// nonconstant flag materialization, and repairs of pinned imaginary live ranges
-/// across block boundaries are not implemented. Unsupported preservation is
-/// diagnosed.
+/// Imag8/Imag16 operations used by sieve. Equal states retain only their
+/// cheapest path; there is no beam pruning. Transfer construction chooses
+/// scratch locally, so this is not an exhaustive search of instruction
+/// sequences. Actual spills, nonconstant flag materialization, and repairs of
+/// pinned imaginary live ranges across block boundaries are not implemented.
+/// Unsupported preservation is diagnosed.
 ///
 //===----------------------------------------------------------------------===//
 
@@ -51,6 +53,7 @@
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
+#include <array>
 #include <map>
 #include <memory>
 #include <utility>
@@ -93,20 +96,99 @@ struct Transfer {
   const MachineInstr *Rematerialization = nullptr;
 };
 
-// Contents is indexed by RepairAllocator::Locations, not by physical register
-// number. Multiple entries may contain the same value number; writes affect
-// only overlapping bytes, so Imag8/Imag16 aliases need no separate validity flags.
-struct PlacementState {
+constexpr std::array<MCPhysReg, 5> HardwareRegs = {MOS::A, MOS::X, MOS::Y,
+                                                   MOS::C, MOS::V};
+
+// Explicit contents while realizing an instruction. Locations begin with
+// HardwareRegs, followed by individual imaginary bytes. Imag16 accesses use
+// their two byte indices, so overwrites invalidate exactly the affected lanes.
+class RegisterContents {
+public:
+  explicit RegisterContents(unsigned NumLocations = 0)
+      : Contents(NumLocations) {}
+
+  unsigned size() const { return Contents.size(); }
+  ValueNumber read(unsigned L) const { return Contents[L]; }
+  void define(unsigned L, ValueNumber V) { Contents[L] = V; }
+  void clobber(unsigned L) { define(L, 0); }
+  void copy(unsigned D, unsigned S) { define(D, read(S)); }
+  bool hasCopy(ValueNumber V) const {
+    return V && llvm::is_contained(Contents, V);
+  }
+  bool hasHardwareCopy(ValueNumber V) const {
+    return V && llvm::is_contained(
+                    ArrayRef(Contents).take_front(HardwareRegs.size()), V);
+  }
+
+private:
   SmallVector<ValueNumber, 40> Contents;
 };
 
-// A proposed operation and its preparation, starting from an incoming candidate.
+// A retained placement stores hardware contents and backing validity only.
+// Backing contents themselves are determined by the live SSA names at this
+// point. Every non-rematerializable live lane must have a valid backing copy
+// whenever its value is absent from hardware. Equivalent names can have
+// distinct backing registers, so validity belongs to locations rather than
+// value numbers. Copies in other imaginary locations are temporary repair
+// state. Comparisons and expansion use the same program point's backing map.
+class PlacementState {
+public:
+  PlacementState(const RegisterContents &Registers,
+                 const RegisterContents &Backings);
+  RegisterContents expand(const RegisterContents &Backings) const;
+
+  bool operator<(const PlacementState &Other) const {
+    if (Hardware != Other.Hardware)
+      return Hardware < Other.Hardware;
+    auto A = ValidBackings.getData();
+    auto B = Other.ValidBackings.getData();
+    return std::lexicographical_compare(A.begin(), A.end(), B.begin(), B.end());
+  }
+
+private:
+  std::array<ValueNumber, HardwareRegs.size()> Hardware = {};
+  BitVector ValidBackings;
+};
+
+PlacementState::PlacementState(const RegisterContents &Registers,
+                               const RegisterContents &Backings)
+    : ValidBackings(Backings.size() - HardwareRegs.size()) {
+  assert(Registers.size() == Backings.size());
+  for (unsigned L = 0; L < Hardware.size(); ++L)
+    Hardware[L] = Registers.read(L);
+  for (unsigned L = Hardware.size(); L < Backings.size(); ++L) {
+    ValueNumber V = Backings.read(L);
+    if (!V)
+      continue;
+    bool Valid = Registers.read(L) == V;
+    assert((Valid || Registers.hasHardwareCopy(V)) &&
+           "live value must be in hardware or its backing register");
+    ValidBackings[L - Hardware.size()] = Valid;
+  }
+}
+
+RegisterContents
+PlacementState::expand(const RegisterContents &Backings) const {
+  assert(ValidBackings.size() + Hardware.size() == Backings.size());
+  RegisterContents Registers = Backings;
+  for (unsigned L = 0; L < Hardware.size(); ++L)
+    Registers.define(L, Hardware[L]);
+  for (unsigned L = Hardware.size(); L < Registers.size(); ++L)
+    if (!ValidBackings[L - Hardware.size()])
+      Registers.clobber(L);
+  return Registers;
+}
+
+// A proposed operation and its preparation, starting from an incoming
+// candidate.
 struct RepairPlan {
-  PlacementState State;
+  RegisterContents State;
   SmallVector<Transfer> Transfers;
   SmallVector<MCPhysReg> Operands;
   // Estimated encoded bytes for the path prefix, repairs, and operation.
   unsigned Cost = 0;
+  // Restore the placement invariant after executing the operation.
+  SmallVector<Transfer> AfterTransfers = {};
 };
 
 // Paths share their prefixes. MIR is not mutated until an entire block has a
@@ -116,6 +198,7 @@ struct Trace {
   MachineInstr *MI = nullptr; // Null denotes the block-boundary restoration.
   SmallVector<Transfer> Transfers;
   SmallVector<MCPhysReg> Operands;
+  SmallVector<Transfer> AfterTransfers = {};
 };
 
 // A retained placement and the path that reaches it.
@@ -171,8 +254,12 @@ private:
   ValueNumber numberValue(Register R, unsigned Lane);
   BitVector fixedLocations(const LivePhysRegs &LiveRegs) const;
 
-  void enumeratePlans(MachineInstr &MI, const Candidate &C,
+  void enumeratePlans(MachineInstr &MI, const RepairPlan &C,
                       function_ref<void(RepairPlan)> Accept);
+  RegisterContents backingContents(const SparseBitVector<> &LiveRegs) const;
+  bool finishPlacement(RepairPlan &P, const RegisterContents &Backings,
+                       const SparseBitVector<> &LiveRegs, BitVector Locked,
+                       bool CanInsert);
   bool restore(RepairPlan &P, const SparseBitVector<> &LiveRegs,
                const SparseBitVector<> &Preserve, BitVector Locked);
 
@@ -194,10 +281,10 @@ private:
                            ArrayRef<MCPhysReg> Operands) const;
 
   SmallVector<MCPhysReg> destinations(Register R) const;
-  SmallVector<MCPhysReg> copies(Register R, const PlacementState &S) const;
-  void forgetDeadValues(PlacementState &S,
+  SmallVector<MCPhysReg> copies(Register R, const RegisterContents &S) const;
+  void forgetDeadValues(RegisterContents &S,
                         const SparseBitVector<> &LiveRegs) const;
-  bool hasLiveValues(const PlacementState &S,
+  bool hasLiveValues(const RegisterContents &S,
                      const SparseBitVector<> &LiveRegs) const;
   bool isLiveValue(ValueNumber V, const SparseBitVector<> &LiveRegs) const;
   bool sameValue(Register A, Register B) const;
@@ -214,9 +301,9 @@ private:
   unsigned backingIndex(Register R, unsigned Lane = 0) const;
   bool isGPR(unsigned L) const;
   bool isImaginary(unsigned L) const;
-  bool hasCopy(ValueNumber V, const PlacementState &State) const;
   const MachineInstr *rematerialization(ValueNumber V) const;
-  [[noreturn]] void fail(const Twine &Reason, const MachineInstr *MI = nullptr);
+  [[noreturn]] void fail(const Twine &Reason,
+                         const MachineInstr *MI = nullptr) const;
 
   MachineFunction &MF;
   MachineRegisterInfo &MRI;
@@ -239,15 +326,17 @@ private:
 };
 
 // One DP step retains the cheapest path for each distinct placement. Keep the
-// candidate vector and its index together so replacement cannot desynchronize them.
+// candidate vector and its index together so replacement cannot desynchronize
+// them.
 class PlacementFrontier {
 public:
-  void insert(const Candidate &Previous, MachineInstr *MI, RepairPlan Plan);
+  void insert(const Candidate &Previous, MachineInstr *MI, RepairPlan Plan,
+              PlacementState State);
   SmallVector<Candidate> takeCandidates();
 
 private:
   SmallVector<Candidate> Candidates;
-  std::map<SmallVector<ValueNumber, 40>, unsigned> StateIndices;
+  std::map<PlacementState, unsigned> StateIndices;
 };
 
 // Search state lasts for one block. A null instruction advances through the
@@ -262,6 +351,8 @@ private:
   void advance(MachineInstr *MI);
   bool restoreLiveOuts(RepairPlan &Plan);
 
+  RegisterContents Backings;
+
   RepairAllocator &Allocator;
   MachineBasicBlock &MBB;
   const BlockPlan &Block;
@@ -273,7 +364,7 @@ private:
 class RepairAllocator::OperandSearch {
 public:
   OperandSearch(RepairAllocator &Allocator, MachineInstr &MI,
-                const Candidate &Incoming,
+                const RepairPlan &Incoming,
                 function_ref<void(RepairPlan)> Accept);
   void run();
 
@@ -288,7 +379,7 @@ private:
 
   RepairAllocator &Allocator;
   MachineInstr &MI;
-  const Candidate &Incoming;
+  const RepairPlan &Incoming;
   function_ref<void(RepairPlan)> Accept;
   SmallVector<SmallVector<MCPhysReg>> Domains;
   SmallVector<MCPhysReg> Assignment;
@@ -362,7 +453,8 @@ void RepairAllocator::run() {
   collectConstraints();
   analyzeLiveness();
   // Keep SSA definitions intact until every block and edge has been planned;
-  // rematerialization recipes and register-class queries refer to the original MIR.
+  // rematerialization recipes and register-class queries refer to the original
+  // MIR.
   for (MachineBasicBlock &MBB : MF)
     planBlock(MBB);
   emitEdges();
@@ -407,7 +499,7 @@ ValueNumber RepairAllocator::numberValue(Register R, unsigned Lane) {
 }
 
 void RepairAllocator::collectLocations() {
-  for (MCPhysReg R : {MOS::A, MOS::X, MOS::Y, MOS::C, MOS::V})
+  for (MCPhysReg R : HardwareRegs)
     addLocation(R);
   for (MCPhysReg R : RCI.getOrder(&MOS::Imag8RegClass))
     addLocation(R);
@@ -482,15 +574,15 @@ void RepairAllocator::planBlock(MachineBasicBlock &MBB) {
 }
 
 void PlacementFrontier::insert(const Candidate &Previous, MachineInstr *MI,
-                               RepairPlan Plan) {
-  auto [I, Inserted] =
-      StateIndices.emplace(Plan.State.Contents, Candidates.size());
+                               RepairPlan Plan, PlacementState State) {
+  auto [I, Inserted] = StateIndices.emplace(State, Candidates.size());
   if (!Inserted && Candidates[I->second].Cost <= Plan.Cost)
     return;
-  Candidate Next{std::move(Plan.State), Plan.Cost,
-                 std::make_shared<Trace>(Trace{Previous.Path, MI,
-                                               std::move(Plan.Transfers),
-                                               std::move(Plan.Operands)})};
+  Candidate Next{
+      std::move(State), Plan.Cost,
+      std::make_shared<Trace>(
+          Trace{Previous.Path, MI, std::move(Plan.Transfers),
+                std::move(Plan.Operands), std::move(Plan.AfterTransfers)})};
   if (Inserted)
     Candidates.push_back(std::move(Next));
   else
@@ -526,8 +618,7 @@ std::shared_ptr<const Trace> RepairAllocator::BlockSearch::run() {
 }
 
 void RepairAllocator::BlockSearch::initialize() {
-  Candidate Entry;
-  Entry.State.Contents.resize(Allocator.Locations.size());
+  Backings = Allocator.backingContents(Block.LiveIns);
   for (unsigned I : Block.LiveIns) {
     Register R = Register::index2VirtReg(I);
     for (unsigned Lane = 0; Lane < Allocator.numLanes(R); ++Lane) {
@@ -541,29 +632,39 @@ void RepairAllocator::BlockSearch::initialize() {
           Allocator.Liveness.find(Block.Instructions.front())
               ->second.FixedLiveIns[Backing])
         Allocator.fail("pinned physical live-in overlaps a backing register");
-      Entry.State.Contents[Backing] = V;
     }
   }
+  Candidate Entry{PlacementState(Backings, Backings), 0, {}};
   Candidates.push_back(std::move(Entry));
 }
 
 void RepairAllocator::BlockSearch::advance(MachineInstr *MI) {
+  const InstructionLiveness *L =
+      MI ? &Allocator.Liveness.find(MI)->second : nullptr;
+  RegisterContents NextBackings =
+      MI ? Allocator.backingContents(L->LiveOuts) : Backings;
   PlacementFrontier Next;
   for (const Candidate &C : Candidates) {
     if (MI) {
-      Allocator.enumeratePlans(*MI, C, [&](RepairPlan Plan) {
-        Allocator.forgetDeadValues(
-            Plan.State, Allocator.Liveness.find(MI)->second.LiveOuts);
-        Next.insert(C, MI, std::move(Plan));
+      RepairPlan Incoming{C.State.expand(Backings), {}, {}, C.Cost};
+      Allocator.enumeratePlans(*MI, Incoming, [&](RepairPlan Plan) {
+        if (!Allocator.finishPlacement(Plan, NextBackings, L->LiveOuts,
+                                       L->FixedLiveOuts, !MI->isTerminator()))
+          return;
+        PlacementState State(Plan.State, NextBackings);
+        Next.insert(C, MI, std::move(Plan), std::move(State));
       });
     } else {
-      RepairPlan Plan{C.State, {}, {}, C.Cost};
+      RepairPlan Plan{C.State.expand(Backings), {}, {}, C.Cost};
       // Keep terminator inputs available at the restoration point, including
       // values which are not live out of the block.
-      if (restoreLiveOuts(Plan))
-        Next.insert(C, nullptr, std::move(Plan));
+      if (restoreLiveOuts(Plan)) {
+        PlacementState State(Plan.State, Backings);
+        Next.insert(C, nullptr, std::move(Plan), std::move(State));
+      }
     }
   }
+  Backings = std::move(NextBackings);
   Candidates = Next.takeCandidates();
   if (Candidates.empty())
     Allocator.fail(MI ? "no supported placement continuation"
@@ -581,7 +682,7 @@ bool RepairAllocator::BlockSearch::restoreLiveOuts(RepairPlan &Plan) {
   const BitVector &Locked = L ? L->FixedLiveIns : Block.FixedLiveOuts;
   const SparseBitVector<> &Preserve = L ? L->LiveIns : Block.LiveOuts;
   return Allocator.restore(Plan, Block.LiveOuts, Preserve, Locked) &&
-         Allocator.hasLiveValues(Plan.State, Preserve);
+         Allocator.finishPlacement(Plan, Backings, Preserve, Locked, true);
 }
 
 void RepairAllocator::emitEdges() {
@@ -612,13 +713,13 @@ SmallVector<RepairAllocator::PHIEdge> RepairAllocator::collectPHIEdges() {
 
 void RepairAllocator::emitPHIEdge(const PHIEdge &E) {
   RepairPlan P;
-  P.State.Contents.resize(Locations.size());
+  P.State = RegisterContents(Locations.size());
   const BlockPlan &B = Blocks[E.From];
   for (int I : B.LiveOuts) {
     Register R = Register::index2VirtReg(I);
     for (unsigned Lane = 0; Lane < numLanes(R); ++Lane)
       if (!rematerialization(value(R, Lane)))
-        P.State.Contents[backingIndex(R, Lane)] = value(R, Lane);
+        P.State.define(backingIndex(R, Lane), value(R, Lane));
   }
   BitVector Locked = B.FixedLiveOuts;
   // Protect completed destinations. Evacuation preserves sources of cycles
@@ -651,6 +752,8 @@ void RepairAllocator::emitSolution(MachineBasicBlock &MBB, const Trace *Last) {
     auto At = T->MI ? T->MI->getIterator() : MBB.getFirstTerminator();
     emitTransfers(MBB, At, T->MI ? T->MI->getDebugLoc() : DebugLoc(),
                   T->Transfers);
+    emitTransfers(MBB, T->MI ? std::next(At) : At,
+                  T->MI ? T->MI->getDebugLoc() : DebugLoc(), T->AfterTransfers);
     if (!T->MI || T->Operands.empty() || T->MI->isCopy() ||
         T->MI->getOpcode() == TargetOpcode::REG_SEQUENCE)
       continue;
@@ -694,14 +797,14 @@ void RepairAllocator::recomputePhysicalLiveness() {
     recomputeLivenessFlags(MBB);
 }
 
-void RepairAllocator::enumeratePlans(MachineInstr &MI, const Candidate &C,
+void RepairAllocator::enumeratePlans(MachineInstr &MI, const RepairPlan &C,
                                      function_ref<void(RepairPlan)> Accept) {
   if (MI.isPHI()) {
     RepairPlan P{C.State, {}, {}, C.Cost};
     Register R = MI.getOperand(0).getReg();
     if (!MRI.use_nodbg_empty(R))
       for (unsigned Lane = 0; Lane < numLanes(R); ++Lane)
-        P.State.Contents[backingIndex(R, Lane)] = value(R, Lane);
+        P.State.define(backingIndex(R, Lane), value(R, Lane));
     Accept(std::move(P));
     return;
   }
@@ -719,7 +822,7 @@ void RepairAllocator::enumeratePlans(MachineInstr &MI, const Candidate &C,
 }
 
 RepairAllocator::OperandSearch::OperandSearch(
-    RepairAllocator &Allocator, MachineInstr &MI, const Candidate &Incoming,
+    RepairAllocator &Allocator, MachineInstr &MI, const RepairPlan &Incoming,
     function_ref<void(RepairPlan)> Accept)
     : Allocator(Allocator), MI(MI), Incoming(Incoming), Accept(Accept),
       Domains(MI.getNumOperands()), Assignment(MI.getNumOperands()) {}
@@ -890,7 +993,7 @@ bool RepairAllocator::InstructionRepair::repairCopy() {
       if (!Allocator.evacuate(Src[I], Plan, Liveness.LiveIns, Locked,
                               BitVector(Allocator.Locations.size())))
         return false;
-      Plan.State.Contents[Src[I]] = Allocator.value(D, I);
+      Plan.State.define(Src[I], Allocator.value(D, I));
     }
     for (unsigned I = 0; I < Dst.size(); ++I)
       if (!Allocator.ensure(Allocator.value(D, I), Dst[I], Plan,
@@ -973,7 +1076,7 @@ bool RepairAllocator::InstructionRepair::applyInstruction() {
     if (MO.isRegMask())
       for (unsigned L = 0; L < Allocator.Locations.size(); ++L)
         if (MO.clobbersPhysReg(Allocator.Locations[L]))
-          Plan.State.Contents[L] = 0;
+          Plan.State.clobber(L);
   for (const MachineOperand &MO : MI.all_defs())
     if (!MO.isEarlyClobber() && !define(MO))
       return false;
@@ -987,7 +1090,7 @@ bool RepairAllocator::InstructionRepair::define(const MachineOperand &MO) {
     if (MO.getReg().isPhysical()) {
       // Fixed liveness protects this result; a later COPY assigns its value
       // number when it captures the physical contents into an SSA register.
-      Plan.State.Contents[L] = 0;
+      Plan.State.clobber(L);
       continue;
     }
     bool TiedPhysicalUse =
@@ -997,8 +1100,82 @@ bool RepairAllocator::InstructionRepair::define(const MachineOperand &MO) {
     if (Liveness.FixedLiveOuts[L] ||
         (MO.isEarlyClobber() && Liveness.FixedLiveIns[L] && !TiedPhysicalUse))
       return false;
-    Plan.State.Contents[L] = Allocator.value(MO.getReg(), Lane);
+    Plan.State.define(L, Allocator.value(MO.getReg(), Lane));
   }
+  return true;
+}
+
+RegisterContents
+RepairAllocator::backingContents(const SparseBitVector<> &LiveRegs) const {
+  RegisterContents Backings(Locations.size());
+  for (unsigned I : LiveRegs) {
+    Register R = Register::index2VirtReg(I);
+    for (unsigned Lane = 0; Lane < numLanes(R); ++Lane) {
+      ValueNumber V = value(R, Lane);
+      if (rematerialization(V))
+        continue;
+      unsigned L = backingIndex(R, Lane);
+      if (L == ~0u)
+        fail("live value has no backing register");
+      assert((!Backings.read(L) || Backings.read(L) == V) &&
+             "backing assignments interfere");
+      Backings.define(L, V);
+    }
+  }
+  return Backings;
+}
+
+bool RepairAllocator::finishPlacement(RepairPlan &P,
+                                      const RegisterContents &Backings,
+                                      const SparseBitVector<> &LiveRegs,
+                                      BitVector Locked, bool CanInsert) {
+  if (!hasLiveValues(P.State, LiveRegs))
+    return false;
+  unsigned NumPreparationTransfers = P.Transfers.size();
+  // A repair can displace a value into arbitrary imaginary scratch. Before
+  // retaining the result, give every live lane either its backing copy or a
+  // hardware copy. Protect established backing copies while doing so.
+  while (true) {
+    unsigned Missing = ~0u;
+    for (unsigned L = HardwareRegs.size(); L < Backings.size(); ++L) {
+      ValueNumber V = Backings.read(L);
+      if (!V)
+        continue;
+      if (P.State.read(L) == V)
+        Locked.set(L);
+      else if (!P.State.hasHardwareCopy(V))
+        Missing = L;
+    }
+    if (Missing == ~0u)
+      break;
+    // In particular, don't insert instructions after a branch to repair its
+    // outgoing state. Its inputs were restored before the terminators.
+    if (!CanInsert)
+      return false;
+    ValueNumber V = Backings.read(Missing);
+    // Either destination establishes the invariant. Keeping a hardware copy
+    // can avoid an unnecessary store, and also works when backing is pinned.
+    unsigned BestLocation = ~0u;
+    RepairPlan Best = P;
+    if (ensure(V, Missing, Best, LiveRegs, Locked))
+      BestLocation = Missing;
+    for (unsigned L = 0; L < HardwareRegs.size(); ++L) {
+      RepairPlan Trial = P;
+      if (ensure(V, L, Trial, LiveRegs, Locked) &&
+          (BestLocation == ~0u || Trial.Cost < Best.Cost)) {
+        BestLocation = L;
+        Best = std::move(Trial);
+      }
+    }
+    if (BestLocation == ~0u)
+      return false;
+    P = std::move(Best);
+    Locked.set(BestLocation);
+  }
+  for (unsigned I = NumPreparationTransfers; I < P.Transfers.size(); ++I)
+    P.AfterTransfers.push_back(std::move(P.Transfers[I]));
+  P.Transfers.resize(NumPreparationTransfers);
+  forgetDeadValues(P.State, LiveRegs);
   return true;
 }
 
@@ -1023,7 +1200,7 @@ bool RepairAllocator::restore(RepairPlan &P, const SparseBitVector<> &LiveRegs,
 bool RepairAllocator::ensure(ValueNumber V, unsigned L, RepairPlan &P,
                              const SparseBitVector<> &LiveRegs,
                              BitVector Locked, const BitVector *Forbidden) {
-  if (P.State.Contents[L] == V)
+  if (P.State.read(L) == V)
     return true;
   if (Locked[L])
     return false;
@@ -1046,7 +1223,7 @@ bool RepairAllocator::ensure(ValueNumber V, unsigned L, RepairPlan &P,
   }
   Locked.set(L);
   for (unsigned S = 0; S < Locations.size(); ++S) {
-    if (P.State.Contents[S] != V)
+    if (P.State.read(S) != V)
       continue;
     RepairPlan Trial = P;
     if (transfer(L, S, Trial))
@@ -1055,7 +1232,7 @@ bool RepairAllocator::ensure(ValueNumber V, unsigned L, RepairPlan &P,
 
   // A byte of a rematerializable Imag16 may be wanted in hardware. Materialize
   // the Imag16 in imaginary storage first, then use the ordinary transfer path.
-  if (!hasCopy(V, P.State) && numLanes(sourceReg(V)) == 2 &&
+  if (!P.State.hasCopy(V) && numLanes(sourceReg(V)) == 2 &&
       rematerialization(V)) {
     unsigned Lane = (V - 1) % 2;
     for (MCPhysReg Imag16 : destinations(sourceReg(V))) {
@@ -1090,7 +1267,8 @@ bool RepairAllocator::ensure(ValueNumber V, unsigned L, RepairPlan &P,
 }
 
 // Rematerialize the complete definition, even when only one byte was requested.
-// The other byte is a clobber during preparation and an available copy afterward.
+// The other byte is a clobber during preparation and an available copy
+// afterward.
 bool RepairAllocator::rematerialize(ValueNumber V, unsigned L, RepairPlan &P,
                                     const SparseBitVector<> &LiveRegs,
                                     BitVector Locked,
@@ -1130,22 +1308,23 @@ bool RepairAllocator::rematerialize(ValueNumber V, unsigned L, RepairPlan &P,
   P.Transfers.push_back({0, Dst, 0, Def});
   P.Cost += instructionCost(*Def, Ops);
   for (unsigned Lane = 0; Lane < U.size(); ++Lane)
-    P.State.Contents[U[Lane]] = value(Source, Lane);
+    P.State.define(U[Lane], value(Source, Lane));
   return true;
 }
 
 bool RepairAllocator::evacuate(unsigned L, RepairPlan &P,
                                const SparseBitVector<> &LiveRegs,
                                BitVector Locked, const BitVector &Forbidden) {
-  ValueNumber A = P.State.Contents[L];
+  ValueNumber A = P.State.read(L);
   if (!isLiveValue(A, LiveRegs) || rematerialization(A))
     return true;
   for (unsigned I = 0; I < Locations.size(); ++I)
-    if (I != L && !Forbidden[I] && P.State.Contents[I] == A)
+    if (I != L && !Forbidden[I] && P.State.read(I) == A)
       return true;
   Locked.set(L);
   // Any live alias's backing register can preserve these contents. Do not use
-  // the ultimate source's backing assignment after its own live range has ended.
+  // the ultimate source's backing assignment after its own live range has
+  // ended.
   for (int I : LiveRegs) {
     Register R = Register::index2VirtReg(I);
     for (unsigned Lane = 0; Lane < numLanes(R); ++Lane) {
@@ -1165,7 +1344,7 @@ bool RepairAllocator::evacuate(unsigned L, RepairPlan &P,
   // destination. Choose empty storage on demand; Imag16 lanes can be evacuated
   // separately.
   for (int T : ScratchLocations.set_bits()) {
-    if (Locked[T] || Forbidden[T] || isLiveValue(P.State.Contents[T], LiveRegs))
+    if (Locked[T] || Forbidden[T] || isLiveValue(P.State.read(T), LiveRegs))
       continue;
     RepairPlan Trial = P;
     if (ensure(A, T, Trial, LiveRegs, Locked, &Forbidden)) {
@@ -1194,7 +1373,7 @@ bool RepairAllocator::transfer(unsigned D, unsigned S, RepairPlan &P) {
     return false;
   P.Transfers.push_back({Opcode, Dst, Src});
   P.Cost += Cost;
-  P.State.Contents[D] = P.State.Contents[S];
+  P.State.copy(D, S);
   return true;
 }
 
@@ -1292,14 +1471,14 @@ SmallVector<MCPhysReg> RepairAllocator::destinations(Register R) const {
   return Result;
 }
 
-SmallVector<MCPhysReg> RepairAllocator::copies(Register R,
-                                               const PlacementState &S) const {
+SmallVector<MCPhysReg>
+RepairAllocator::copies(Register R, const RegisterContents &S) const {
   SmallVector<MCPhysReg> Result;
   ValueNumber V = value(R);
   if (!V)
     return Result;
   for (unsigned L = 0; L < Locations.size(); ++L) {
-    if (S.Contents[L] != V)
+    if (S.read(L) != V)
       continue;
     if (numLanes(R) == 1) {
       Result.push_back(Locations[L]);
@@ -1310,25 +1489,25 @@ SmallVector<MCPhysReg> RepairAllocator::copies(Register R,
     if (!Imag16)
       continue;
     auto Hi = LocationIndices.find(TRI.getSubReg(Imag16, MOS::subhi));
-    if (Hi != LocationIndices.end() && S.Contents[Hi->second] == value(R, 1))
+    if (Hi != LocationIndices.end() && S.read(Hi->second) == value(R, 1))
       Result.push_back(Imag16);
   }
   return Result;
 }
 
 void RepairAllocator::forgetDeadValues(
-    PlacementState &S, const SparseBitVector<> &LiveRegs) const {
-  for (ValueNumber &A : S.Contents)
-    if (!isLiveValue(A, LiveRegs))
-      A = 0;
+    RegisterContents &S, const SparseBitVector<> &LiveRegs) const {
+  for (unsigned L = 0; L < S.size(); ++L)
+    if (!isLiveValue(S.read(L), LiveRegs))
+      S.clobber(L);
 }
 
-bool RepairAllocator::hasLiveValues(const PlacementState &S,
+bool RepairAllocator::hasLiveValues(const RegisterContents &S,
                                     const SparseBitVector<> &LiveRegs) const {
   for (int I : LiveRegs) {
     Register R = Register::index2VirtReg(I);
     for (unsigned Lane = 0; Lane < numLanes(R); ++Lane)
-      if (!rematerialization(value(R, Lane)) && !hasCopy(value(R, Lane), S))
+      if (!rematerialization(value(R, Lane)) && !S.hasCopy(value(R, Lane)))
         return false;
   }
   return true;
@@ -1427,11 +1606,6 @@ bool RepairAllocator::isImaginary(unsigned L) const {
   return MOS::Imag8RegClass.contains(Locations[L]);
 }
 
-bool RepairAllocator::hasCopy(ValueNumber V,
-                              const PlacementState &State) const {
-  return V && llvm::is_contained(State.Contents, V);
-}
-
 const MachineInstr *RepairAllocator::rematerialization(ValueNumber V) const {
   if (!V)
     return nullptr;
@@ -1439,7 +1613,7 @@ const MachineInstr *RepairAllocator::rematerialization(ValueNumber V) const {
   return Def && TII.isTriviallyReMaterializable(*Def) ? Def : nullptr;
 }
 
-void RepairAllocator::fail(const Twine &Reason, const MachineInstr *MI) {
+void RepairAllocator::fail(const Twine &Reason, const MachineInstr *MI) const {
   errs() << "MOSRegAlloc: " << Reason << " in " << MF.getName() << '\n';
   if (MI)
     errs() << *MI;
