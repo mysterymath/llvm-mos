@@ -38,7 +38,13 @@ class MOSPseudo : Instruction {
 //===---------------------------------------------------------------------===//
 
 // Parallel copy: all sources are read before any destination is written.
-// Operands are all defs followed by all uses, with def[i] paired to use[i].
+// Explicit operands are all defs followed by all sources, paired by index.
+// Before allocation, exit copies inserted by MOSConventionalSSA additionally
+// have one implicit reservation use per destination, in the same order. Each
+// destination inherits that reservation's backing location, while its contents
+// come from the explicit source. PHIs preserve this backing-location identity;
+// ordinary PCOPYs, including entry copies, do not. The allocator consumes these
+// reservation operands before physical copy expansion.
 // ExpandPostRAPseudos requires an acyclic physical move set.
 def PCOPY : MOSPseudo {
   dag OutOperandList = (outs variable_ops);

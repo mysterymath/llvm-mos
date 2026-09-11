@@ -11,17 +11,18 @@ body: |
   ; CHECK: bb.0:
   ; CHECK-NEXT:   successors: %bb.1(0x80000000)
   ; CHECK-NEXT: {{  $}}
+  ; CHECK-NEXT:   [[DEF:%[0-9]+]]:gpr = IMPLICIT_DEF
   ; CHECK-NEXT:   [[LDAbs:%[0-9]+]]:gpr = LDAbs 1000
-  ; CHECK-NEXT:   [[PCOPY:%[0-9]+]]:gpr = PCOPY [[LDAbs]]
+  ; CHECK-NEXT:   [[PCOPY:%[0-9]+]]:gpr = PCOPY [[LDAbs]], implicit [[DEF]]
   ; CHECK-NEXT:   JMP %bb.1
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT: bb.1:
   ; CHECK-NEXT:   successors: %bb.1(0x40000000), %bb.2(0x40000000)
   ; CHECK-NEXT: {{  $}}
-  ; CHECK-NEXT:   [[PHI:%[0-9]+]]:gpr = PHI [[PCOPY]], %bb.0, %5, %bb.1
+  ; CHECK-NEXT:   [[PHI:%[0-9]+]]:gpr = PHI [[PCOPY]], %bb.0, %6, %bb.1
   ; CHECK-NEXT:   [[PCOPY1:%[0-9]+]]:gpr = PCOPY [[PHI]]
   ; CHECK-NEXT:   [[IncMB:%[0-9]+]]:gpr = IncMB [[PCOPY1]](tied-def 0), implicit-def $c, implicit-def $v
-  ; CHECK-NEXT:   [[PCOPY2:%[0-9]+]]:gpr = PCOPY [[IncMB]]
+  ; CHECK-NEXT:   [[PCOPY2:%[0-9]+]]:gpr = PCOPY [[IncMB]], implicit [[DEF]]
   ; CHECK-NEXT:   CmpBrZero %bb.1, undef $z, 1, [[IncMB]], implicit-def $c
   ; CHECK-NEXT:   JMP %bb.2
   ; CHECK-NEXT: {{  $}}
@@ -52,20 +53,22 @@ body: |
   ; CHECK: bb.0:
   ; CHECK-NEXT:   successors: %bb.1(0x80000000)
   ; CHECK-NEXT: {{  $}}
+  ; CHECK-NEXT:   [[DEF:%[0-9]+]]:gpr = IMPLICIT_DEF
+  ; CHECK-NEXT:   [[DEF1:%[0-9]+]]:gpr = IMPLICIT_DEF
   ; CHECK-NEXT:   [[LDAbs:%[0-9]+]]:gpr = LDAbs 1000
   ; CHECK-NEXT:   [[LDAbs1:%[0-9]+]]:gpr = LDAbs 1001
-  ; CHECK-NEXT:   [[PCOPY:%[0-9]+]]:gpr, [[PCOPY1:%[0-9]+]]:gpr = PCOPY [[LDAbs]], [[LDAbs1]]
+  ; CHECK-NEXT:   [[PCOPY:%[0-9]+]]:gpr, [[PCOPY1:%[0-9]+]]:gpr = PCOPY [[LDAbs]], [[LDAbs1]], implicit [[DEF]], implicit [[DEF1]]
   ; CHECK-NEXT:   JMP %bb.1
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT: bb.1:
   ; CHECK-NEXT:   successors: %bb.1(0x40000000), %bb.2(0x40000000)
   ; CHECK-NEXT: {{  $}}
-  ; CHECK-NEXT:   [[PHI:%[0-9]+]]:gpr = PHI [[PCOPY]], %bb.0, %7, %bb.1
-  ; CHECK-NEXT:   [[PHI1:%[0-9]+]]:gpr = PHI [[PCOPY1]], %bb.0, %9, %bb.1
+  ; CHECK-NEXT:   [[PHI:%[0-9]+]]:gpr = PHI [[PCOPY]], %bb.0, %8, %bb.1
+  ; CHECK-NEXT:   [[PHI1:%[0-9]+]]:gpr = PHI [[PCOPY1]], %bb.0, %11, %bb.1
   ; CHECK-NEXT:   [[PCOPY2:%[0-9]+]]:gpr, [[PCOPY3:%[0-9]+]]:gpr = PCOPY [[PHI]], [[PHI1]]
   ; CHECK-NEXT:   STAbs [[PCOPY2]], 2000
   ; CHECK-NEXT:   STAbs [[PCOPY3]], 2001
-  ; CHECK-NEXT:   [[PCOPY4:%[0-9]+]]:gpr, [[PCOPY5:%[0-9]+]]:gpr = PCOPY [[PCOPY3]], [[PCOPY2]]
+  ; CHECK-NEXT:   [[PCOPY4:%[0-9]+]]:gpr, [[PCOPY5:%[0-9]+]]:gpr = PCOPY [[PCOPY3]], [[PCOPY2]], implicit [[DEF]], implicit [[DEF1]]
   ; CHECK-NEXT:   CmpBrZero %bb.1, undef $z, 1, [[PCOPY2]], implicit-def $c
   ; CHECK-NEXT:   JMP %bb.2
   ; CHECK-NEXT: {{  $}}
@@ -95,15 +98,16 @@ body: |
   ; CHECK: bb.0:
   ; CHECK-NEXT:   successors: %bb.1(0x40000000), %bb.2(0x40000000)
   ; CHECK-NEXT: {{  $}}
+  ; CHECK-NEXT:   [[DEF:%[0-9]+]]:gpr = IMPLICIT_DEF
   ; CHECK-NEXT:   [[LDAbs:%[0-9]+]]:gpr = LDAbs 1000
   ; CHECK-NEXT:   [[LDAbs1:%[0-9]+]]:gpr = LDAbs 1001
-  ; CHECK-NEXT:   [[PCOPY:%[0-9]+]]:gpr = PCOPY [[LDAbs1]]
+  ; CHECK-NEXT:   [[PCOPY:%[0-9]+]]:gpr = PCOPY [[LDAbs1]], implicit [[DEF]]
   ; CHECK-NEXT:   CmpBrZero %bb.2, undef $z, 1, [[LDAbs]], implicit-def $c
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT: bb.1:
   ; CHECK-NEXT:   successors: %bb.2(0x80000000)
   ; CHECK-NEXT: {{  $}}
-  ; CHECK-NEXT:   [[PCOPY1:%[0-9]+]]:gpr = PCOPY [[LDAbs]]
+  ; CHECK-NEXT:   [[PCOPY1:%[0-9]+]]:gpr = PCOPY [[LDAbs]], implicit [[DEF]]
   ; CHECK-NEXT:   JMP %bb.2
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT: bb.2:
@@ -133,24 +137,23 @@ body: |
   ; CHECK-NEXT:   successors: %bb.1(0x40000000), %bb.2(0x40000000)
   ; CHECK-NEXT:   liveins: $rs0
   ; CHECK-NEXT: {{  $}}
+  ; CHECK-NEXT:   [[DEF:%[0-9]+]]:gpr = IMPLICIT_DEF
   ; CHECK-NEXT:   [[LDAbs:%[0-9]+]]:gpr = LDAbs 1000
   ; CHECK-NEXT:   [[LDAbs1:%[0-9]+]]:gpr = LDAbs 1001
-  ; CHECK-NEXT:   [[PCOPY:%[0-9]+]]:gpr, [[PCOPY1:%[0-9]+]]:gpr = PCOPY [[LDAbs]], [[LDAbs1]]
+  ; CHECK-NEXT:   [[PCOPY:%[0-9]+]]:gpr = PCOPY [[LDAbs1]], implicit [[DEF]]
   ; CHECK-NEXT:   JMPIndir $rs0
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT: bb.1:
   ; CHECK-NEXT:   successors: %bb.2(0x80000000)
   ; CHECK-NEXT: {{  $}}
-  ; CHECK-NEXT:   [[PHI:%[0-9]+]]:gpr = PHI [[PCOPY]], %bb.0
-  ; CHECK-NEXT:   [[PCOPY2:%[0-9]+]]:gpr = PCOPY [[PHI]]
-  ; CHECK-NEXT:   STAbs [[PCOPY2]], 2000
-  ; CHECK-NEXT:   [[PCOPY3:%[0-9]+]]:gpr = PCOPY [[PCOPY2]]
+  ; CHECK-NEXT:   STAbs [[LDAbs]], 2000
+  ; CHECK-NEXT:   [[PCOPY1:%[0-9]+]]:gpr = PCOPY [[LDAbs]], implicit [[DEF]]
   ; CHECK-NEXT:   JMP %bb.2
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT: bb.2:
-  ; CHECK-NEXT:   [[PHI1:%[0-9]+]]:gpr = PHI [[PCOPY1]], %bb.0, [[PCOPY3]], %bb.1
-  ; CHECK-NEXT:   [[PCOPY4:%[0-9]+]]:gpr = PCOPY [[PHI1]]
-  ; CHECK-NEXT:   STAbs [[PCOPY4]], 2001
+  ; CHECK-NEXT:   [[PHI:%[0-9]+]]:gpr = PHI [[PCOPY]], %bb.0, [[PCOPY1]], %bb.1
+  ; CHECK-NEXT:   [[PCOPY2:%[0-9]+]]:gpr = PCOPY [[PHI]]
+  ; CHECK-NEXT:   STAbs [[PCOPY2]], 2001
   ; CHECK-NEXT:   RTS
   bb.0:
     successors: %bb.1, %bb.2
@@ -179,14 +182,12 @@ body: |
   ; CHECK-NEXT:   liveins: $rs0
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT:   [[COPY:%[0-9]+]]:imag16 = COPY $rs0
-  ; CHECK-NEXT:   [[PCOPY:%[0-9]+]]:imag8, [[PCOPY1:%[0-9]+]]:imag16 = PCOPY [[COPY]].sublo, undef %3:imag16
   ; CHECK-NEXT:   JMP %bb.1
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT: bb.1:
-  ; CHECK-NEXT:   [[PHI:%[0-9]+]]:imag8 = PHI [[PCOPY]], %bb.0
-  ; CHECK-NEXT:   [[PHI1:%[0-9]+]]:imag16 = PHI [[PCOPY1]], %bb.0
-  ; CHECK-NEXT:   [[PCOPY2:%[0-9]+]]:imag8, dead [[PCOPY3:%[0-9]+]]:imag16 = PCOPY [[PHI]], [[PHI1]]
-  ; CHECK-NEXT:   $a = COPY [[PCOPY2]]
+  ; CHECK-NEXT:   [[COPY1:%[0-9]+]]:imag16 = COPY undef %3:imag16
+  ; CHECK-NEXT:   [[COPY2:%[0-9]+]]:imag8 = COPY [[COPY]].sublo
+  ; CHECK-NEXT:   $a = COPY [[COPY2]]
   ; CHECK-NEXT:   RTS implicit $a
   bb.0:
     liveins: $rs0

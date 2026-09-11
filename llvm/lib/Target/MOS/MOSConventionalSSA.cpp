@@ -13,6 +13,14 @@
 /// predecessor terminators and after PHI bundles connect these registers to the
 /// original values. All PHIs remain in SSA form, and the CFG is unchanged.
 ///
+/// An IMPLICIT_DEF at the common dominator reserves each PHI's backing
+/// location. Exit PCOPYs carry this reservation as an implicit use, associating
+/// it with their destination without reading particular contents. The PCOPY
+/// destinations and PHI result carry the meaningful portions of the
+/// reservation. Ordinary SSA liveness therefore describes both its undefined
+/// and meaningful portions. Entry PCOPYs end this association: their results
+/// have independent backing.
+///
 /// This implements the unoptimized copy insertion construction: it does not
 /// coalesce copies. PHI inputs defined at or after the predecessor's first
 /// terminator are not yet supported, since the exit copy would read them too
@@ -25,10 +33,13 @@
 #include "MOS.h"
 #include "llvm/ADT/IndexedMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
+#include "llvm/InitializePasses.h"
 #include "llvm/Support/ErrorHandling.h"
 
 #define DEBUG_TYPE "mos-conventional-ssa"
@@ -52,6 +63,10 @@ public:
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
+    // Like LiveVariables, require reachable blocks for the SSA traversal.
+    AU.addRequiredID(UnreachableMachineBlockElimID);
+    AU.addRequired<MachineDominatorTreeWrapperPass>();
+    AU.addPreserved<MachineDominatorTreeWrapperPass>();
     AU.setPreservesCFG();
     MachineFunctionPass::getAnalysisUsage(AU);
   }
@@ -61,6 +76,9 @@ private:
   struct Copy {
     MachineOperand Def;
     MachineOperand Use;
+    // Exit copies inherit this reservation's backing location. Entry copies
+    // have no reservation operand; they end the shared-location chain.
+    Register Reservation;
   };
 
   void isolatePHIs(MachineBasicBlock &MBB);
@@ -71,6 +89,7 @@ private:
 
   MachineRegisterInfo *MRI = nullptr;
   const TargetInstrInfo *TII = nullptr;
+  const MachineDominatorTree *MDT = nullptr;
   // One exit PCOPY per predecessor, shared by all its successors.
   IndexedMap<SmallVector<Copy, 0>, MBB2NumberFunctor> ExitCopies;
 };
@@ -78,6 +97,7 @@ private:
 bool MOSConventionalSSA::runOnMachineFunction(MachineFunction &MF) {
   MRI = &MF.getRegInfo();
   TII = MF.getSubtarget().getInstrInfo();
+  MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   ExitCopies.clear();
   ExitCopies.resize(MF.getNumBlockIDs());
 
@@ -98,34 +118,44 @@ bool MOSConventionalSSA::runOnMachineFunction(MachineFunction &MF) {
 }
 
 void MOSConventionalSSA::isolatePHIs(MachineBasicBlock &MBB) {
+  MachineBasicBlock *ReservationBlock = &MBB;
+  for (MachineBasicBlock *Pred : MBB.predecessors())
+    ReservationBlock = MDT->findNearestCommonDominator(ReservationBlock, Pred);
+  auto ReservationInsertPt = ReservationBlock->getFirstNonPHI();
+  // If the reservation starts here, insert entry copies after its definitions.
+  auto EntryCopyInsertPt = MBB.getFirstNonPHI();
   SmallVector<Copy> EntryCopies;
   for (MachineInstr &PHI : MBB.phis()) {
     MachineOperand &Def = PHI.getOperand(0);
     Register Result = MRI->cloneVirtualRegister(Def.getReg());
-    EntryCopies.push_back({Def, MachineOperand::CreateReg(Result, false)});
+    EntryCopies.push_back({Def, MachineOperand::CreateReg(Result, false), {}});
     Def.setReg(Result);
     Def.setIsDead(false);
   }
-  // Keep result copies parallel, including when PHIs exchange their previous
-  // results on a backedge.
-  insertParallelCopy(MBB, MBB.getFirstNonPHI(), EntryCopies,
-                     MBB.front().getDebugLoc());
-
   for (MachineInstr &PHI : MBB.phis()) {
     assert(PHI.getNumOperands() == 1 + 2 * MBB.pred_size() &&
            "expected one PHI input per predecessor");
+    Register Reservation =
+        MRI->cloneVirtualRegister(PHI.getOperand(0).getReg());
+    BuildMI(*ReservationBlock, ReservationInsertPt, PHI.getDebugLoc(),
+            TII->get(TargetOpcode::IMPLICIT_DEF), Reservation);
     for (unsigned I = 1, E = PHI.getNumOperands(); I != E; I += 2) {
       MachineOperand &Use = PHI.getOperand(I);
       MachineBasicBlock *Pred = PHI.getOperand(I + 1).getMBB();
       Register Input = MRI->cloneVirtualRegister(PHI.getOperand(0).getReg());
       MRI->clearKillFlags(Use.getReg());
-      ExitCopies[Pred].push_back({MachineOperand::CreateReg(Input, true), Use});
+      ExitCopies[Pred].push_back(
+          {MachineOperand::CreateReg(Input, true), Use, Reservation});
       Use.setReg(Input);
       Use.setSubReg(0);
       Use.setIsUndef(false);
       Use.setIsKill(false);
     }
   }
+  // Keep result copies parallel, including when PHIs exchange their previous
+  // results on a backedge.
+  insertParallelCopy(MBB, EntryCopyInsertPt, EntryCopies,
+                     MBB.front().getDebugLoc());
 }
 
 void MOSConventionalSSA::insertExitCopies(MachineBasicBlock &MBB,
@@ -161,13 +191,22 @@ void MOSConventionalSSA::insertParallelCopy(
     MIB.add(C.Def);
   for (const Copy &C : Copies)
     MIB.add(C.Use);
+  for (const Copy &C : Copies)
+    if (C.Reservation)
+      // This is an ordinary use of an undefined value, not an undef operand:
+      // LiveVariables must retain its lifetime up to the copy.
+      MIB.addReg(C.Reservation, RegState::Implicit);
 }
 
 } // namespace
 
 char MOSConventionalSSA::ID = 0;
-INITIALIZE_PASS(MOSConventionalSSA, DEBUG_TYPE, "MOS Conventional SSA", false,
-                false)
+INITIALIZE_PASS_BEGIN(MOSConventionalSSA, DEBUG_TYPE, "MOS Conventional SSA",
+                      false, false)
+INITIALIZE_PASS_DEPENDENCY(UnreachableMachineBlockElimLegacy)
+INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
+INITIALIZE_PASS_END(MOSConventionalSSA, DEBUG_TYPE, "MOS Conventional SSA",
+                    false, false)
 
 MachineFunctionPass *llvm::createMOSConventionalSSAPass() {
   return new MOSConventionalSSA;
