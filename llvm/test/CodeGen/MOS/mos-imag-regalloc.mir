@@ -159,30 +159,41 @@ body: |
     RTS
 ...
 
-# PHI operands are edge uses; the PHI result and killed loop input can reuse
-# backing storage.
+# An isolated loop PHI and its inputs share a backing register. Ordinary
+# values may reuse that reservation when their lifetimes do not conflict.
 ---
 name: loop_phi
 tracksRegLiveness: true
 # CHECK-LABEL: name: loop_phi
 # CHECK: isSSA: true
 # CHECK: registers:
-# CHECK-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
-# CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
-# CHECK-NEXT: - { id: 2, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 2, class: gpr, preferred-register: '', flags: [  ], split-from: '%1',
+# CHECK-NEXT: assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 3, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 4, class: gpr, preferred-register: '', flags: [  ], split-from: '%6',
+# CHECK-NEXT: assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 5, class: gpr, preferred-register: '', flags: [  ], split-from: '%3',
+# CHECK-NEXT: assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 6, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc3' }
 # CHECK: body: |
 body: |
   bb.0:
+    %6:gpr = IMPLICIT_DEF
     %0:gpr = LDAbs 1000
+    %1:gpr = PCOPY %0, implicit %6
     JMP %bb.1
   bb.1:
     successors: %bb.1, %bb.2
-    %1:gpr = PHI %0, %bb.0, %2, %bb.1
-    %2:gpr = IncMB %1(tied-def 0), implicit-def $c, implicit-def $v
-    CmpBrZero %bb.2, undef $z, 1, %2, implicit-def $c
+    %2:gpr = PHI %1, %bb.0, %3, %bb.1
+    %4:gpr = PCOPY %2
+    %5:gpr = IncMB %4(tied-def 0), implicit-def $c, implicit-def $v
+    %3:gpr = PCOPY %5, implicit %6
+    CmpBrZero %bb.2, undef $z, 1, %5, implicit-def $c
     JMP %bb.1
   bb.2:
-    STAbs %2, 2000
+    STAbs %5, 2000
     RTS
 ...
 
@@ -254,6 +265,9 @@ tracksRegLiveness: true
 # CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ], split-from: '%0' }
 # CHECK-NEXT: - { id: 2, class: ac, preferred-register: '', flags: [ ], split-from: '%0' }
 # CHECK-NEXT: - { id: 3, class: cc, preferred-register: '', flags: [ ] }
+# CHECK-NEXT: - { id: 4, class: gpr, preferred-register: '', flags: [ ] }
+# CHECK-NEXT: - { id: 5, class: gpr, preferred-register: '', flags: [ ], split-from: '%4' }
+# CHECK-NEXT: - { id: 6, class: gpr, preferred-register: '', flags: [ ] }
 # CHECK: body: |
 body: |
   bb.0:
@@ -263,6 +277,11 @@ body: |
     STAbs %2, 2000
     %3:cc = LDImm1 1
     $c = COPY %3
+    ; Explicit PCOPY sources and unused IMPLICIT_DEFs are not reservations.
+    %4:gpr = IMPLICIT_DEF
+    %5:gpr = PCOPY %4
+    STAbs %5, 2001
+    %6:gpr = IMPLICIT_DEF
     RTS implicit $c
 ...
 

@@ -1,15 +1,32 @@
 # XFAIL: *
-# RUN: llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %s -o /dev/null
-# RUN: llc -mtriple=mos -run-pass=mos-imag-regalloc,mos-regalloc -verify-machineinstrs %s -o /dev/null
+# RUN: llc -mtriple=mos -run-pass=mos-regalloc -verify-machineinstrs %s -o /dev/null
 
 # All 28 backing bytes are live: thirteen Imag16 values and two byte PHIs.
-# The pressure scan succeeds, but swapping the PHIs on the backedge fails:
+# With explicit backing registers, swapping the PHIs on the backedge fails:
 # emitPHIEdge/evacuate require an empty imaginary byte to save a cycle source.
 # Hardware registers are free at this boundary, but evacuation does not use
 # them as destinations. This should compile once cycle scratch is guaranteed.
 ---
 name: full_swap
 tracksRegLiveness: true
+registers:
+  - { id: 0, class: imag16, assigned-phys: '$rs1' }
+  - { id: 1, class: imag16, assigned-phys: '$rs2' }
+  - { id: 2, class: imag16, assigned-phys: '$rs3' }
+  - { id: 3, class: imag16, assigned-phys: '$rs4' }
+  - { id: 4, class: imag16, assigned-phys: '$rs5' }
+  - { id: 5, class: imag16, assigned-phys: '$rs6' }
+  - { id: 6, class: imag16, assigned-phys: '$rs7' }
+  - { id: 7, class: imag16, assigned-phys: '$rs9' }
+  - { id: 8, class: imag16, assigned-phys: '$rs10' }
+  - { id: 9, class: imag16, assigned-phys: '$rs11' }
+  - { id: 10, class: imag16, assigned-phys: '$rs12' }
+  - { id: 11, class: imag16, assigned-phys: '$rs13' }
+  - { id: 12, class: imag16, assigned-phys: '$rs14' }
+  - { id: 13, class: gpr, assigned-phys: '$rc30' }
+  - { id: 14, class: gpr, assigned-phys: '$rc31' }
+  - { id: 15, class: gpr, assigned-phys: '$rc30' }
+  - { id: 16, class: gpr, assigned-phys: '$rc31' }
 body: |
   bb.0:
     %0:imag16 = COPY $rs0

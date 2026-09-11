@@ -1,0 +1,344 @@
+# RUN: split-file %s %t
+# RUN: llc -mtriple=mos -run-pass=mos-conventional-ssa,mos-imag-regalloc -stress-regalloc=2 -verify-machineinstrs %t/loop_reservation.mir -o /dev/null
+# RUN: llc -mtriple=mos -run-pass=mos-conventional-ssa,mos-imag-regalloc -verify-machineinstrs %t/valid.mir -o - | FileCheck %s
+# RUN: not llc -mtriple=mos -run-pass=mos-conventional-ssa,mos-imag-regalloc -verify-machineinstrs %t/overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=OVERFLOW
+
+# VirtRegMap assignments, rather than unchanged instructions, are the output
+# under test. update_mir_test_checks.py does not generate register-map checks.
+
+#--- valid.mir
+# Ordinary SSA pressure is two for a/b and either PHI input, but merging the
+# inputs creates a triangle: a and b interfere, and each conflicts with a
+# different PHI input. Reserve a third location before assigning either one.
+# The extra local in bb.1 also conflicts with the reservation in bb.3, checking
+# that the reservation survives the intervening dominator-tree node.
+---
+name: triangle
+# CHECK-LABEL: name: triangle
+# CHECK: registers:
+# CHECK: - { id: 0, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc3' }
+# CHECK: - { id: 1, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc4' }
+# CHECK: - { id: 2, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc5' }
+# CHECK: - { id: 3, class: gpr, preferred-register: '', flags: [  ], split-from: '%4',
+# CHECK-NEXT: assigned-phys: '$rc2' }
+# CHECK: - { id: 4, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
+# CHECK: - { id: 5, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
+# CHECK: - { id: 6, class: gpr, preferred-register: '', flags: [  ], split-from: '%0',
+# CHECK-NEXT: assigned-phys: '$rc2' }
+# CHECK: - { id: 7, class: gpr, preferred-register: '', flags: [  ], split-from: '%1',
+# CHECK-NEXT: assigned-phys: '$rc2' }
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    CmpBrZero %bb.1, undef $z, 1, %0, implicit-def $c
+    JMP %bb.2
+  bb.1:
+    %2:gpr = LDAbs 1002
+    JMP %bb.3
+  bb.2:
+    successors: %bb.4, %bb.5
+    CmpBrZero %bb.4, undef $z, 1, %1, implicit-def $c
+    JMP %bb.5
+  bb.3:
+    successors: %bb.4, %bb.5
+    CmpBrZero %bb.4, undef $z, 1, %2, implicit-def $c
+    CmpBrZero %bb.4, undef $z, 1, %0, implicit-def $c
+    JMP %bb.5
+  bb.4:
+    %3:gpr = PHI %0, %bb.2, %1, %bb.3
+    STAbs %3, 2000
+    RTS
+  bb.5:
+    RTS
+...
+
+# The first diamond has conflicting Imag16 and Imag8 reservations. The second
+# diamond starts its reservation in bb.3, overlapping both extents but neither
+# actual member lifetime. It reuses rs1, as can the ordinary pair inputs.
+---
+name: sequential_reservations
+# CHECK-LABEL: name: sequential_reservations
+# CHECK: registers:
+# CHECK: - { id: 0, class: imag16, preferred-register: '', flags: [  ], assigned-phys: '$rs1' }
+# CHECK: - { id: 1, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc4' }
+# CHECK: - { id: 2, class: imag16, preferred-register: '', flags: [  ], assigned-phys: '$rs1' }
+# CHECK: - { id: 3, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc4' }
+# CHECK: - { id: 4, class: imag16, preferred-register: '', flags: [  ], split-from: '%9',
+# CHECK-NEXT: assigned-phys: '$rs1' }
+# CHECK: - { id: 5, class: gpr, preferred-register: '', flags: [  ], split-from: '%10',
+# CHECK-NEXT: assigned-phys: '$rc4' }
+# CHECK: - { id: 6, class: imag16, preferred-register: '', flags: [  ], assigned-phys: '$rs1' }
+# CHECK: - { id: 7, class: imag16, preferred-register: '', flags: [  ], assigned-phys: '$rs1' }
+# CHECK: - { id: 8, class: imag16, preferred-register: '', flags: [  ], split-from: '%17',
+# CHECK-NEXT: assigned-phys: '$rs1' }
+# CHECK: - { id: 9, class: imag16, preferred-register: '', flags: [  ], assigned-phys: '$rs1' }
+# CHECK: - { id: 10, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc4' }
+# CHECK: - { id: 11, class: imag16, preferred-register: '', flags: [  ], assigned-phys: '$rs1' }
+# CHECK: - { id: 12, class: imag16, preferred-register: '', flags: [  ], split-from: '%0',
+# CHECK-NEXT: assigned-phys: '$rs1' }
+# CHECK: - { id: 13, class: imag16, preferred-register: '', flags: [  ], split-from: '%2',
+# CHECK-NEXT: assigned-phys: '$rs1' }
+# CHECK: - { id: 14, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc4' }
+# CHECK: - { id: 15, class: gpr, preferred-register: '', flags: [  ], split-from: '%1',
+# CHECK-NEXT: assigned-phys: '$rc4' }
+# CHECK: - { id: 16, class: gpr, preferred-register: '', flags: [  ], split-from: '%3',
+# CHECK-NEXT: assigned-phys: '$rc4' }
+# CHECK: - { id: 17, class: imag16, preferred-register: '', flags: [  ], assigned-phys: '$rs1' }
+# CHECK: - { id: 18, class: imag16, preferred-register: '', flags: [  ], assigned-phys: '$rs1' }
+# CHECK: - { id: 19, class: imag16, preferred-register: '', flags: [  ], split-from: '%6',
+# CHECK-NEXT: assigned-phys: '$rs1' }
+# CHECK: - { id: 20, class: imag16, preferred-register: '', flags: [  ], split-from: '%7',
+# CHECK-NEXT: assigned-phys: '$rs1' }
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    %0:imag16 = COPY $rs0
+    %6:gpr = LDAbs 1000
+    CmpBrZero %bb.1, undef $z, 1, undef $a, implicit-def $c
+    JMP %bb.2
+  bb.1:
+    JMP %bb.3
+  bb.2:
+    %1:imag16 = COPY $rs0
+    %7:gpr = LDAbs 1001
+    JMP %bb.3
+  bb.3:
+    successors: %bb.4, %bb.5
+    %2:imag16 = PHI %0, %bb.1, %1, %bb.2
+    %8:gpr = PHI %6, %bb.1, %7, %bb.2
+    STAbs %8, 2000
+    $rs0 = COPY %2
+    %3:imag16 = COPY $rs0
+    CmpBrZero %bb.4, undef $z, 1, undef $a, implicit-def $c
+    JMP %bb.5
+  bb.4:
+    JMP %bb.6
+  bb.5:
+    %4:imag16 = COPY $rs0
+    JMP %bb.6
+  bb.6:
+    %5:imag16 = PHI %3, %bb.4, %4, %bb.5
+    $rs0 = COPY %5
+    RTS
+...
+
+# PHIs in different successors still need distinct reservations: each
+# predecessor defines both incoming destinations before choosing a successor.
+---
+name: shared_predecessor
+# CHECK-LABEL: name: shared_predecessor
+# CHECK: registers:
+# CHECK: - { id: 5, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc3' }
+# CHECK: - { id: 9, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    CmpBrZero %bb.1, undef $z, 1, undef $a, implicit-def $c
+    JMP %bb.2
+  bb.1:
+    CmpBrZero %bb.3, undef $z, 1, undef $a, implicit-def $c
+    JMP %bb.4
+  bb.2:
+    CmpBrZero %bb.3, undef $z, 1, undef $a, implicit-def $c
+    JMP %bb.4
+  bb.3:
+    %2:gpr = PHI %0, %bb.1, %1, %bb.2
+    STAbs %2, 2000
+    RTS
+  bb.4:
+    %3:gpr = PHI %1, %bb.1, %0, %bb.2
+    STAbs %3, 2001
+    RTS
+...
+
+# The reservation starts in bb.1 while %0 is still live, but %0 dies before any
+# member is defined. It must not count against, or prevent reuse by, the new
+# reservation. Constant PHI inputs still get the reservation's backing register.
+---
+name: inherited_local
+# CHECK-LABEL: name: inherited_local
+# CHECK: registers:
+# CHECK: - { id: 0, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
+# CHECK: - { id: 1, class: gpr, preferred-register: '', flags: [  ] }
+# CHECK: - { id: 2, class: gpr, preferred-register: '', flags: [  ] }
+# CHECK: - { id: 3, class: gpr, preferred-register: '', flags: [  ], split-from: '%4',
+# CHECK-NEXT: assigned-phys: '$rc2' }
+# CHECK: - { id: 4, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
+# CHECK: - { id: 5, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
+# CHECK: - { id: 6, class: gpr, preferred-register: '', flags: [  ], split-from: '%1',
+# CHECK-NEXT: assigned-phys: '$rc2' }
+# CHECK: - { id: 7, class: gpr, preferred-register: '', flags: [  ], split-from: '%2',
+# CHECK-NEXT: assigned-phys: '$rc2' }
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.1, %bb.5
+    %0:gpr = LDAbs 1000
+    CmpBrZero %bb.1, undef $z, 1, %0, implicit-def $c
+    JMP %bb.5
+  bb.1:
+    successors: %bb.2, %bb.3
+    STAbs %0, 2000
+    %1:gpr = LDImm 42
+    CmpBrZero %bb.2, undef $z, 1, undef $a, implicit-def $c
+    JMP %bb.3
+  bb.2:
+    JMP %bb.4
+  bb.3:
+    %2:gpr = LDImm 43
+    JMP %bb.4
+  bb.4:
+    %3:gpr = PHI %1, %bb.2, %2, %bb.3
+    STAbs %3, 2001
+    RTS
+  bb.5:
+    RTS
+...
+
+# Fourteen local pairs fill the entire bank during a hole in an Imag8
+# reservation. Counting the reservation unconditionally would reject this.
+---
+name: full_bank_hole
+# CHECK-LABEL: name: full_bank_hole
+# CHECK: registers:
+# CHECK: - { id: 0, class: imag16, preferred-register: '', flags: [  ], assigned-phys: '$rs1' }
+# CHECK: - { id: 13, class: imag16, preferred-register: '', flags: [  ], assigned-phys: '$rs15' }
+# CHECK: - { id: 17, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
+# CHECK: - { id: 18, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
+# CHECK: - { id: 19, class: gpr, preferred-register: '', flags: [  ], split-from: '%14',
+# CHECK-NEXT: assigned-phys: '$rc2' }
+# CHECK: - { id: 20, class: gpr, preferred-register: '', flags: [  ], split-from: '%15',
+# CHECK-NEXT: assigned-phys: '$rc2' }
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:imag16 = COPY $rs0
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    $rs0 = COPY %13
+    %14:gpr = LDAbs 1000
+    CmpBrZero %bb.1, undef $z, 1, undef $a, implicit-def $c
+    JMP %bb.2
+  bb.1:
+    JMP %bb.3
+  bb.2:
+    %16:gpr = LDAbs 1001
+    JMP %bb.3
+  bb.3:
+    %15:gpr = PHI %14, %bb.1, %16, %bb.2
+    STAbs %15, 2000
+    RTS
+...
+
+#--- overflow.mir
+# Only the final pair now survives across the PCOPY. It conflicts with the
+# reservation, so its definition needs fifteen potentially occupied pairs.
+# OVERFLOW: MOSImagRegAlloc: cannot prove backing assignability in reservation_overflow, bb.0 for Imag16 backing: requires 15, 14 available locations
+# OVERFLOW: %13:imag16 = COPY $rs0
+# OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+---
+name: reservation_overflow
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:imag16 = COPY $rs0
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    %14:gpr = LDAbs 1000
+    CmpBrZero %bb.1, undef $z, 1, undef $a, implicit-def $c
+    JMP %bb.2
+  bb.1:
+    JMP %bb.3
+  bb.2:
+    %16:gpr = LDAbs 1001
+    JMP %bb.3
+  bb.3:
+    %15:gpr = PHI %14, %bb.1, %16, %bb.2
+    STAbs %15, 2000
+    $rs0 = COPY %13
+    RTS
+...
+
+#--- loop_reservation.mir
+# The loop PHI and the exit PHI need distinct reservations at bb.2's exit.
+# The exit reservation starts in bb.1 while both the loop reservation root and
+# its PHI result are live. Only the root conflicts with the exit reservation:
+# the result dies at the entry PCOPY. The two available Imag8 registers suffice.
+---
+name: loop_reservation
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:gpr = LDImm 0
+    JMP %bb.1
+  bb.1:
+    %1:gpr = PHI %0, %bb.0, %2, %bb.2
+    STAbs %1, 2000
+    CmpBrZero %bb.2, undef $z, 1, undef $a, implicit-def $c
+    JMP %bb.3
+  bb.2:
+    %2:gpr = LDImm 2
+    CmpBrZero %bb.1, undef $z, 1, undef $a, implicit-def $c
+    JMP %bb.4
+  bb.3:
+    %3:gpr = LDImm 3
+    JMP %bb.4
+  bb.4:
+    %4:gpr = PHI %2, %bb.2, %3, %bb.3
+    STAbs %4, 2001
+    RTS
+...

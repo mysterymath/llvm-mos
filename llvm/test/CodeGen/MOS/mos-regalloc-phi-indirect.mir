@@ -1,5 +1,5 @@
 # XFAIL: *
-# RUN: llc -mtriple=mos -run-pass=mos-imag-regalloc,mos-regalloc -verify-machineinstrs -o - %s | FileCheck %s
+# RUN: llc -mtriple=mos -run-pass=mos-regalloc -verify-machineinstrs -o - %s | FileCheck %s
 
 # rs0 contains the address of bb.1 or bb.2. Replacing an indirect successor in
 # the CFG cannot redirect this runtime address through a new repair block.
@@ -16,6 +16,10 @@
 ---
 name: indirect_phi
 tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr, assigned-phys: '$rc2' }
+  - { id: 1, class: gpr, assigned-phys: '$rc3' }
+  - { id: 2, class: gpr, assigned-phys: '$rc2' }
 body: |
   bb.0:
     successors: %bb.1, %bb.2
