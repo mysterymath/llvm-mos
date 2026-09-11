@@ -1,0 +1,53 @@
+# XFAIL: *
+# RUN: llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %s -o /dev/null
+# RUN: llc -mtriple=mos -run-pass=mos-imag-regalloc,mos-regalloc -verify-machineinstrs %s -o /dev/null
+
+# All 28 backing bytes are live: thirteen Imag16 values, the PHI result, and
+# its next input. The pressure scan succeeds. On the backedge the old PHI
+# result is dead, so its backing byte can simply receive the next input.
+# emitPHIEdge instead preserves the union of both edges' live-outs, including
+# the old result needed only by bb.2, and fails to find scratch storage.
+# This should compile once preservation uses liveness for the selected edge.
+---
+name: full_lost_copy
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:gpr = LDAbs 1000
+    %14:gpr = LDAbs 1001
+    JMP %bb.1
+  bb.1:
+    successors: %bb.1, %bb.2
+    %15:gpr = PHI %14, %bb.0, %13, %bb.1
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    CmpBrZero %bb.1, undef $z, 1, %15, implicit-def $c
+    JMP %bb.2
+  bb.2:
+    STAbs %15, 2000
+    RTS
+...

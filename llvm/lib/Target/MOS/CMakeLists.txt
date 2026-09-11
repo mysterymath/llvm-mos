@@ -25,6 +25,7 @@ add_llvm_target(MOSCodeGen
   MOSCallLowering.cpp
   MOSCallingConv.cpp
   MOSCombiner.cpp
+  MOSConventionalSSA.cpp
   MOSCopyOpt.cpp
   MOSFrameLowering.cpp
   MOSISelLowering.cpp
@@ -82,7 +83,8 @@ add_llvm_target(MOSCodeGen
   MOS
 )
 
-set_property(SOURCE MOSImagRegAlloc.cpp APPEND PROPERTY COMPILE_OPTIONS
+set_property(SOURCE MOSConventionalSSA.cpp MOSImagRegAlloc.cpp
+  APPEND PROPERTY COMPILE_OPTIONS
   -fprofile-instr-generate
   -fcoverage-mapping
 )

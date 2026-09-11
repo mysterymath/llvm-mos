@@ -1,0 +1,31 @@
+# XFAIL: *
+# RUN: llc -mtriple=mos -run-pass=mos-imag-regalloc,mos-regalloc -verify-machineinstrs -o - %s | FileCheck %s
+
+# rs0 contains the address of bb.1 or bb.2. Replacing an indirect successor in
+# the CFG cannot redirect this runtime address through a new repair block.
+# The current allocator changes the successor to bb.3 but leaves JMPIndir
+# unchanged. A jump directly to bb.2 bypasses its PHI copy and stores the value
+# loaded from 1000 instead of 1001. MachineVerifier does not catch this.
+# Preserve the indirect targets; any PHI lowering must execute on the actual
+# paths rather than relying on a successor-list-only edge split.
+# CHECK-LABEL: name: indirect_phi
+# CHECK: bb.0:
+# CHECK-NEXT: successors: %bb.1(0x40000000), %bb.2(0x40000000)
+# CHECK: JMPIndir $rs0
+
+---
+name: indirect_phi
+tracksRegLiveness: true
+body: |
+  bb.0:
+    successors: %bb.1, %bb.2
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    JMPIndir $rs0
+  bb.1:
+    JMP %bb.2
+  bb.2:
+    %2:gpr = PHI %1, %bb.0, %0, %bb.1
+    STAbs %2, 2000
+    RTS
+...
