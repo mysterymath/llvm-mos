@@ -88,13 +88,13 @@ body: |
     ; CHECK-LABEL: name: distinct_backings
     ; CHECK: liveins: $rc2
     ; CHECK-NEXT: {{  $}}
-    ; CHECK-NEXT: $y = LDImag8 killed $rc2
-    ; CHECK-NEXT: STAbs $y, 3000
+    ; CHECK-NEXT: $a = LDImag8 killed $rc2
+    ; CHECK-NEXT: STAbs $a, 3000
+    ; CHECK-NEXT: $rc3 = STImag8 killed $a
     ; CHECK-NEXT: $a = LDImm 13
     ; CHECK-NEXT: $rc2 = STImag8 killed $a
     ; CHECK-NEXT: $a = LDImm 7
     ; CHECK-NEXT: $x = LDImm 8
-    ; CHECK-NEXT: $rc3 = STImag8 killed $y
     ; CHECK-NEXT: $y = LDImm 9
     ; CHECK-NEXT: STAbs killed $a, 3001
     ; CHECK-NEXT: STAbs killed $x, 3002
@@ -141,5 +141,84 @@ body: |
     %0:gpr = LDAbs 4000
     JSR &callee, mos_csr
     STAbs killed %0, 4001
+    RTS
+...
+
+# REG_SEQUENCE operand order does not determine byte order. A subsequent
+# whole-register copy retains the identities of both source bytes.
+---
+name: reg_sequence_copy
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr, assigned-phys: '$rc6' }
+  - { id: 1, class: gpr, assigned-phys: '$rc7' }
+  - { id: 2, class: imag16, assigned-phys: '$rs1' }
+  - { id: 3, class: imag16, split-from: '%2', assigned-phys: '$rs2' }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: reg_sequence_copy
+    ; CHECK: $x = LDAbs 5000
+    ; CHECK-NEXT: $a = LDAbs 5001
+    ; CHECK-NEXT: dead $rc3 = STImag8 $a
+    ; CHECK-NEXT: dead $rc2 = STImag8 $x
+    ; CHECK-NEXT: $rc2 = STImag8 killed $x
+    ; CHECK-NEXT: $rc3 = STImag8 killed $a
+    ; CHECK-NEXT: RTS implicit killed $rs1
+    %0:gpr = LDAbs 5000
+    %1:gpr = LDAbs 5001
+    %2:imag16 = REG_SEQUENCE killed %1, %subreg.subhi, killed %0, %subreg.sublo
+    %3:imag16 = COPY killed %2
+    $rs1 = COPY killed %3
+    RTS implicit killed $rs1
+...
+# Rematerialization selects the enclosing Imag16 from either byte identity.
+---
+name: remat_pair
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: imag16 }
+  - { id: 1, class: imag16, split-from: '%0' }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: remat_pair
+    ; CHECK: $rs1 = LDImm16Remat 4660
+    ; CHECK-NEXT: RTS implicit killed $rs1
+    %0:imag16 = LDImm16Remat 4660
+    %1:imag16 = COPY killed %0
+    $rs1 = COPY killed %1
+    RTS implicit killed $rs1
+...
+
+# A and X both contain the input. Selecting either as INC's use leaves the
+# same register contents, but the tie forces its result into that register.
+# Keep those choices distinct until defs: X avoids preservation across the
+# following overwrite of A.
+---
+name: tied_use_choices
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr, assigned-phys: '$rc2' }
+  - { id: 1, class: gpr, assigned-phys: '$rc3' }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: tied_use_choices
+    ; CHECK: $a = LDAbs 6000
+    ; CHECK-NEXT: $x = TA $a
+    ; CHECK-NEXT: STAbs killed $a, 6001
+    ; CHECK-NEXT: STAbs $x, 6002
+    ; CHECK-NEXT: $x = INC killed $x
+    ; CHECK-NEXT: $a = LDImm 7
+    ; CHECK-NEXT: STAbs killed $a, 6003
+    ; CHECK-NEXT: STAbs killed $x, 6004
+    ; CHECK-NEXT: RTS
+    %0:gpr = LDAbs 6000
+    $a = COPY %0
+    $x = COPY %0
+    STAbs killed $a, 6001
+    STAbs killed $x, 6002
+    %1:gpr = INC killed %0
+    $a = LDImm 7
+    STAbs killed $a, 6003
+    STAbs killed %1, 6004
     RTS
 ...

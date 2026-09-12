@@ -159,11 +159,11 @@ registers:
 body: |
   bb.0:
     ; CHECK-LABEL: name: tied_multi_use
-    ; CHECK: $a = LDAbs 1000
-    ; CHECK-NEXT: $x = TA $a
-    ; CHECK-NEXT: $x = INC killed $x
-    ; CHECK-NEXT: STAbs killed $a, 2000
-    ; CHECK-NEXT: STAbs killed $x, 3000
+    ; CHECK: $x = LDAbs 1000
+    ; CHECK-NEXT: $a = T_A $x
+    ; CHECK-NEXT: $a = INC killed $a
+    ; CHECK-NEXT: STAbs killed $x, 2000
+    ; CHECK-NEXT: STAbs killed $a, 3000
     %0:gpr = LDAbs 1000
     %1:gpr = INC %0
     STAbs killed %0, 2000
