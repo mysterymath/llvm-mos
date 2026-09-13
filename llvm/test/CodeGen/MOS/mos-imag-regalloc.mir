@@ -76,7 +76,7 @@ body: |
     STAbs %0, 2000
     STAbs %2, 2001
     $rs3 = COPY %1
-    RTS
+    RTS implicit $rs3
 ...
 
 # The early-clobber scratch cannot reuse either input; ordinary results can.
@@ -217,8 +217,8 @@ tracksRegLiveness: true
 # CHECK-NEXT: - { id: 9, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc11' }
 # CHECK-NEXT: - { id: 10, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc12' }
 # CHECK-NEXT: - { id: 11, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc13' }
-# CHECK-NEXT: - { id: 12, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc14' }
-# CHECK-NEXT: - { id: 13, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc15' }
+# CHECK-NEXT: - { id: 12, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 13, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc3' }
 # CHECK: body: |
 body: |
   bb.0:
