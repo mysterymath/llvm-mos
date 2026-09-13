@@ -13,11 +13,10 @@
 /// their materialization while retaining the corresponding values in A/X/Y/C/V.
 /// An established backing copy remains valid until its SSA live range ends.
 ///
-/// The DP key records hardware contents and whether every live backing for each
-/// retained value is established. A value absent from hardware must have all
-/// its backing copies. Partial materialization is conservatively forgotten at
-/// DP boundaries; it may cause repeated stores of the same value, but does not
-/// permit displacement of an established backing.
+/// The DP key records hardware contents and the valid live backing registers
+/// for those values. Liveness and VirtRegMap determine each backing's value.
+/// Values absent from hardware must have all their live backing copies, so
+/// their validity is implicit and omitted from the key.
 ///
 /// Each transition chooses hardware operands and realizes the instruction's
 /// transfers. Imaginary operands use their assigned locations. Parallel copies
@@ -62,6 +61,8 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include <array>
+#include <bitset>
+#include <functional>
 #include <utility>
 #include <variant>
 
@@ -81,26 +82,30 @@ using ValueNumber = TargetInstrInfo::RegSubRegPair;
 constexpr std::array<MCPhysReg, 5> HardwareRegs = {MOS::A, MOS::X, MOS::Y,
                                                    MOS::C, MOS::V};
 
-// The DP key at an instruction boundary. Backed[I] means every live backing
-// for Hardware[I] is established. Equal hardware values have equal Backed bits;
-// unused hardware registers have neither a value nor a backing obligation.
+// The DP key at an instruction boundary. ValidBackings contains only physical
+// Imag8 registers holding an assigned live value also present in Hardware.
+// Liveness and VirtRegMap associate each bit with its value, so this is one set
+// per distinct hardware value without duplicating sets for hardware copies.
+// Imag16 backings are tracked byte by byte. Dead backings are omitted; live
+// backings of values absent from Hardware are implicitly valid.
+// Index directly by physical register number, through the last Imag8 register.
+// Fixed-size storage avoids a separate allocation for each DP state.
 struct AllocationState {
   std::array<ValueNumber, HardwareRegs.size()> Hardware = {};
-  std::array<bool, HardwareRegs.size()> Backed = {};
+  std::bitset<MOS::RC255 + 1> ValidBackings;
 
   bool operator==(const AllocationState &Other) const {
-    return Hardware == Other.Hardware && Backed == Other.Backed;
+    return Hardware == Other.Hardware && ValidBackings == Other.ValidBackings;
   }
 };
 
 struct AllocationStateInfo {
   static unsigned getHashValue(const AllocationState &State) {
-    unsigned Hash = 0;
-    for (unsigned I = 0; I != HardwareRegs.size(); ++I) {
+    unsigned Hash =
+        std::hash<decltype(State.ValidBackings)>{}(State.ValidBackings);
+    for (ValueNumber V : State.Hardware)
       Hash = detail::combineHashValue(
-          Hash, DenseMapInfo<ValueNumber>::getHashValue(State.Hardware[I]));
-      Hash = detail::combineHashValue(Hash, State.Backed[I]);
-    }
+          Hash, DenseMapInfo<ValueNumber>::getHashValue(V));
     return Hash;
   }
   static bool isEqual(const AllocationState &A, const AllocationState &B) {
@@ -924,18 +929,16 @@ AllocationState
 FunctionAllocator::getAllocationState(const RegisterContents &Registers,
                                       const SparseBitVector<> &LiveRegs) const {
   AllocationState State;
-  for (auto [I, R] : llvm::enumerate(HardwareRegs)) {
+  for (auto [I, R] : llvm::enumerate(HardwareRegs))
     State.Hardware[I] = Registers.read(R);
-    State.Backed[I] = State.Hardware[I].Reg != 0;
-  }
   forEachBacking(LiveRegs, [&](MCPhysReg R, ValueNumber V) {
-    if (Registers.read(R) == V)
+    if (!Registers.hasHardwareCopy(V)) {
+      assert(Registers.read(R) == V &&
+             "value absent from hardware requires every live backing");
       return;
-    assert(Registers.hasHardwareCopy(V) &&
-           "unmaterialized backing requires a hardware copy");
-    for (unsigned I = 0; I != HardwareRegs.size(); ++I)
-      if (State.Hardware[I] == V)
-        State.Backed[I] = false;
+    }
+    if (Registers.read(R) == V)
+      State.ValidBackings.set(R);
   });
   return State;
 }
@@ -947,9 +950,8 @@ RegisterContents FunctionAllocator::getRegisterContents(
     if (State.Hardware[I].Reg)
       Registers.define(R, State.Hardware[I]);
   forEachBacking(LiveRegs, [&](MCPhysReg R, ValueNumber V) {
-    for (unsigned I = 0; I != HardwareRegs.size(); ++I)
-      if (State.Hardware[I] == V && !State.Backed[I])
-        return;
+    if (Registers.hasHardwareCopy(V) && !State.ValidBackings[R])
+      return;
     assert((!Registers.read(R).Reg || Registers.read(R) == V) &&
            "backing assignments interfere");
     Registers.define(R, V);

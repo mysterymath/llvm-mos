@@ -104,8 +104,8 @@ body: |
     ; CHECK-LABEL: name: independent_values
     ; CHECK: $a = LDAbs 1000
     ; CHECK-NEXT: STAbs killed $a, 2000
-    ; CHECK-NEXT: $a = LDAbs 3000
-    ; CHECK-NEXT: STAbs killed $a, 4000
+    ; CHECK-NEXT: $y = LDAbs 3000
+    ; CHECK-NEXT: STAbs killed $y, 4000
     %0:gpr = LDAbs 1000
     STAbs killed %0, 2000
     %1:gpr = LDAbs 3000
@@ -121,9 +121,9 @@ registers:
 body: |
   bb.0:
     ; CHECK-LABEL: name: tied_def
-    ; CHECK: $a = LDAbs 1000
-    ; CHECK-NEXT: $a = INC killed $a
-    ; CHECK-NEXT: STAbs killed $a, 2000
+    ; CHECK: $y = LDAbs 1000
+    ; CHECK-NEXT: $y = INC killed $y
+    ; CHECK-NEXT: STAbs killed $y, 2000
     %0:gpr = LDAbs 1000
     %1:gpr = INC killed %0
     STAbs killed %1, 2000
@@ -159,11 +159,11 @@ registers:
 body: |
   bb.0:
     ; CHECK-LABEL: name: tied_multi_use
-    ; CHECK: $x = LDAbs 1000
-    ; CHECK-NEXT: $a = T_A $x
-    ; CHECK-NEXT: $a = INC killed $a
-    ; CHECK-NEXT: STAbs killed $x, 2000
-    ; CHECK-NEXT: STAbs killed $a, 3000
+    ; CHECK: $a = LDAbs 1000
+    ; CHECK-NEXT: $y = TA $a
+    ; CHECK-NEXT: $y = INC killed $y
+    ; CHECK-NEXT: STAbs killed $a, 2000
+    ; CHECK-NEXT: STAbs killed $y, 3000
     %0:gpr = LDAbs 1000
     %1:gpr = INC %0
     STAbs killed %0, 2000
@@ -180,8 +180,8 @@ body: |
   bb.0:
     ; CHECK-LABEL: name: dead_def_solitary
     ; CHECK: dead $a = LDAbs 1000
-    ; CHECK-NEXT: $a = LDAbs 2000
-    ; CHECK-NEXT: STAbs killed $a, 3000
+    ; CHECK-NEXT: $y = LDAbs 2000
+    ; CHECK-NEXT: STAbs killed $y, 3000
     dead %0:gpr = LDAbs 1000
     %1:gpr = LDAbs 2000
     STAbs killed %1, 3000
@@ -263,8 +263,8 @@ body: |
   bb.0:
     ; CHECK-LABEL: name: terminator_interleaved
     ; CHECK: $a = LDAbs 1000
-    ; CHECK-NEXT: $x = LDAbs 2000
-    ; CHECK-NEXT: STAbs killed $x, 3000
+    ; CHECK-NEXT: $y = LDAbs 2000
+    ; CHECK-NEXT: STAbs killed $y, 3000
     ; CHECK-NEXT: RTS implicit killed $a
     %0:ac = LDAbs 1000
     $a = COPY killed %0

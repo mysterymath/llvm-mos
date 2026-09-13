@@ -39,7 +39,7 @@ body: |
 ...
 
 # A freshly computed value has no valid backing copy. Overwriting all hardware
-# copies must preserve it, even though the next state omits imaginary contents.
+# copies must preserve it in its backing register.
 ---
 name: stale_backing
 tracksRegLiveness: true
@@ -70,6 +70,47 @@ body: |
     STAbs killed $x, 2003
     STAbs killed $y, 2004
     STAbs killed %0, 2005
+    RTS
+...
+
+# Adding a deferred backing must not forget an existing valid backing of the
+# same value. Evicting the value only needs to initialize the new backing.
+---
+name: partial_backings
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: gpr, assigned-phys: '$rc2' }
+  - { id: 1, class: gpr, split-from: '%0', assigned-phys: '$rc3' }
+body: |
+  bb.0:
+    liveins: $rc2
+    ; CHECK-LABEL: name: partial_backings
+    ; CHECK: liveins: $rc2
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: $y = LDImag8 $rc2
+    ; CHECK-NEXT: STAbs $y, 3100
+    ; CHECK-NEXT: $a = LDImm 7
+    ; CHECK-NEXT: $x = LDImm 8
+    ; CHECK-NEXT: dead $rc3 = STImag8 killed $y
+    ; CHECK-NEXT: $y = LDImm 9
+    ; CHECK-NEXT: STAbs killed $a, 3101
+    ; CHECK-NEXT: STAbs killed $x, 3102
+    ; CHECK-NEXT: STAbs killed $y, 3103
+    ; CHECK-NEXT: $a = LDImag8 killed $rc2
+    ; CHECK-NEXT: STAbs $a, 3104
+    ; CHECK-NEXT: STAbs killed $a, 3105
+    ; CHECK-NEXT: RTS
+    %0:gpr = COPY $rc2
+    STAbs %0, 3100
+    %1:gpr = PCOPY %0
+    $a = LDImm 7
+    $x = LDImm 8
+    $y = LDImm 9
+    STAbs killed $a, 3101
+    STAbs killed $x, 3102
+    STAbs killed $y, 3103
+    STAbs killed %0, 3104
+    STAbs killed %1, 3105
     RTS
 ...
 
@@ -159,13 +200,13 @@ body: |
   bb.0:
     ; CHECK-LABEL: name: reg_sequence_copy
     ; CHECK: $a = LDAbs 5000
-    ; CHECK-NEXT: $x = LDAbs 5001
-    ; CHECK-NEXT: dead $rc3 = STImag8 $x
+    ; CHECK-NEXT: $y = LDAbs 5001
+    ; CHECK-NEXT: dead $rc3 = STImag8 $y
     ; CHECK-NEXT: dead $rc2 = STImag8 $a
     ; CHECK-NEXT: dead $rc4 = STImag8 $a
-    ; CHECK-NEXT: dead $rc5 = STImag8 $x
+    ; CHECK-NEXT: dead $rc5 = STImag8 $y
     ; CHECK-NEXT: $rc2 = STImag8 killed $a
-    ; CHECK-NEXT: $rc3 = STImag8 killed $x
+    ; CHECK-NEXT: $rc3 = STImag8 killed $y
     ; CHECK-NEXT: RTS implicit killed $rs1
     %0:gpr = LDAbs 5000
     %1:gpr = LDAbs 5001
@@ -241,11 +282,11 @@ body: |
   bb.0:
     ; CHECK-LABEL: name: parallel_swap
     ; CHECK: $a = LDImag8 $rc0
+    ; CHECK-NEXT: $y = LDImag8 $rc1
     ; CHECK-NEXT: $rc2 = STImag8 killed $a
-    ; CHECK-NEXT: $a = LDImag8 $rc1
-    ; CHECK-NEXT: $rc3 = STImag8 killed $a
     ; CHECK-NEXT: dead $a = LDImm 7
     ; CHECK-NEXT: dead $x = LDImm 8
+    ; CHECK-NEXT: $rc3 = STImag8 killed $y
     ; CHECK-NEXT: dead $y = LDImm 9
     ; CHECK-NEXT: $a = LDImag8 killed $rc3
     ; CHECK-NEXT: $x = LDImag8 killed $rc2
