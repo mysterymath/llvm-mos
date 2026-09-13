@@ -121,17 +121,17 @@ body: |
     RTS
 ...
 
-# Caller-clobbered backing cannot preserve a value through the call. Imaginary
-# scratch can do so temporarily; afterward a hardware copy restores the
-# invariant without requiring a store back to the assigned backing register.
+# The imaginary repair pass splits a value into call-preserved backing.
+# Hardware allocation must materialize that assigned location before the call.
 ---
-name: temporary_backing
+name: assigned_call_backing
 tracksRegLiveness: true
 registers:
   - { id: 0, class: gpr, assigned-phys: '$rc2' }
+  - { id: 1, class: gpr, split-from: '%0', assigned-phys: '$rc20' }
 body: |
   bb.0:
-    ; CHECK-LABEL: name: temporary_backing
+    ; CHECK-LABEL: name: assigned_call_backing
     ; CHECK: $a = LDAbs 4000
     ; CHECK-NEXT: $rc20 = STImag8 killed $a
     ; CHECK-NEXT: JSR &callee, mos_csr
@@ -139,8 +139,9 @@ body: |
     ; CHECK-NEXT: STAbs killed $a, 4001
     ; CHECK-NEXT: RTS
     %0:gpr = LDAbs 4000
+    %1:gpr = PCOPY killed %0
     JSR &callee, mos_csr
-    STAbs killed %0, 4001
+    STAbs killed %1, 4001
     RTS
 ...
 
@@ -157,12 +158,14 @@ registers:
 body: |
   bb.0:
     ; CHECK-LABEL: name: reg_sequence_copy
-    ; CHECK: $x = LDAbs 5000
-    ; CHECK-NEXT: $a = LDAbs 5001
-    ; CHECK-NEXT: dead $rc3 = STImag8 $a
-    ; CHECK-NEXT: dead $rc2 = STImag8 $x
-    ; CHECK-NEXT: $rc2 = STImag8 killed $x
-    ; CHECK-NEXT: $rc3 = STImag8 killed $a
+    ; CHECK: $a = LDAbs 5000
+    ; CHECK-NEXT: $x = LDAbs 5001
+    ; CHECK-NEXT: dead $rc3 = STImag8 $x
+    ; CHECK-NEXT: dead $rc2 = STImag8 $a
+    ; CHECK-NEXT: dead $rc4 = STImag8 $a
+    ; CHECK-NEXT: dead $rc5 = STImag8 $x
+    ; CHECK-NEXT: $rc2 = STImag8 killed $a
+    ; CHECK-NEXT: $rc3 = STImag8 killed $x
     ; CHECK-NEXT: RTS implicit killed $rs1
     %0:gpr = LDAbs 5000
     %1:gpr = LDAbs 5001
@@ -221,4 +224,42 @@ body: |
     STAbs killed $a, 6003
     STAbs killed %1, 6004
     RTS
+...
+
+# Both values have established backing, and all hardware registers are
+# overwritten before the swap. The PCOPY must break its cycle in hardware;
+# no unassigned imaginary scratch location is available to this pass.
+---
+name: parallel_swap
+tracksRegLiveness: true
+registers:
+  - { id: 0, class: imag8, assigned-phys: '$rc2' }
+  - { id: 1, class: imag8, assigned-phys: '$rc3' }
+  - { id: 2, class: imag8, split-from: '%0', assigned-phys: '$rc3' }
+  - { id: 3, class: imag8, split-from: '%1', assigned-phys: '$rc2' }
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: parallel_swap
+    ; CHECK: $a = LDImag8 $rc0
+    ; CHECK-NEXT: $rc2 = STImag8 killed $a
+    ; CHECK-NEXT: $a = LDImag8 $rc1
+    ; CHECK-NEXT: $rc3 = STImag8 killed $a
+    ; CHECK-NEXT: dead $a = LDImm 7
+    ; CHECK-NEXT: dead $x = LDImm 8
+    ; CHECK-NEXT: dead $y = LDImm 9
+    ; CHECK-NEXT: $a = LDImag8 killed $rc3
+    ; CHECK-NEXT: $x = LDImag8 killed $rc2
+    ; CHECK-NEXT: dead $rc3 = STImag8 $x
+    ; CHECK-NEXT: $rc0 = STImag8 killed $x
+    ; CHECK-NEXT: $rc1 = STImag8 killed $a
+    ; CHECK-NEXT: RTS implicit $rc0, implicit $rc1
+    %0:imag8 = COPY $rc0
+    %1:imag8 = COPY $rc1
+    $a = LDImm 7
+    $x = LDImm 8
+    $y = LDImm 9
+    %2:imag8, %3:imag8 = PCOPY killed %0, killed %1
+    $rc0 = COPY killed %2
+    $rc1 = COPY killed %3
+    RTS implicit $rc0, implicit $rc1
 ...

@@ -16,11 +16,11 @@
 /// eliminate that need.
 ///
 /// Backing registers are assigned by a dominance-order treescan, independently
-/// of operand constraints. MOSRegAlloc may keep copies elsewhere and repairs
-/// constraints locally; live values return to their backing registers at block
-/// boundaries. VirtRegMap carries these assignments to MOSRegAlloc. They may be
-/// outside the vregs' operand classes; MOSRegAlloc realizes those constraints
-/// instead of the ordinary virtual-register rewriter.
+/// of operand constraints. MOSImagRegRepair splits live ranges to satisfy
+/// imaginary constraints while restoring these assignments at block boundaries.
+/// VirtRegMap carries the assignments between passes. They may be outside the
+/// vregs' operand classes; MOSRegAlloc handles hardware register constraints and
+/// may eliminate backing operations by retaining values in hardware registers.
 /// VirtRegMap's split ancestry also records whole-value equality for COPYs and
 /// value-preserving splits. These roots do not merge backing assignments or
 /// live ranges; MOSRegAlloc uses them to identify equal register contents.
@@ -41,8 +41,8 @@
 /// This implementation handles Imag8 and Imag16 backing registers, with Imag8
 /// backing for flags. Physical imaginary definitions contribute ordinary
 /// demand; call clobbers contribute simultaneous dead definitions. Their
-/// required physical locations are left to MOSRegAlloc. This pass does not yet
-/// insert spills; failure of the conservative pressure test is diagnosed.
+/// required physical locations are left to MOSImagRegRepair. This pass does not
+/// yet insert spills; failure of the conservative pressure test is diagnosed.
 ///
 //===----------------------------------------------------------------------===//
 
@@ -60,6 +60,7 @@
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/RegisterClassInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
@@ -204,6 +205,7 @@ void MOSImagRegAlloc::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addPreserved<LiveVariablesWrapperPass>();
   AU.addPreserved<MachineDominatorTreeWrapperPass>();
   AU.addPreserved<MachineRegisterClassInfoWrapperPass>();
+  AU.addPreservedID(UnreachableMachineBlockElimID);
   AU.setPreservesCFG();
 }
 

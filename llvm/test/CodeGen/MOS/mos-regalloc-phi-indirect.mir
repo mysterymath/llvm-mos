@@ -1,13 +1,8 @@
-# XFAIL: *
-# RUN: llc -mtriple=mos -run-pass=mos-regalloc -verify-machineinstrs -o - %s | FileCheck %s
+# RUN: llc -mtriple=mos -run-pass=mos-conventional-ssa,mos-imag-regalloc,mos-imag-reg-repair,mos-regalloc -verify-machineinstrs -o - %s | FileCheck %s
 
-# rs0 contains the address of bb.1 or bb.2. Replacing an indirect successor in
-# the CFG cannot redirect this runtime address through a new repair block.
-# The current allocator changes the successor to bb.3 but leaves JMPIndir
-# unchanged. A jump directly to bb.2 bypasses its PHI copy and stores the value
-# loaded from 1000 instead of 1001. MachineVerifier does not catch this.
-# Preserve the indirect targets; any PHI lowering must execute on the actual
-# paths rather than relying on a successor-list-only edge split.
+# rs0 contains the address of bb.1 or bb.2. CSSA copies must preserve those
+# targets; imaginary and hardware allocation must not insert edge blocks that
+# an indirect branch would bypass.
 # CHECK-LABEL: name: indirect_phi
 # CHECK: bb.0:
 # CHECK-NEXT: successors: %bb.1(0x40000000), %bb.2(0x40000000)
@@ -17,9 +12,9 @@
 name: indirect_phi
 tracksRegLiveness: true
 registers:
-  - { id: 0, class: gpr, assigned-phys: '$rc2' }
-  - { id: 1, class: gpr, assigned-phys: '$rc3' }
-  - { id: 2, class: gpr, assigned-phys: '$rc2' }
+  - { id: 0, class: gpr }
+  - { id: 1, class: gpr }
+  - { id: 2, class: gpr }
 body: |
   bb.0:
     successors: %bb.1, %bb.2

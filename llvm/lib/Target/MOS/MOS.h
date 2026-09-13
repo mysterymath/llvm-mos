@@ -23,6 +23,7 @@ void initializeMOSCombinerPass(PassRegistry &);
 void initializeMOSConventionalSSAPass(PassRegistry &);
 void initializeMOSCopyOptPass(PassRegistry &);
 void initializeMOSImagRegAllocPass(PassRegistry &);
+void initializeMOSImagRegRepairPass(PassRegistry &);
 void initializeMOSIndexIVPass(PassRegistry &);
 void initializeMOSInsertCopiesPass(PassRegistry &);
 void initializeMOSInternalizePass(PassRegistry &);
