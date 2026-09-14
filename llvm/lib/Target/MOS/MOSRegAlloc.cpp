@@ -178,7 +178,8 @@ struct Implementation {
 
 class FunctionAllocator {
 public:
-  FunctionAllocator(MachineFunction &MF, VirtRegMap &VRM, LiveVariables &LV);
+  FunctionAllocator(MachineFunction &MF, const VirtRegMap &VRM,
+                    LiveVariables &LV, const MOSValueNumbering &ValueNumbers);
   void run();
 
 private:
@@ -257,7 +258,7 @@ private:
   // This pass realizes the operands itself and consumes the map's assignments.
   const VirtRegMap &VRM;
   LiveVariables &LV;
-  MOSValueNumbering ValueNumbers;
+  const MOSValueNumbering &ValueNumbers;
   DenseMap<MachineBasicBlock *, BlockPlan> Blocks;
 };
 
@@ -356,11 +357,12 @@ private:
   BitVector Locked;
 };
 
-FunctionAllocator::FunctionAllocator(MachineFunction &MF, VirtRegMap &VRM,
-                                     LiveVariables &LV)
+FunctionAllocator::FunctionAllocator(MachineFunction &MF, const VirtRegMap &VRM,
+                                     LiveVariables &LV,
+                                     const MOSValueNumbering &ValueNumbers)
     : MF(MF), MRI(MF.getRegInfo()), TII(*MF.getSubtarget().getInstrInfo()),
       TRI(*MF.getSubtarget().getRegisterInfo()), VRM(VRM), LV(LV),
-      ValueNumbers(VRM) {}
+      ValueNumbers(ValueNumbers) {}
 
 void FunctionAllocator::run() {
   checkPHIAssignments();
@@ -463,7 +465,7 @@ void FunctionAllocator::BlockSearch::initialize() {
   Allocator.forEachBacking(Entry.LiveRegs, [&](MCPhysReg R, ValueNumber V) {
     if (Entry.FixedRegs[R])
       Allocator.fail("pinned physical live-in overlaps a backing register");
-    assert((!Registers.read(R).Reg || Registers.read(R) == V) &&
+    assert((!Registers.read(R) || Registers.read(R) == V) &&
            "backing assignments interfere");
     Registers.define(R, V);
   });
@@ -516,11 +518,13 @@ bool FunctionAllocator::BlockSearch::restoreLiveOuts(
 bool FunctionAllocator::isRematerialized(const MachineInstr &MI) const {
   return (TII.isTriviallyReMaterializable(MI) &&
           MI.getOperand(0).getReg().isVirtual()) ||
-         (MI.isCopy() && MI.getOperand(0).getReg().isVirtual() &&
+         ((MI.isCopy() || MI.isRegSequence()) &&
+          MI.getOperand(0).getReg().isVirtual() &&
           llvm::all_of(ValueNumbers.subRegIndices(MI.getOperand(0).getReg()),
                        [&](unsigned SubReg) {
-                         return rematerialization(ValueNumbers.getValueNumber(
-                             MI.getOperand(0).getReg(), SubReg));
+                         ValueNumber V = ValueNumbers.getValueNumber(
+                             MI.getOperand(0).getReg(), SubReg);
+                         return V.isUndef() || rematerialization(V);
                        }));
 }
 
@@ -625,6 +629,10 @@ void FunctionAllocator::OperandChoices::buildDomain(unsigned I) {
     if (!RC)
       RC = Allocator.MRI.getRegClass(R);
     llvm::erase_if(Domains[I], [&](MCPhysReg H) { return !RC->contains(H); });
+    // ProcessImplicitDefs can leave an undef imaginary operand without a
+    // definition or backing assignment. Any member satisfies that read.
+    if (MO.isUndef() && Domains[I].empty())
+      Domains[I].push_back(*RC->begin());
   }
   if (Domains[I].empty())
     Allocator.fail("empty operand placement domain", &MI);
@@ -642,22 +650,32 @@ bool FunctionAllocator::OperandChoices::isLegal(unsigned I, MCPhysReg R) const {
     if (!Other.isReg())
       continue;
     MCPhysReg OtherReg = Assignment[J];
+    // Even undef uses of the same register can depend on reading identical
+    // bits within this instruction. Preserve that relationship rather than
+    // choosing their locations independently.
+    if (MO.isUse() && Other.isUse() && MO.getReg() == Other.getReg() &&
+        R != OtherReg)
+      return false;
     if (MO.isTied() && MI.findTiedOperandIdx(I) == J) {
       if (R != OtherReg)
         return false;
       continue;
     }
-    if (!R || !OtherReg || !Allocator.TRI.regsOverlap(R, OtherReg) ||
-        MO.isUndef() || Other.isUndef())
+    if (!R || !OtherReg || !Allocator.TRI.regsOverlap(R, OtherReg))
       continue;
     if (MO.isDef() && Other.isDef())
       return false;
-    if (MO.isUse() && Other.isUse() &&
-        (R != OtherReg ||
-         !Allocator.ValueNumbers.sameValue(MO.getReg(), Other.getReg())))
-      return false;
+    // Undef relaxes contents requirements, not instruction constraints.
+    // Conservatively retain early-clobber exclusions for undef inputs too.
     if ((MO.isEarlyClobber() && Other.isUse() && !isTiedUseAlias(MO, Other)) ||
         (Other.isEarlyClobber() && MO.isUse() && !isTiedUseAlias(Other, MO)))
+      return false;
+    if (MO.isUndef() || Other.isUndef())
+      continue;
+    if (MO.isUse() && Other.isUse() &&
+        (R != OtherReg ||
+         Allocator.ValueNumbers.getValueNumber(MO) !=
+             Allocator.ValueNumbers.getValueNumber(Other)))
       return false;
   }
   return true;
@@ -766,14 +784,16 @@ bool FunctionAllocator::InstructionPlacement::planCopy() {
   } else {
     for (auto [SubReg, Reg] :
          llvm::zip_equal(Allocator.ValueNumbers.subRegIndices(S), Dst)) {
-      if (!Allocator.placeValue(
-              Allocator.ValueNumbers.getValueNumber(S, SubReg), Reg, Plan,
-              After.LiveRegs, Locked))
+      ValueNumber V = Allocator.ValueNumbers.getValueNumber(S, SubReg);
+      if (V.isUndef())
+        continue;
+      if (!Allocator.placeValue(V, Reg, Plan, After.LiveRegs, Locked))
         return false;
       Locked.set(Reg);
     }
-    if (D.isVirtual() && !Allocator.ValueNumbers.sameValue(D, S))
-      Allocator.fail("COPY lacks whole-value ancestry", &MI);
+    if (D.isVirtual() && Allocator.ValueNumbers.getValueNumber(D) !=
+                             Allocator.ValueNumbers.getValueNumber(S))
+      Allocator.fail("COPY changes value identity", &MI);
   }
   Plan.Registers.define(
       Operands[0], D.isVirtual() ? Allocator.ValueNumbers.getValueNumber(D)
@@ -788,30 +808,34 @@ bool FunctionAllocator::InstructionPlacement::planRegSequence() {
   for (unsigned I = 1; I < MI.getNumOperands(); I += 2) {
     unsigned SubReg = MI.getOperand(I + 1).getImm();
     MCPhysReg Reg = Allocator.TRI.getSubReg(Operands[0], SubReg);
-    Register S = MI.getOperand(I).getReg();
-    if (!Allocator.placeValue(Allocator.ValueNumbers.getValueNumber(S), Reg,
-                              Plan, After.LiveRegs, Locked))
+    ValueNumber V = Allocator.ValueNumbers.getValueNumber(
+        MI.getOperand(0).getReg(), SubReg);
+    if (V.isUndef())
+      continue;
+    if (!Allocator.placeValue(V, Reg, Plan, After.LiveRegs, Locked))
       return false;
     Locked.set(Reg);
   }
   Plan.Registers.define(
-      Operands[0], Allocator.ValueNumbers.getDefValueNumber(MI.getOperand(0)));
+      Operands[0], Allocator.ValueNumbers.getValueNumber(MI.getOperand(0)));
   return Allocator.hasLiveValues(Plan.Registers, After.LiveRegs);
 }
 
 bool FunctionAllocator::InstructionPlacement::prepareUses(bool InGPRs) {
   for (unsigned I = 0; I < MI.getNumOperands(); ++I) {
     const MachineOperand &MO = MI.getOperand(I);
-    if (!MO.isReg() || !MO.isUse() || MO.isUndef() || !MO.getReg().isVirtual())
+    if (!MO.isReg() || !MO.isUse() || !MO.getReg().isVirtual())
       continue;
     auto Parts = Allocator.registerParts(Operands[I]);
     if (Parts.empty() || MOS::GPRRegClass.contains(Parts.front()) != InGPRs)
       continue;
+    ValueNumber Value = Allocator.ValueNumbers.getValueNumber(MO);
     for (auto [SubReg, Reg] : llvm::zip_equal(
              Allocator.ValueNumbers.subRegIndices(MO.getReg()), Parts)) {
-      if (!Allocator.placeValue(
-              Allocator.ValueNumbers.getValueNumber(MO.getReg(), SubReg), Reg,
-              Plan, Before.LiveRegs, Locked))
+      ValueNumber V = Allocator.ValueNumbers.getSubValue(Value, SubReg);
+      if (V.isUndef())
+        continue;
+      if (!Allocator.placeValue(V, Reg, Plan, Before.LiveRegs, Locked))
         return false;
       Locked.set(Reg);
     }
@@ -870,7 +894,7 @@ bool FunctionAllocator::InstructionPlacement::define(const MachineOperand &MO) {
           (MO.isEarlyClobber() && Before.FixedRegs[Reg] && !TiedPhysicalUse))
         return false;
   }
-  Plan.Registers.define(Phys, Allocator.ValueNumbers.getDefValueNumber(MO));
+  Plan.Registers.define(Phys, Allocator.ValueNumbers.getValueNumber(MO));
   return true;
 }
 
@@ -881,7 +905,7 @@ void FunctionAllocator::forEachBacking(
     Register R = Register::index2VirtReg(I);
     for (unsigned SubReg : ValueNumbers.subRegIndices(R)) {
       ValueNumber V = ValueNumbers.getValueNumber(R, SubReg);
-      if (rematerialization(V))
+      if (V.isUndef() || rematerialization(V))
         continue;
       MCPhysReg Backing = getBackingRegister(R, SubReg);
       if (!Backing)
@@ -913,12 +937,12 @@ RegisterContents FunctionAllocator::getRegisterContents(
     const AllocationState &State, const SparseBitVector<> &LiveRegs) const {
   RegisterContents Registers(TRI, ValueNumbers);
   for (auto [I, R] : llvm::enumerate(HardwareRegs))
-    if (State.Hardware[I].Reg)
+    if (State.Hardware[I])
       Registers.define(R, State.Hardware[I]);
   forEachBacking(LiveRegs, [&](MCPhysReg R, ValueNumber V) {
     if (Registers.hasCopyIn(V, HardwareRegs) && !State.ValidBackings[R])
       return;
-    assert((!Registers.read(R).Reg || Registers.read(R) == V) &&
+    assert((!Registers.read(R) || Registers.read(R) == V) &&
            "backing assignments interfere");
     Registers.define(R, V);
   });
@@ -967,6 +991,8 @@ bool FunctionAllocator::restoreBackingRegisters(
     Register R = Register::index2VirtReg(I);
     for (unsigned SubReg : ValueNumbers.subRegIndices(R)) {
       ValueNumber A = ValueNumbers.getValueNumber(R, SubReg);
+      if (A.isUndef())
+        continue;
       MCPhysReg H = getBackingRegister(R, SubReg);
       // PHI inputs can be copies of constants. Their assigned backing must
       // still be initialized before control reaches the PHI.
@@ -986,7 +1012,7 @@ bool FunctionAllocator::placeValue(ValueNumber V, MCPhysReg Dst,
                                    const SparseBitVector<> &LiveRegs,
                                    BitVector Locked,
                                    const BitVector *Forbidden) {
-  if (Plan.Registers.read(Dst) == V)
+  if (V.isUndef() || Plan.Registers.read(Dst) == V)
     return true;
   if (Locked[Dst])
     return false;
@@ -1042,10 +1068,12 @@ bool FunctionAllocator::rematerialize(ValueNumber V, MCPhysReg Reg,
   const MachineInstr *Def = rematerialization(V);
   if (!Def)
     return false;
-  Register Source = V.Reg;
+  auto SourceValue = ValueNumbers.source(V);
+  Register Source = SourceValue.Reg;
   MCPhysReg Dst = Reg;
   if (ValueNumbers.subRegIndices(Source).size() == 2) {
-    Dst = TRI.getMatchingSuperReg(Dst, V.SubReg, &MOS::Imag16RegClass);
+    Dst =
+        TRI.getMatchingSuperReg(Dst, SourceValue.SubReg, &MOS::Imag16RegClass);
     if (!Dst)
       return false;
   }
@@ -1221,21 +1249,22 @@ bool FunctionAllocator::hasLiveValues(const RegisterContents &S,
                                       const SparseBitVector<> &LiveRegs) const {
   for (int I : LiveRegs) {
     Register R = Register::index2VirtReg(I);
-    for (unsigned SubReg : ValueNumbers.subRegIndices(R))
-      if (!rematerialization(ValueNumbers.getValueNumber(R, SubReg)) &&
-          !S.hasCopy(ValueNumbers.getValueNumber(R, SubReg)))
+    for (unsigned SubReg : ValueNumbers.subRegIndices(R)) {
+      ValueNumber V = ValueNumbers.getValueNumber(R, SubReg);
+      if (!V.isUndef() && !rematerialization(V) && !S.hasCopy(V))
         return false;
+    }
   }
   return true;
 }
 
 bool FunctionAllocator::isLiveValue(ValueNumber V,
                                     const SparseBitVector<> &LiveRegs) const {
-  if (!V.Reg)
+  if (!V || V.isUndef())
     return false;
   for (int I : LiveRegs) {
     Register R = Register::index2VirtReg(I);
-    if (ValueNumbers.sameValue(ValueNumbers.getValueNumber(R), V))
+    if (ValueNumbers.getValueNumber(R) == V)
       return true;
     for (unsigned SubReg : ValueNumbers.subRegIndices(R))
       if (ValueNumbers.getValueNumber(R, SubReg) == V)
@@ -1282,9 +1311,9 @@ MCPhysReg FunctionAllocator::getBackingRegister(Register R,
 }
 
 const MachineInstr *FunctionAllocator::rematerialization(ValueNumber V) const {
-  if (!V.Reg)
+  if (!V || V.isUndef())
     return nullptr;
-  const MachineInstr *Def = MRI.getVRegDef(V.Reg);
+  const MachineInstr *Def = MRI.getVRegDef(ValueNumbers.source(V).Reg);
   return Def && TII.isTriviallyReMaterializable(*Def) ? Def : nullptr;
 }
 
@@ -1305,6 +1334,8 @@ void FunctionAllocator::emitInstructions(
       for (unsigned I = 0; I < MI->getNumOperands(); ++I) {
         MachineOperand &MO = MI->getOperand(I);
         if (MO.isReg() && MO.getReg().isVirtual()) {
+          if (MO.isUse() && ValueNumbers.getValueNumber(MO).isUndef())
+            MO.setIsUndef();
           MO.setReg(Assignment.Registers[I]);
           MO.setIsRenamable(false);
         }
@@ -1398,7 +1429,8 @@ bool MOSRegAlloc::runOnMachineFunction(MachineFunction &MF) {
   if (!MF.getRegInfo().getNumVirtRegs())
     return false;
   FunctionAllocator(MF, getAnalysis<VirtRegMapWrapperLegacy>().getVRM(),
-                    getAnalysis<LiveVariablesWrapperPass>().getLV())
+                    getAnalysis<LiveVariablesWrapperPass>().getLV(),
+                    getAnalysis<MOSValueNumberingWrapperPass>().valueNumbers())
       .run();
   return true;
 }
@@ -1418,6 +1450,7 @@ MachineFunctionProperties MOSRegAlloc::getClearedProperties() const {
 void MOSRegAlloc::getAnalysisUsage(AnalysisUsage &AU) const {
   MachineFunctionPass::getAnalysisUsage(AU);
   AU.addRequired<LiveVariablesWrapperPass>();
+  AU.addRequired<MOSValueNumberingWrapperPass>();
   AU.addRequired<VirtRegMapWrapperLegacy>();
 }
 
@@ -1427,6 +1460,7 @@ char MOSRegAlloc::ID = 0;
 INITIALIZE_PASS_BEGIN(MOSRegAlloc, DEBUG_TYPE,
                       "MOS hardware register allocation", false, false)
 INITIALIZE_PASS_DEPENDENCY(LiveVariablesWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(MOSValueNumberingWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(VirtRegMapWrapperLegacy)
 INITIALIZE_PASS_END(MOSRegAlloc, DEBUG_TYPE, "MOS hardware register allocation",
                     false, false)

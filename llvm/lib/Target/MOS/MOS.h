@@ -33,6 +33,7 @@ void initializeMOSPostRAScavengingPass(PassRegistry &);
 void initializeMOSRegAllocPass(PassRegistry &);
 void initializeMOSShiftRotateChainPass(PassRegistry &);
 void initializeMOSStaticStackAllocPass(PassRegistry &);
+void initializeMOSValueNumberingWrapperPassPass(PassRegistry &);
 void initializeMOSZeroPageAllocPass(PassRegistry &);
 
 // The behind-by-one property of the std::reverse_iterator adaptor applied by

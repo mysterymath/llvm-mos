@@ -6,8 +6,7 @@
 # RUN: llc -mtriple=mos -start-before=mos-imag-regalloc -stop-after=mos-imag-regalloc -verify-machineinstrs %t/debug.mir -o %t/debug.out
 # RUN: FileCheck %s --check-prefix=DEBUG --input-file=%t/debug.out
 
-# Check the pass in isolation: assignments and value origins are serialized from
-# VirtRegMap, while the instruction stream remains in SSA form.
+# Check the pass in isolation: assignments are serialized from VirtRegMap, while the instruction stream remains in SSA form.
 
 #--- valid.mir
 # Whole COPYs share value origins and may share backing registers even while
@@ -19,10 +18,8 @@ tracksRegLiveness: true
 # CHECK: isSSA: true
 # CHECK: registers:
 # CHECK-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
-# CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ], split-from: '%0',
-# CHECK-NEXT: assigned-phys: '$rc2' }
-# CHECK-NEXT: - { id: 2, class: ac, preferred-register: '', flags: [ ], split-from: '%0',
-# CHECK-NEXT: assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 2, class: ac, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
 # CHECK: body: |
 body: |
   bb.0:
@@ -169,13 +166,10 @@ tracksRegLiveness: true
 # CHECK: registers:
 # CHECK-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
 # CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
-# CHECK-NEXT: - { id: 2, class: gpr, preferred-register: '', flags: [  ], split-from: '%1',
-# CHECK-NEXT: assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 2, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
 # CHECK-NEXT: - { id: 3, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
-# CHECK-NEXT: - { id: 4, class: gpr, preferred-register: '', flags: [  ], split-from: '%6',
-# CHECK-NEXT: assigned-phys: '$rc2' }
-# CHECK-NEXT: - { id: 5, class: gpr, preferred-register: '', flags: [  ], split-from: '%3',
-# CHECK-NEXT: assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 4, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
+# CHECK-NEXT: - { id: 5, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc2' }
 # CHECK-NEXT: - { id: 6, class: gpr, preferred-register: '', flags: [  ], assigned-phys: '$rc3' }
 # CHECK: body: |
 body: |
@@ -262,11 +256,11 @@ tracksRegLiveness: true
 # CHECK: isSSA: true
 # CHECK: registers:
 # CHECK-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [ ] }
-# CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ], split-from: '%0' }
-# CHECK-NEXT: - { id: 2, class: ac, preferred-register: '', flags: [ ], split-from: '%0' }
+# CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ] }
+# CHECK-NEXT: - { id: 2, class: ac, preferred-register: '', flags: [ ] }
 # CHECK-NEXT: - { id: 3, class: cc, preferred-register: '', flags: [ ] }
 # CHECK-NEXT: - { id: 4, class: gpr, preferred-register: '', flags: [ ] }
-# CHECK-NEXT: - { id: 5, class: gpr, preferred-register: '', flags: [ ], split-from: '%4' }
+# CHECK-NEXT: - { id: 5, class: gpr, preferred-register: '', flags: [ ] }
 # CHECK-NEXT: - { id: 6, class: gpr, preferred-register: '', flags: [ ] }
 # CHECK: body: |
 body: |

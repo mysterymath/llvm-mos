@@ -73,9 +73,9 @@ body: |
   ; CHECK-NEXT:   successors: %bb.1(0x80000000)
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT:   $a = LDAbs 1000
-  ; CHECK-NEXT:   $y = LDAbs 1001
+  ; CHECK-NEXT:   $x = LDAbs 1001
   ; CHECK-NEXT:   $rc2 = STImag8 killed $a
-  ; CHECK-NEXT:   $rc3 = STImag8 killed $y
+  ; CHECK-NEXT:   $rc3 = STImag8 killed $x
   ; CHECK-NEXT:   JMP %bb.1
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT: bb.1:
@@ -125,9 +125,9 @@ body: |
   ; CHECK-NEXT:   successors: %bb.1(0x40000000), %bb.2(0x40000000)
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT:   $a = LDAbs 1000
-  ; CHECK-NEXT:   $y = LDAbs 1001
+  ; CHECK-NEXT:   $x = LDAbs 1001
   ; CHECK-NEXT:   $rc3 = STImag8 $a
-  ; CHECK-NEXT:   $rc2 = STImag8 killed $y
+  ; CHECK-NEXT:   $rc2 = STImag8 killed $x
   ; CHECK-NEXT:   CmpBrZero %bb.2, undef $z, 1, killed $a, implicit-def dead $c
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT: bb.1:
@@ -171,9 +171,9 @@ body: |
   ; CHECK-NEXT:   successors: %bb.1(0x40000000), %bb.2(0x40000000)
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT:   $a = LDAbs 1000
-  ; CHECK-NEXT:   $y = LDAbs 1001
+  ; CHECK-NEXT:   $x = LDAbs 1001
   ; CHECK-NEXT:   $rc3 = STImag8 $a
-  ; CHECK-NEXT:   $rc2 = STImag8 killed $y
+  ; CHECK-NEXT:   $rc2 = STImag8 killed $x
   ; CHECK-NEXT:   CmpBrZero %bb.2, undef $z, 1, killed $a, implicit-def dead $c
   ; CHECK-NEXT: {{  $}}
   ; CHECK-NEXT: bb.1:

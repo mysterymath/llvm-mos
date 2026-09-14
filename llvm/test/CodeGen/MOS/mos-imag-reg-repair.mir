@@ -12,12 +12,9 @@ name: physical_definition
 # ASSIGN-LABEL: name: physical_definition
 # ASSIGN: isSSA: true
 # ASSIGN: id: 0, {{.*}}assigned-phys: '$rc2'
-# ASSIGN: id: 1, {{.*}}split-from: '%0',
-# ASSIGN-NEXT: assigned-phys: '$rc3'
-# ASSIGN: id: 2, {{.*}}split-from: '%0',
-# ASSIGN-NEXT: assigned-phys: '$rc2'
-# ASSIGN: id: 3, {{.*}}split-from: '%0',
-# ASSIGN-NEXT: assigned-phys: '$rc2'
+# ASSIGN: id: 1, {{.*}}assigned-phys: '$rc3'
+# ASSIGN: id: 2, {{.*}}assigned-phys: '$rc2'
+# ASSIGN: id: 3, {{.*}}assigned-phys: '$rc2'
 tracksRegLiveness: true
 registers:
   - { id: 0, class: gpr }
@@ -71,8 +68,7 @@ name: live_through_tie
 # ASSIGN: id: 0, {{.*}}assigned-phys: '$rc2'
 # ASSIGN: id: 2, {{.*}}assigned-phys: '$rc4'
 # ASSIGN: id: 3, {{.*}}assigned-phys: '$rc3'
-# ASSIGN: id: 4, {{.*}}split-from: '%0',
-# ASSIGN-NEXT: assigned-phys: '$rc4'
+# ASSIGN: id: 4, {{.*}}assigned-phys: '$rc4'
 tracksRegLiveness: true
 registers:
   - { id: 0, class: anyi8 }
@@ -109,10 +105,8 @@ name: local_definition
 # ASSIGN: id: 0, {{.*}}assigned-phys: '$rc2'
 # ASSIGN: id: 1, {{.*}}assigned-phys: '$rc3'
 # ASSIGN: id: 2, {{.*}}assigned-phys: '$rc4'
-# ASSIGN: id: 3, {{.*}}split-from: '%0',
-# ASSIGN-NEXT: assigned-phys: '$rc3'
-# ASSIGN: id: 4, {{.*}}split-from: '%1',
-# ASSIGN-NEXT: assigned-phys: '$rc2'
+# ASSIGN: id: 3, {{.*}}assigned-phys: '$rc3'
+# ASSIGN: id: 4, {{.*}}assigned-phys: '$rc2'
 tracksRegLiveness: true
 registers:
   - { id: 0, class: anyi8 }
@@ -161,14 +155,10 @@ body: |
 name: repeated_loop_repairs
 # ASSIGN-LABEL: name: repeated_loop_repairs
 # ASSIGN: id: 0, {{.*}}assigned-phys: '$rc2'
-# ASSIGN: id: 1, {{.*}}split-from: '%0',
-# ASSIGN-NEXT: assigned-phys: '$rc3'
-# ASSIGN: id: 2, {{.*}}split-from: '%0',
-# ASSIGN-NEXT: assigned-phys: '$rc4'
-# ASSIGN: id: 3, {{.*}}split-from: '%0',
-# ASSIGN-NEXT: assigned-phys: '$rc2'
-# ASSIGN: id: 4, {{.*}}split-from: '%0',
-# ASSIGN-NEXT: assigned-phys: '$rc2'
+# ASSIGN: id: 1, {{.*}}assigned-phys: '$rc3'
+# ASSIGN: id: 2, {{.*}}assigned-phys: '$rc4'
+# ASSIGN: id: 3, {{.*}}assigned-phys: '$rc2'
+# ASSIGN: id: 4, {{.*}}assigned-phys: '$rc2'
 tracksRegLiveness: true
 body: |
   ; CHECK-LABEL: name: repeated_loop_repairs

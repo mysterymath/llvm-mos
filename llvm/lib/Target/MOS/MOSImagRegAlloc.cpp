@@ -10,8 +10,8 @@
 /// Allocate imaginary registers before MOS register allocation.
 ///
 /// MOSImagRegAlloc operates on conventional SSA machine IR. Its contract is to
-/// make imaginary backing registers assignable by inserting spills and reloads
-/// where necessary, while preserving SSA form. Pressure is assessed assuming
+/// assign imaginary backing registers, inserting spills and reloads where
+/// necessary while preserving SSA form. Pressure is assessed assuming
 /// that values need backing even if subsequent hardware register allocation may
 /// eliminate that need.
 ///
@@ -31,10 +31,10 @@
 /// VirtRegMap carries the assignments between passes. Assignments may be
 /// outside the vregs' operand classes; MOSRegAlloc handles hardware
 /// register constraints and may eliminate backing operations by retaining
-/// values in hardware registers. VirtRegMap's split ancestry also records
-/// whole-value equality for COPYs and value-preserving splits. These roots do
-/// not merge backing assignments or live ranges; MOSRegAlloc uses them to
-/// identify equal register contents.
+/// values in hardware registers. MOSValueNumbering identifies equal contents
+/// through copies and REG_SEQUENCE components. This pass records new splits
+/// in that shared analysis, so both allocators agree on value identities
+/// independently of backing assignments and live ranges.
 ///
 /// Each isolated PHI and its inputs share the backing register of the explicit
 /// IMPLICIT_DEF reservation supplied by MOSConventionalSSA. This reserves a
@@ -46,9 +46,8 @@
 /// Before assigning new backing, the pass scans live registers to check that
 /// enough locations are available. Reservation IMPLICIT_DEFs predict conflicts
 /// at those future boundaries; other registers use their ordinary SSA
-/// lifetimes. Assignment uses the same conflict rule. Conflicts are
-/// conservative: distinct SSA registers may interfere even when they contain
-/// copies of the same value.
+/// lifetimes. Assignment uses the same conflict rule. Ordinary SSA registers
+/// with equal value numbers do not conflict and may share backing storage.
 ///
 /// This implementation handles Imag8 and Imag16 backing registers, with Imag8
 /// backing for flags. Physical imaginary definitions contribute ordinary
@@ -288,7 +287,7 @@ private:
   LiveVariables *LV = nullptr;
   const MachineDominatorTree *MDT = nullptr;
 
-  std::optional<MOSValueNumbering> ValueNumbers;
+  MOSValueNumbering *ValueNumbers = nullptr;
   LiveRegisters LiveRegs;
 
   // Maps local SSA names to their pending restorations. Records follow local
@@ -331,13 +330,12 @@ bool MOSImagRegAlloc::runOnMachineFunction(MachineFunction &F) {
   VRM = &getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
   LV = &getAnalysis<LiveVariablesWrapperPass>().getLV();
   MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
-  ValueNumbers.emplace(*VRM);
+  ValueNumbers = &getAnalysis<MOSValueNumberingWrapperPass>().valueNumbers();
   LiveRegs.init(F, *RCI, *LV, *ValueNumbers);
   PhysRegs.init(*TRI);
   PhysContents.emplace(*TRI, *ValueNumbers);
   Changed = recomputeLiveIns(F.front());
 
-  ValueNumbers->recordCopyOrigins();
   checkPressure();
   assign();
   return Changed;
@@ -357,6 +355,8 @@ void MOSImagRegAlloc::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addPreserved<LiveVariablesWrapperPass>();
   AU.addRequired<MachineDominatorTreeWrapperPass>();
   AU.addRequired<MachineRegisterClassInfoWrapperPass>();
+  AU.addRequired<MOSValueNumberingWrapperPass>();
+  AU.addPreserved<MOSValueNumberingWrapperPass>();
   AU.addRequired<VirtRegMapWrapperLegacy>();
   AU.addPreserved<VirtRegMapWrapperLegacy>();
   AU.addPreserved<MachineDominatorTreeWrapperPass>();
@@ -549,7 +549,7 @@ void MOSImagRegAlloc::assignDefinition(Register R, MCPhysReg Local,
 Register MOSImagRegAlloc::split(Register R, MCPhysReg Phys) {
   Register New = MRI->cloneVirtualRegister(R);
   VRM->grow();
-  VRM->setIsSplitFromReg(New, VRM->getOriginal(R));
+  ValueNumbers->recordCopy(New, R);
   VRM->assignVirt2Phys(New, Phys);
   ChangedRegs.set(R);
   ChangedRegs.set(New);
@@ -610,16 +610,16 @@ void MOSImagRegAlloc::recordCopySourceValue(const MachineInstr &MI) {
   // Before allocating %v = COPY $phys, name unknown source contents with %v's
   // identity. The new virtual range can then share its still-live constraint.
   Register Source = MI.getOperand(1).getReg();
-  if (!PhysContents->read(Source).Reg)
+  if (!PhysContents->read(Source))
     PhysContents->define(Source,
-                         ValueNumbers->getDefValueNumber(MI.getOperand(0)));
+                         ValueNumbers->getValueNumber(MI.getOperand(0)));
 }
 
 void MOSImagRegAlloc::recordPhysicalDefinition(const MachineOperand &MO) {
   MCPhysReg Phys = MO.getReg();
   PhysRegs.removeReg(Phys);
   PhysRegs.addReg(Phys);
-  PhysContents->define(Phys, ValueNumbers->getDefValueNumber(MO));
+  PhysContents->define(Phys, ValueNumbers->getValueNumber(MO));
 }
 
 bool MOSImagRegAlloc::isPhysicalRegisterAvailable(MCPhysReg Phys,
@@ -685,7 +685,8 @@ bool MOSImagRegAlloc::backingAvailable(MCPhysReg Phys, Register Value,
   return llvm::none_of(LiveRegs, [&](Register R) {
     return R != Vacated && !isReservation(R) &&
            TRI->regsOverlap(Phys, VRM->getPhys(R)) &&
-           !ValueNumbers->sameValue(R, Value);
+           ValueNumbers->getValueNumber(R) !=
+               ValueNumbers->getValueNumber(Value);
   });
 }
 
@@ -766,8 +767,10 @@ void MOSImagRegAlloc::displace(MachineInstr &MI, MCPhysReg Phys, Register Value,
   // Preserve incoming values, not results produced by MI itself. In
   // particular, a regmask does not invalidate a new early-clobber result.
   for (Register R : LiveRegs)
-    if (!ValueNumbers->sameValue(R, Value) && !isReservation(R) &&
-        MRI->getVRegDef(R) != &MI && TRI->regsOverlap(Phys, VRM->getPhys(R)))
+    if (ValueNumbers->getValueNumber(R) !=
+            ValueNumbers->getValueNumber(Value) &&
+        !isReservation(R) && MRI->getVRegDef(R) != &MI &&
+        TRI->regsOverlap(Phys, VRM->getPhys(R)))
       Occupants.push_back(R);
   for (Register R : Occupants) {
     bool Pinned = isPhysicalInput(MI, VRM->getPhys(R));
@@ -880,7 +883,7 @@ void MOSImagRegAlloc::assignDefs(MachineInstr &MI, bool Early) {
     Register Source;
     // Implicit alias defs describe the same COPY write, so they preserve the
     // source value just as the explicit whole-register definition does.
-    if (MI.isFullCopy() && ValueNumbers->getDefValueNumber(MO).Reg)
+    if (MI.isFullCopy() && ValueNumbers->getValueNumber(MO))
       Source = MI.getOperand(1).getReg();
     if (needsReg(MO.getReg()))
       displace(MI, MO.getReg(), Source, Early);
@@ -967,7 +970,7 @@ void MOSImagRegAlloc::repairOutgoingUses(MachineBasicBlock &MBB) {
       Register Reg = PHI->getOperand(0).getReg();
       VRM->grow();
       VRM->assignVirt2Phys(Reg, Restore.Phys);
-      VRM->setIsSplitFromReg(Reg, VRM->getOriginal(R));
+      ValueNumbers->recordCopy(Reg, R);
       ChangedRegs.set(Reg);
     }
   }
@@ -1025,7 +1028,15 @@ bool MOSImagRegAlloc::needsReg(Register R) const {
     report_fatal_error(
         "MOSImagRegAlloc only supports Imag8 and Imag16 backing registers",
         /*GenCrashDiag=*/false);
-  const MachineInstr *Def = MRI.getVRegDef(VRM->getOriginal(R));
+  auto V = ValueNumbers->getValueNumber(R);
+  if (V.isUndef()) {
+    // An imaginary-only operand still needs an encodable location, even when
+    // nothing needs to be stored there.
+    const TargetRegisterClass *RC = MRI.getRegClass(R);
+    return MOS::Imag8RegClass.hasSubClassEq(RC) ||
+           MOS::Imag16RegClass.hasSubClassEq(RC);
+  }
+  const MachineInstr *Def = MRI.getVRegDef(ValueNumbers->source(V).Reg);
   return !Def ||
          !MF->getSubtarget().getInstrInfo()->isTriviallyReMaterializable(*Def);
 }
@@ -1109,7 +1120,8 @@ bool LiveRegisters::conflict(Register R, Register LiveReg) const {
     return conflictsWithReservation(LiveReg, R);
   // Simultaneously live copies of this value can share its new assignment,
   // regardless of which locations were chosen for those copies.
-  return !ValueNumbers->sameValue(R, LiveReg);
+  return ValueNumbers->getValueNumber(R) !=
+         ValueNumbers->getValueNumber(LiveReg);
 }
 
 bool LiveRegisters::conflictsWithReservation(Register Root, Register R) const {
@@ -1198,6 +1210,7 @@ INITIALIZE_PASS_BEGIN(MOSImagRegAlloc, DEBUG_TYPE,
 INITIALIZE_PASS_DEPENDENCY(LiveVariablesWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineDominatorTreeWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(MachineRegisterClassInfoWrapperPass)
+INITIALIZE_PASS_DEPENDENCY(MOSValueNumberingWrapperPass)
 INITIALIZE_PASS_DEPENDENCY(VirtRegMapWrapperLegacy)
 INITIALIZE_PASS_END(MOSImagRegAlloc, DEBUG_TYPE,
                     "MOS imaginary register allocation", false, false)

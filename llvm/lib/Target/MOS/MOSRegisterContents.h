@@ -32,7 +32,8 @@ public:
       : TRI(&TRI), ValueNumbers(&ValueNumbers) {}
 
   // Whole-register definitions record both the whole value and its known
-  // subregister values. A partial overwrite invalidates incompatible aliases.
+  // subregister values. Undef components impose no write or contents
+  // requirement. A partial overwrite invalidates incompatible aliases.
   // Missing contents are unknown, not free. Independent subregister writes do
   // not invent a number for super-registers.
   ValueNumber read(MCPhysReg R) const { return Contents.lookup(R); }

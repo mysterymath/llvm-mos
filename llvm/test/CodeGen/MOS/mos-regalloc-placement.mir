@@ -80,18 +80,18 @@ name: partial_backings
 tracksRegLiveness: true
 registers:
   - { id: 0, class: gpr, assigned-phys: '$rc2' }
-  - { id: 1, class: gpr, split-from: '%0', assigned-phys: '$rc3' }
+  - { id: 1, class: gpr, assigned-phys: '$rc3' }
 body: |
   bb.0:
     liveins: $rc2
     ; CHECK-LABEL: name: partial_backings
     ; CHECK: liveins: $rc2
     ; CHECK-NEXT: {{  $}}
-    ; CHECK-NEXT: $y = LDImag8 $rc2
-    ; CHECK-NEXT: STAbs $y, 3100
+    ; CHECK-NEXT: $a = LDImag8 $rc2
+    ; CHECK-NEXT: STAbs $a, 3100
+    ; CHECK-NEXT: dead $rc3 = STImag8 killed $a
     ; CHECK-NEXT: $a = LDImm 7
     ; CHECK-NEXT: $x = LDImm 8
-    ; CHECK-NEXT: dead $rc3 = STImag8 killed $y
     ; CHECK-NEXT: $y = LDImm 9
     ; CHECK-NEXT: STAbs killed $a, 3101
     ; CHECK-NEXT: STAbs killed $x, 3102
@@ -122,16 +122,16 @@ name: distinct_backings
 tracksRegLiveness: true
 registers:
   - { id: 0, class: gpr, assigned-phys: '$rc2' }
-  - { id: 1, class: gpr, split-from: '%0', assigned-phys: '$rc3' }
+  - { id: 1, class: gpr, assigned-phys: '$rc3' }
 body: |
   bb.0:
     liveins: $rc2
     ; CHECK-LABEL: name: distinct_backings
     ; CHECK: liveins: $rc2
     ; CHECK-NEXT: {{  $}}
-    ; CHECK-NEXT: $a = LDImag8 killed $rc2
-    ; CHECK-NEXT: STAbs $a, 3000
-    ; CHECK-NEXT: $rc3 = STImag8 killed $a
+    ; CHECK-NEXT: $y = LDImag8 killed $rc2
+    ; CHECK-NEXT: $rc3 = STImag8 $y
+    ; CHECK-NEXT: STAbs killed $y, 3000
     ; CHECK-NEXT: $a = LDImm 13
     ; CHECK-NEXT: $rc2 = STImag8 killed $a
     ; CHECK-NEXT: $a = LDImm 7
@@ -169,7 +169,7 @@ name: assigned_call_backing
 tracksRegLiveness: true
 registers:
   - { id: 0, class: gpr, assigned-phys: '$rc2' }
-  - { id: 1, class: gpr, split-from: '%0', assigned-phys: '$rc20' }
+  - { id: 1, class: gpr, assigned-phys: '$rc20' }
 body: |
   bb.0:
     ; CHECK-LABEL: name: assigned_call_backing
@@ -195,18 +195,18 @@ registers:
   - { id: 0, class: gpr, assigned-phys: '$rc6' }
   - { id: 1, class: gpr, assigned-phys: '$rc7' }
   - { id: 2, class: imag16, assigned-phys: '$rs1' }
-  - { id: 3, class: imag16, split-from: '%2', assigned-phys: '$rs2' }
+  - { id: 3, class: imag16, assigned-phys: '$rs2' }
 body: |
   bb.0:
     ; CHECK-LABEL: name: reg_sequence_copy
     ; CHECK: $a = LDAbs 5000
-    ; CHECK-NEXT: $y = LDAbs 5001
-    ; CHECK-NEXT: dead $rc3 = STImag8 $y
+    ; CHECK-NEXT: $x = LDAbs 5001
+    ; CHECK-NEXT: dead $rc3 = STImag8 $x
     ; CHECK-NEXT: dead $rc2 = STImag8 $a
     ; CHECK-NEXT: dead $rc4 = STImag8 $a
-    ; CHECK-NEXT: dead $rc5 = STImag8 $y
+    ; CHECK-NEXT: dead $rc5 = STImag8 $x
     ; CHECK-NEXT: $rc2 = STImag8 killed $a
-    ; CHECK-NEXT: $rc3 = STImag8 killed $y
+    ; CHECK-NEXT: $rc3 = STImag8 killed $x
     ; CHECK-NEXT: RTS implicit killed $rs1
     %0:gpr = LDAbs 5000
     %1:gpr = LDAbs 5001
@@ -221,7 +221,7 @@ name: remat_pair
 tracksRegLiveness: true
 registers:
   - { id: 0, class: imag16 }
-  - { id: 1, class: imag16, split-from: '%0' }
+  - { id: 1, class: imag16 }
 body: |
   bb.0:
     ; CHECK-LABEL: name: remat_pair
@@ -276,14 +276,14 @@ tracksRegLiveness: true
 registers:
   - { id: 0, class: imag8, assigned-phys: '$rc2' }
   - { id: 1, class: imag8, assigned-phys: '$rc3' }
-  - { id: 2, class: imag8, split-from: '%0', assigned-phys: '$rc3' }
-  - { id: 3, class: imag8, split-from: '%1', assigned-phys: '$rc2' }
+  - { id: 2, class: imag8, assigned-phys: '$rc3' }
+  - { id: 3, class: imag8, assigned-phys: '$rc2' }
 body: |
   bb.0:
     ; CHECK-LABEL: name: parallel_swap
-    ; CHECK: $a = LDImag8 $rc0
+    ; CHECK: $y = LDImag8 $rc0
+    ; CHECK-NEXT: $rc2 = STImag8 killed $y
     ; CHECK-NEXT: $y = LDImag8 $rc1
-    ; CHECK-NEXT: $rc2 = STImag8 killed $a
     ; CHECK-NEXT: dead $a = LDImm 7
     ; CHECK-NEXT: dead $x = LDImm 8
     ; CHECK-NEXT: $rc3 = STImag8 killed $y

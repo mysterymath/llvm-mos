@@ -66,6 +66,7 @@ extern "C" LLVM_EXTERNAL_VISIBILITY void LLVMInitializeMOSTarget() {
   initializeMOSConventionalSSAPass(PR);
   initializeMOSCopyOptPass(PR);
   initializeMOSImagRegAllocPass(PR);
+  initializeMOSValueNumberingWrapperPassPass(PR);
   initializeMOSInsertCopiesPass(PR);
   initializeMOSInternalizePass(PR);
   initializeMOSLateOptimizationPass(PR);
@@ -287,6 +288,8 @@ void MOSPassConfig::addMachineSSAOptimization() {
 }
 
 void MOSPassConfig::addOptimizedRegAlloc() {
+  // Process ordinary implicit defs before CSSA creates backing reservations.
+  addPass(&ProcessImplicitDefsID);
   addPass(createMOSConventionalSSAPass());
   addPass(createMOSImagRegAllocPass());
   addPass(createMOSRegAllocPass());
