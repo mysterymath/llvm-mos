@@ -275,3 +275,70 @@ body: |
     STAbs %0, 2001
     RTS
 ...
+
+# Equal live copies may share a fixed destination without evacuating one another.
+---
+name: fixed_equal_copies
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: fixed_equal_copies
+    ; CHECK: [[LDAbs:%[0-9]+]]:gpr = LDAbs 1000
+    ; CHECK-NEXT: [[COPY:%[0-9]+]]:gpr = COPY [[LDAbs]]
+    ; CHECK-NEXT: $rc2 = COPY [[COPY]]
+    ; CHECK-NEXT: JSR &callee, implicit killed $rc2
+    ; CHECK-NEXT: STAbs killed [[LDAbs]], 2000
+    ; CHECK-NEXT: STAbs killed [[COPY]], 2001
+    ; CHECK-NEXT: RTS
+    ;
+    ; HW-LABEL: name: fixed_equal_copies
+    ; HW: $a = LDAbs 1000
+    ; HW-NEXT: $rc2 = STImag8 $a
+    ; HW-NEXT: JSR &callee, implicit killed $rc2
+    ; HW-NEXT: STAbs $a, 2000
+    ; HW-NEXT: STAbs killed $a, 2001
+    ; HW-NEXT: RTS
+    %0:gpr = LDAbs 1000
+    %1:gpr = COPY %0
+    $rc2 = COPY %1
+    JSR &callee, implicit $rc2
+    STAbs %0, 2000
+    STAbs %1, 2001
+    RTS
+...
+
+# Killing one copy does not release storage still holding the old value for
+# another live copy. A destructive tie must use a separate location.
+---
+name: tied_equal_copies
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: tied_equal_copies
+    ; CHECK: [[COPY:%[0-9]+]]:anyi8 = COPY $rc0
+    ; CHECK-NEXT: [[COPY1:%[0-9]+]]:anyi8 = COPY [[COPY]]
+    ; CHECK-NEXT: [[PCOPY:%[0-9]+]]:anyi8 = PCOPY killed [[COPY1]]
+    ; CHECK-NEXT: [[IncMB:%[0-9]+]]:anyi8 = IncMB killed [[PCOPY]](tied-def 0), implicit-def dead $c, implicit-def dead $v
+    ; CHECK-NEXT: $a = COPY killed [[COPY]]
+    ; CHECK-NEXT: STAbs killed $a, 2000
+    ; CHECK-NEXT: $a = COPY killed [[IncMB]]
+    ; CHECK-NEXT: STAbs killed $a, 2001
+    ; CHECK-NEXT: RTS
+    ;
+    ; HW-LABEL: name: tied_equal_copies
+    ; HW: $a = LDImag8 $rc0
+    ; HW-NEXT: $x = TA $a
+    ; HW-NEXT: $x = IncMB killed $x(tied-def 0), implicit-def dead $c, implicit-def dead $v
+    ; HW-NEXT: STAbs killed $a, 2000
+    ; HW-NEXT: $a = T_A killed $x
+    ; HW-NEXT: STAbs killed $a, 2001
+    ; HW-NEXT: RTS
+    %0:anyi8 = COPY $rc0
+    %1:anyi8 = COPY %0
+    %2:anyi8 = IncMB %1(tied-def 0), implicit-def $c, implicit-def $v
+    $a = COPY %0
+    STAbs $a, 2000
+    $a = COPY %2
+    STAbs $a, 2001
+    RTS
+...

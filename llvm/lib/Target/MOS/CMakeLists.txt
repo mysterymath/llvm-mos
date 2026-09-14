@@ -52,6 +52,7 @@ add_llvm_target(MOSCodeGen
   MOSSubtarget.cpp
   MOSTargetMachine.cpp
   MOSTargetObjectFile.cpp
+  MOSValueNumbering.cpp
   MOSZeroPageAlloc.cpp
 
   DEPENDS

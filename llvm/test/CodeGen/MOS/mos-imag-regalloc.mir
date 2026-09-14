@@ -10,8 +10,8 @@
 # VirtRegMap, while the instruction stream remains in SSA form.
 
 #--- valid.mir
-# Whole COPYs share value origins, but overlapping lifetimes need distinct
-# backing registers.
+# Whole COPYs share value origins and may share backing registers even while
+# their lifetimes overlap.
 ---
 name: copy_origins
 tracksRegLiveness: true
@@ -20,9 +20,9 @@ tracksRegLiveness: true
 # CHECK: registers:
 # CHECK-NEXT: - { id: 0, class: gpr, preferred-register: '', flags: [ ], assigned-phys: '$rc2' }
 # CHECK-NEXT: - { id: 1, class: gpr, preferred-register: '', flags: [ ], split-from: '%0',
-# CHECK-NEXT: assigned-phys: '$rc3' }
+# CHECK-NEXT: assigned-phys: '$rc2' }
 # CHECK-NEXT: - { id: 2, class: ac, preferred-register: '', flags: [ ], split-from: '%0',
-# CHECK-NEXT: assigned-phys: '$rc4' }
+# CHECK-NEXT: assigned-phys: '$rc2' }
 # CHECK: body: |
 body: |
   bb.0:

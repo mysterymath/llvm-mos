@@ -13,6 +13,74 @@
 # consume values without adding physical backing demand.
 
 #--- valid.mir
+# More live copies than backing locations still fit: each new definition holds
+# the same value as every earlier assignment, so none of them blocks it.
+---
+name: equal_copies
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:gpr = LDAbs 1000
+    %1:gpr = COPY %0
+    %2:gpr = COPY %1
+    %3:gpr = COPY %2
+    %4:gpr = COPY %3
+    %5:gpr = COPY %4
+    %6:gpr = COPY %5
+    %7:gpr = COPY %6
+    %8:gpr = COPY %7
+    %9:gpr = COPY %8
+    %10:gpr = COPY %9
+    %11:gpr = COPY %10
+    %12:gpr = COPY %11
+    %13:gpr = COPY %12
+    %14:gpr = COPY %13
+    %15:gpr = COPY %14
+    %16:gpr = COPY %15
+    %17:gpr = COPY %16
+    %18:gpr = COPY %17
+    %19:gpr = COPY %18
+    %20:gpr = COPY %19
+    %21:gpr = COPY %20
+    %22:gpr = COPY %21
+    %23:gpr = COPY %22
+    %24:gpr = COPY %23
+    %25:gpr = COPY %24
+    %26:gpr = COPY %25
+    %27:gpr = COPY %26
+    %28:gpr = COPY %27
+    STAbs %0, 2000
+    STAbs %1, 2001
+    STAbs %2, 2002
+    STAbs %3, 2003
+    STAbs %4, 2004
+    STAbs %5, 2005
+    STAbs %6, 2006
+    STAbs %7, 2007
+    STAbs %8, 2008
+    STAbs %9, 2009
+    STAbs %10, 2010
+    STAbs %11, 2011
+    STAbs %12, 2012
+    STAbs %13, 2013
+    STAbs %14, 2014
+    STAbs %15, 2015
+    STAbs %16, 2016
+    STAbs %17, 2017
+    STAbs %18, 2018
+    STAbs %19, 2019
+    STAbs %20, 2020
+    STAbs %21, 2021
+    STAbs %22, 2022
+    STAbs %23, 2023
+    STAbs %24, 2024
+    STAbs %25, 2025
+    STAbs %26, 2026
+    STAbs %27, 2027
+    STAbs %28, 2028
+    RTS
+...
+
 # One physical pair plus thirteen virtual pairs fits; splitting the physical
 # pair into two byte demands would reject the last virtual pair.
 ---

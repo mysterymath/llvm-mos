@@ -43,6 +43,7 @@
 #include "MOS.h"
 #include "MOSRegisterInfo.h"
 #include "MOSSubtarget.h"
+#include "MOSValueNumbering.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -74,10 +75,7 @@ STATISTIC(NumTransfers, "Number of MOS register transfers emitted");
 
 namespace {
 
-// Uniquely identifies a static value. getValueNumber resolves known copies to
-// a canonical source SSA register and subregister index. A null register
-// denotes unknown contents.
-using ValueNumber = TargetInstrInfo::RegSubRegPair;
+using ValueNumber = MOSValueNumbering::ValueNumber;
 
 constexpr std::array<MCPhysReg, 5> HardwareRegs = {MOS::A, MOS::X, MOS::Y,
                                                    MOS::C, MOS::V};
@@ -218,8 +216,7 @@ struct Implementation {
 
 class FunctionAllocator {
 public:
-  FunctionAllocator(MachineFunction &MF, const VirtRegMap &VRM,
-                    LiveVariables &LV);
+  FunctionAllocator(MachineFunction &MF, VirtRegMap &VRM, LiveVariables &LV);
   void run();
 
 private:
@@ -278,13 +275,8 @@ private:
   bool hasLiveValues(const RegisterContents &S,
                      const SparseBitVector<> &LiveRegs) const;
   bool isLiveValue(ValueNumber V, const SparseBitVector<> &LiveRegs) const;
-  bool sameValue(Register A, Register B) const;
   SparseBitVector<> liveOuts(MachineBasicBlock &MBB) const;
 
-  // Select each independently tracked value: both bytes of an Imag16, or
-  // the whole register (index 0) for an Imag8 or flag.
-  ArrayRef<unsigned> subRegIndices(Register R) const;
-  ValueNumber getValueNumber(Register R, unsigned SubReg = 0) const;
   // Storage modeled by the search: A/X/Y/C/V and Imag8. An Imag16 denotes
   // its two Imag8s; implicit hardware aliases are not separate storage.
   SmallVector<MCPhysReg, 2> registerParts(MCPhysReg R) const;
@@ -303,6 +295,7 @@ private:
   // This pass realizes the operands itself and consumes the map's assignments.
   const VirtRegMap &VRM;
   LiveVariables &LV;
+  MOSValueNumbering ValueNumbers;
   DenseMap<MachineBasicBlock *, BlockPlan> Blocks;
 };
 
@@ -401,10 +394,11 @@ private:
   BitVector Locked;
 };
 
-FunctionAllocator::FunctionAllocator(MachineFunction &MF, const VirtRegMap &VRM,
+FunctionAllocator::FunctionAllocator(MachineFunction &MF, VirtRegMap &VRM,
                                      LiveVariables &LV)
     : MF(MF), MRI(MF.getRegInfo()), TII(*MF.getSubtarget().getInstrInfo()),
-      TRI(*MF.getSubtarget().getRegisterInfo()), VRM(VRM), LV(LV) {}
+      TRI(*MF.getSubtarget().getRegisterInfo()), VRM(VRM), LV(LV),
+      ValueNumbers(VRM) {}
 
 void FunctionAllocator::run() {
   checkPHIAssignments();
@@ -561,10 +555,10 @@ bool FunctionAllocator::isRematerialized(const MachineInstr &MI) const {
   return (TII.isTriviallyReMaterializable(MI) &&
           MI.getOperand(0).getReg().isVirtual()) ||
          (MI.isCopy() && MI.getOperand(0).getReg().isVirtual() &&
-          llvm::all_of(subRegIndices(MI.getOperand(0).getReg()),
+          llvm::all_of(ValueNumbers.subRegIndices(MI.getOperand(0).getReg()),
                        [&](unsigned SubReg) {
-                         return rematerialization(
-                             getValueNumber(MI.getOperand(0).getReg(), SubReg));
+                         return rematerialization(ValueNumbers.getValueNumber(
+                             MI.getOperand(0).getReg(), SubReg));
                        }));
 }
 
@@ -580,9 +574,9 @@ void FunctionAllocator::InstructionSearch::run() {
     Implementation Plan(Incoming);
     Register R = MI.getOperand(0).getReg();
     if (!Allocator.MRI.use_nodbg_empty(R))
-      for (unsigned SubReg : Allocator.subRegIndices(R))
+      for (unsigned SubReg : Allocator.ValueNumbers.subRegIndices(R))
         Plan.Registers.define(Allocator.getBackingRegister(R, SubReg),
-                              Allocator.getValueNumber(R, SubReg));
+                              Allocator.ValueNumbers.getValueNumber(R, SubReg));
     finish(std::move(Plan));
     return;
   }
@@ -697,7 +691,8 @@ bool FunctionAllocator::OperandChoices::isLegal(unsigned I, MCPhysReg R) const {
     if (MO.isDef() && Other.isDef())
       return false;
     if (MO.isUse() && Other.isUse() &&
-        (R != OtherReg || !Allocator.sameValue(MO.getReg(), Other.getReg())))
+        (R != OtherReg ||
+         !Allocator.ValueNumbers.sameValue(MO.getReg(), Other.getReg())))
       return false;
     if ((MO.isEarlyClobber() && Other.isUse() && !isTiedUseAlias(MO, Other)) ||
         (Other.isEarlyClobber() && MO.isUse() && !isTiedUseAlias(Other, MO)))
@@ -789,25 +784,29 @@ bool FunctionAllocator::InstructionPlacement::planCopy() {
     // Capture the existing physical bits without emitting a transfer when the
     // chosen destination is the source. The fixed live range protects them.
     for (auto [SubReg, Reg] :
-         llvm::zip_equal(Allocator.subRegIndices(D), Src)) {
+         llvm::zip_equal(Allocator.ValueNumbers.subRegIndices(D), Src)) {
       if (!Allocator.evacuate(Reg, Plan, After.LiveRegs, Locked,
                               BitVector(MOS::NUM_TARGET_REGS)))
         return false;
-      Plan.Registers.define(Reg, Allocator.getValueNumber(D, SubReg));
+      Plan.Registers.define(Reg,
+                            Allocator.ValueNumbers.getValueNumber(D, SubReg));
     }
-    for (auto [SubReg, Reg] : llvm::zip_equal(Allocator.subRegIndices(D), Dst))
-      if (!Allocator.placeValue(Allocator.getValueNumber(D, SubReg), Reg, Plan,
-                                After.LiveRegs, Locked))
+    for (auto [SubReg, Reg] :
+         llvm::zip_equal(Allocator.ValueNumbers.subRegIndices(D), Dst))
+      if (!Allocator.placeValue(
+              Allocator.ValueNumbers.getValueNumber(D, SubReg), Reg, Plan,
+              After.LiveRegs, Locked))
         return false;
   } else {
     for (auto [SubReg, Reg] :
-         llvm::zip_equal(Allocator.subRegIndices(S), Dst)) {
-      if (!Allocator.placeValue(Allocator.getValueNumber(S, SubReg), Reg, Plan,
-                                After.LiveRegs, Locked))
+         llvm::zip_equal(Allocator.ValueNumbers.subRegIndices(S), Dst)) {
+      if (!Allocator.placeValue(
+              Allocator.ValueNumbers.getValueNumber(S, SubReg), Reg, Plan,
+              After.LiveRegs, Locked))
         return false;
       Locked.set(Reg);
     }
-    if (D.isVirtual() && !Allocator.sameValue(D, S))
+    if (D.isVirtual() && !Allocator.ValueNumbers.sameValue(D, S))
       Allocator.fail("COPY lacks whole-value ancestry", &MI);
   }
   return Allocator.hasLiveValues(Plan.Registers, After.LiveRegs);
@@ -821,8 +820,8 @@ bool FunctionAllocator::InstructionPlacement::planRegSequence() {
     unsigned SubReg = MI.getOperand(I + 1).getImm();
     MCPhysReg Reg = Allocator.TRI.getSubReg(Operands[0], SubReg);
     Register S = MI.getOperand(I).getReg();
-    if (!Allocator.placeValue(Allocator.getValueNumber(S), Reg, Plan,
-                              After.LiveRegs, Locked))
+    if (!Allocator.placeValue(Allocator.ValueNumbers.getValueNumber(S), Reg,
+                              Plan, After.LiveRegs, Locked))
       return false;
     Locked.set(Reg);
   }
@@ -837,10 +836,11 @@ bool FunctionAllocator::InstructionPlacement::prepareUses(bool InGPRs) {
     auto Parts = Allocator.registerParts(Operands[I]);
     if (Parts.empty() || MOS::GPRRegClass.contains(Parts.front()) != InGPRs)
       continue;
-    for (auto [SubReg, Reg] :
-         llvm::zip_equal(Allocator.subRegIndices(MO.getReg()), Parts)) {
-      if (!Allocator.placeValue(Allocator.getValueNumber(MO.getReg(), SubReg),
-                                Reg, Plan, Before.LiveRegs, Locked))
+    for (auto [SubReg, Reg] : llvm::zip_equal(
+             Allocator.ValueNumbers.subRegIndices(MO.getReg()), Parts)) {
+      if (!Allocator.placeValue(
+              Allocator.ValueNumbers.getValueNumber(MO.getReg(), SubReg), Reg,
+              Plan, Before.LiveRegs, Locked))
         return false;
       Locked.set(Reg);
     }
@@ -889,7 +889,7 @@ bool FunctionAllocator::InstructionPlacement::applyInstruction() {
 bool FunctionAllocator::InstructionPlacement::define(const MachineOperand &MO) {
   auto Parts = Allocator.registerParts(Operands[MO.getOperandNo()]);
   for (auto [SubReg, Reg] :
-       llvm::zip(Allocator.subRegIndices(MO.getReg()), Parts)) {
+       llvm::zip(Allocator.ValueNumbers.subRegIndices(MO.getReg()), Parts)) {
     if (MO.getReg().isPhysical()) {
       // Fixed liveness protects this result; a later COPY assigns its value
       // number when it captures the physical contents into an SSA register.
@@ -903,7 +903,8 @@ bool FunctionAllocator::InstructionPlacement::define(const MachineOperand &MO) {
     if (After.FixedRegs[Reg] ||
         (MO.isEarlyClobber() && Before.FixedRegs[Reg] && !TiedPhysicalUse))
       return false;
-    Plan.Registers.define(Reg, Allocator.getValueNumber(MO.getReg(), SubReg));
+    Plan.Registers.define(
+        Reg, Allocator.ValueNumbers.getValueNumber(MO.getReg(), SubReg));
   }
   return true;
 }
@@ -913,8 +914,8 @@ void FunctionAllocator::forEachBacking(
     function_ref<void(MCPhysReg, ValueNumber)> Visit) const {
   for (unsigned I : LiveRegs) {
     Register R = Register::index2VirtReg(I);
-    for (unsigned SubReg : subRegIndices(R)) {
-      ValueNumber V = getValueNumber(R, SubReg);
+    for (unsigned SubReg : ValueNumbers.subRegIndices(R)) {
+      ValueNumber V = ValueNumbers.getValueNumber(R, SubReg);
       if (rematerialization(V))
         continue;
       MCPhysReg Backing = getBackingRegister(R, SubReg);
@@ -990,8 +991,8 @@ bool FunctionAllocator::restoreBackingRegisters(
     const SparseBitVector<> &Preserve, BitVector Locked) {
   for (int I : LiveRegs) {
     Register R = Register::index2VirtReg(I);
-    for (unsigned SubReg : subRegIndices(R)) {
-      ValueNumber A = getValueNumber(R, SubReg);
+    for (unsigned SubReg : ValueNumbers.subRegIndices(R)) {
+      ValueNumber A = ValueNumbers.getValueNumber(R, SubReg);
       MCPhysReg H = getBackingRegister(R, SubReg);
       // PHI inputs can be copies of constants. Their assigned backing must
       // still be initialized before control reaches the PHI.
@@ -1069,7 +1070,7 @@ bool FunctionAllocator::rematerialize(ValueNumber V, MCPhysReg Reg,
     return false;
   Register Source = V.Reg;
   MCPhysReg Dst = Reg;
-  if (subRegIndices(Source).size() == 2) {
+  if (ValueNumbers.subRegIndices(Source).size() == 2) {
     Dst = TRI.getMatchingSuperReg(Dst, V.SubReg, &MOS::Imag16RegClass);
     if (!Dst)
       return false;
@@ -1081,7 +1082,7 @@ bool FunctionAllocator::rematerialize(ValueNumber V, MCPhysReg Reg,
     return false;
 
   auto Parts = registerParts(Dst);
-  if (Parts.size() != subRegIndices(Source).size())
+  if (Parts.size() != ValueNumbers.subRegIndices(Source).size())
     return false;
   BitVector Clobbered = Forbidden;
   for (MCPhysReg Part : Parts) {
@@ -1096,8 +1097,9 @@ bool FunctionAllocator::rematerialize(ValueNumber V, MCPhysReg Reg,
   Ops[0] = Dst;
   Plan.Instructions.push_back(Rematerialization{Def, Dst});
   Plan.Cost += instructionCost(*Def, Ops);
-  for (auto [SubReg, Part] : llvm::zip_equal(subRegIndices(Source), Parts))
-    Plan.Registers.define(Part, getValueNumber(Source, SubReg));
+  for (auto [SubReg, Part] :
+       llvm::zip_equal(ValueNumbers.subRegIndices(Source), Parts))
+    Plan.Registers.define(Part, ValueNumbers.getValueNumber(Source, SubReg));
   return true;
 }
 
@@ -1230,7 +1232,7 @@ unsigned FunctionAllocator::instructionCost(const MachineInstr &MI,
 
 SmallVector<MCPhysReg> FunctionAllocator::destinations(Register R) const {
   SmallVector<MCPhysReg> Result;
-  if (subRegIndices(R).size() == 1) {
+  if (ValueNumbers.subRegIndices(R).size() == 1) {
     if (TRI.getRegSizeInBits(*MRI.getRegClass(R)) == 1)
       Result.append({MOS::C, MOS::V});
     else
@@ -1245,9 +1247,9 @@ bool FunctionAllocator::hasLiveValues(const RegisterContents &S,
                                       const SparseBitVector<> &LiveRegs) const {
   for (int I : LiveRegs) {
     Register R = Register::index2VirtReg(I);
-    for (unsigned SubReg : subRegIndices(R))
-      if (!rematerialization(getValueNumber(R, SubReg)) &&
-          !S.hasCopy(getValueNumber(R, SubReg)))
+    for (unsigned SubReg : ValueNumbers.subRegIndices(R))
+      if (!rematerialization(ValueNumbers.getValueNumber(R, SubReg)) &&
+          !S.hasCopy(ValueNumbers.getValueNumber(R, SubReg)))
         return false;
   }
   return true;
@@ -1259,23 +1261,11 @@ bool FunctionAllocator::isLiveValue(ValueNumber V,
     return false;
   for (int I : LiveRegs) {
     Register R = Register::index2VirtReg(I);
-    for (unsigned SubReg : subRegIndices(R))
-      if (getValueNumber(R, SubReg) == V)
+    for (unsigned SubReg : ValueNumbers.subRegIndices(R))
+      if (ValueNumbers.getValueNumber(R, SubReg) == V)
         return true;
   }
   return false;
-}
-
-bool FunctionAllocator::sameValue(Register A, Register B) const {
-  if (A == B)
-    return true;
-  if (!A.isVirtual() || !B.isVirtual() ||
-      subRegIndices(A).size() != subRegIndices(B).size())
-    return false;
-  for (unsigned SubReg : subRegIndices(A))
-    if (getValueNumber(A, SubReg) != getValueNumber(B, SubReg))
-      return false;
-  return true;
 }
 
 SparseBitVector<> FunctionAllocator::liveOuts(MachineBasicBlock &MBB) const {
@@ -1296,36 +1286,6 @@ SparseBitVector<> FunctionAllocator::liveOuts(MachineBasicBlock &MBB) const {
             !Phi.getOperand(I).isUndef())
           LiveRegs.set(Phi.getOperand(I).getReg().virtRegIndex());
   return LiveRegs;
-}
-
-ArrayRef<unsigned> FunctionAllocator::subRegIndices(Register R) const {
-  static constexpr unsigned Whole[] = {0};
-  static constexpr unsigned Bytes[] = {MOS::sublo, MOS::subhi};
-  bool IsImag16 = R.isPhysical()
-                      ? MOS::Imag16RegClass.contains(R)
-                      : TRI.getRegSizeInBits(*MRI.getRegClass(R)) == 16;
-  return IsImag16 ? ArrayRef<unsigned>(Bytes) : ArrayRef<unsigned>(Whole);
-}
-
-ValueNumber FunctionAllocator::getValueNumber(Register R,
-                                              unsigned SubReg) const {
-  assert(llvm::is_contained(subRegIndices(R), SubReg));
-  // Copy ancestry preserves size and byte order. REG_SEQUENCE additionally
-  // identifies a pair's selected byte with an entire Imag8 source value.
-  R = VRM.getOriginal(R);
-  const MachineInstr *Def = MRI.getVRegDef(R);
-  if (Def && Def->getOpcode() == TargetOpcode::REG_SEQUENCE)
-    for (unsigned I = 1; I < Def->getNumOperands(); I += 2) {
-      const MachineOperand &Source = Def->getOperand(I);
-      if (Def->getOperand(I + 1).getImm() == SubReg &&
-          Source.getReg().isVirtual() && !Source.isUndef() &&
-          !Source.getSubReg() &&
-          TRI.getRegSizeInBits(*MRI.getRegClass(Source.getReg())) == 8)
-        return ValueNumber(VRM.getOriginal(Source.getReg()));
-    }
-  // PHIs and physical-register captures introduce new values. In particular,
-  // loop-carried PHI operands are not unconditionally equal to their result.
-  return ValueNumber(R, SubReg);
 }
 
 SmallVector<MCPhysReg, 2> FunctionAllocator::registerParts(MCPhysReg R) const {
