@@ -45,6 +45,7 @@ add_llvm_target(MOSCodeGen
   MOSNonReentrant.cpp
   MOSPostRAScavenging.cpp
   MOSRegAlloc.cpp
+  MOSRegisterContents.cpp
   MOSRegisterBankInfo.cpp
   MOSRegisterInfo.cpp
   MOSShiftRotateChain.cpp

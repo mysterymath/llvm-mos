@@ -72,7 +72,7 @@ ArrayRef<unsigned> MOSValueNumbering::subRegIndices(Register R) const {
 
 MOSValueNumbering::ValueNumber
 MOSValueNumbering::getValueNumber(Register R, unsigned SubReg) const {
-  assert(llvm::is_contained(subRegIndices(R), SubReg));
+  assert(!SubReg || llvm::is_contained(subRegIndices(R), SubReg));
   // Copy ancestry preserves size and byte order. REG_SEQUENCE additionally
   // identifies a pair's selected byte with an entire Imag8 source value.
   R = VRM.getOriginal(R);
@@ -89,6 +89,46 @@ MOSValueNumbering::getValueNumber(Register R, unsigned SubReg) const {
   // PHIs and physical-register captures introduce new values. In particular,
   // loop-carried PHI operands are not unconditionally equal to their result.
   return ValueNumber(R, SubReg);
+}
+
+MOSValueNumbering::ValueNumber
+MOSValueNumbering::getDefValueNumber(const MachineOperand &MO,
+                                     unsigned SubReg) const {
+  assert(MO.isDef());
+  if (MO.getReg().isVirtual())
+    return getValueNumber(MO.getReg(), SubReg);
+  const MachineInstr &MI = *MO.getParent();
+  if (!MI.isFullCopy() || !MI.getOperand(0).getReg().isPhysical() ||
+      !MI.getOperand(1).getReg().isVirtual() || MI.getOperand(1).isUndef())
+    return {};
+  MCPhysReg Dst = MI.getOperand(0).getReg();
+  Register Source = MI.getOperand(1).getReg();
+  MCPhysReg Part = MO.getReg();
+  if (SubReg)
+    Part = TRI.getSubReg(Part, SubReg);
+  unsigned SourceSubReg = TRI.getSubRegIndex(Dst, Part);
+  if ((Part != Dst && !SourceSubReg) ||
+      (SourceSubReg &&
+       !llvm::is_contained(subRegIndices(Source), SourceSubReg)))
+    return {};
+  return getValueNumber(Source, SourceSubReg);
+}
+
+MOSValueNumbering::ValueNumber
+MOSValueNumbering::getSubValue(ValueNumber V, unsigned SubReg) const {
+  if (!V.Reg || !SubReg)
+    return V;
+  if (V.SubReg || !llvm::is_contained(subRegIndices(V.Reg), SubReg))
+    return {};
+  return getValueNumber(V.Reg, SubReg);
+}
+
+bool MOSValueNumbering::sameValue(ValueNumber A, ValueNumber B) const {
+  if (A == B)
+    return true;
+  if (!A.Reg || !B.Reg || A.SubReg || B.SubReg)
+    return false;
+  return sameValue(A.Reg, B.Reg);
 }
 
 bool MOSValueNumbering::sameValue(Register A, Register B) const {

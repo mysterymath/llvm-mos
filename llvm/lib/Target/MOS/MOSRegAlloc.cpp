@@ -41,6 +41,7 @@
 #include "MOSRegAlloc.h"
 #include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
+#include "MOSRegisterContents.h"
 #include "MOSRegisterInfo.h"
 #include "MOSSubtarget.h"
 #include "MOSValueNumbering.h"
@@ -76,6 +77,7 @@ STATISTIC(NumTransfers, "Number of MOS register transfers emitted");
 namespace {
 
 using ValueNumber = MOSValueNumbering::ValueNumber;
+using RegisterContents = MOSRegisterContents;
 
 constexpr std::array<MCPhysReg, 5> HardwareRegs = {MOS::A, MOS::X, MOS::Y,
                                                    MOS::C, MOS::V};
@@ -161,51 +163,11 @@ struct BlockPlan {
   SmallVector<ProgramPoint> Points;
 };
 
-// Known contents of physical registers during instruction search. Imag16
-// contents are stored under their Imag8 subregisters, so a byte overwrite
-// affects only that byte. Missing entries have unknown contents.
-class RegisterContents {
-public:
-  ValueNumber read(MCPhysReg R) const { return Contents.lookup(R); }
-  void define(MCPhysReg R, ValueNumber V) {
-    assert(R && V.Reg);
-    Contents[R] = V;
-  }
-  void clobber(MCPhysReg R) { Contents.erase(R); }
-  void copy(MCPhysReg Dst, MCPhysReg Src) { define(Dst, read(Src)); }
-  bool hasCopy(ValueNumber V) const {
-    return V.Reg && llvm::any_of(Contents, [=](const auto &Entry) {
-             return Entry.second == V;
-           });
-  }
-  bool hasHardwareCopy(ValueNumber V) const {
-    return V.Reg && llvm::any_of(HardwareRegs, [this, V](MCPhysReg R) {
-             return read(R) == V;
-           });
-  }
-  SmallVector<MCPhysReg> copies(ValueNumber V) const {
-    SmallVector<MCPhysReg> Regs;
-    for (auto [R, Value] : Contents)
-      if (Value == V)
-        Regs.push_back(R);
-    // Copy construction must not depend on hash table iteration order.
-    llvm::sort(Regs);
-    return Regs;
-  }
-  void forget(function_ref<bool(ValueNumber)> IsDead) {
-    Contents.remove_if([&](const auto &Entry) { return IsDead(Entry.second); });
-  }
-
-private:
-  SmallDenseMap<MCPhysReg, ValueNumber, 8> Contents;
-};
-
 // Working contents and generated code for one instruction's implementation.
 // Registers records the effects of individual transfers, including the backing
 // copies they establish. Cost is local, in estimated bytes; it excludes
 // preceding instructions.
 struct Implementation {
-  Implementation() = default;
   explicit Implementation(RegisterContents Input)
       : Registers(std::move(Input)) {}
 
@@ -497,7 +459,7 @@ void FunctionAllocator::BlockSearch::run() {
 
 void FunctionAllocator::BlockSearch::initialize() {
   ProgramPoint &Entry = Block.Points.front();
-  RegisterContents Registers;
+  RegisterContents Registers(Allocator.TRI, Allocator.ValueNumbers);
   Allocator.forEachBacking(Entry.LiveRegs, [&](MCPhysReg R, ValueNumber V) {
     if (Entry.FixedRegs[R])
       Allocator.fail("pinned physical live-in overlaps a backing register");
@@ -785,11 +747,15 @@ bool FunctionAllocator::InstructionPlacement::planCopy() {
     // chosen destination is the source. The fixed live range protects them.
     for (auto [SubReg, Reg] :
          llvm::zip_equal(Allocator.ValueNumbers.subRegIndices(D), Src)) {
+      ValueNumber V = Allocator.ValueNumbers.getValueNumber(D, SubReg);
+      // A capture of already known contents preserves their identity. Only
+      // unknown or differently named contents need the capture operation.
+      if (Plan.Registers.read(Reg) == V)
+        continue;
       if (!Allocator.evacuate(Reg, Plan, After.LiveRegs, Locked,
                               BitVector(MOS::NUM_TARGET_REGS)))
         return false;
-      Plan.Registers.define(Reg,
-                            Allocator.ValueNumbers.getValueNumber(D, SubReg));
+      Plan.Registers.define(Reg, V);
     }
     for (auto [SubReg, Reg] :
          llvm::zip_equal(Allocator.ValueNumbers.subRegIndices(D), Dst))
@@ -809,6 +775,9 @@ bool FunctionAllocator::InstructionPlacement::planCopy() {
     if (D.isVirtual() && !Allocator.ValueNumbers.sameValue(D, S))
       Allocator.fail("COPY lacks whole-value ancestry", &MI);
   }
+  Plan.Registers.define(
+      Operands[0], D.isVirtual() ? Allocator.ValueNumbers.getValueNumber(D)
+                                 : Allocator.ValueNumbers.getValueNumber(S));
   return Allocator.hasLiveValues(Plan.Registers, After.LiveRegs);
 }
 
@@ -825,6 +794,8 @@ bool FunctionAllocator::InstructionPlacement::planRegSequence() {
       return false;
     Locked.set(Reg);
   }
+  Plan.Registers.define(
+      Operands[0], Allocator.ValueNumbers.getDefValueNumber(MI.getOperand(0)));
   return Allocator.hasLiveValues(Plan.Registers, After.LiveRegs);
 }
 
@@ -877,9 +848,7 @@ bool FunctionAllocator::InstructionPlacement::applyInstruction() {
       return false;
   for (const MachineOperand &MO : MI.operands())
     if (MO.isRegMask())
-      for (MCPhysReg Reg = 1; Reg < MOS::NUM_TARGET_REGS; ++Reg)
-        if (MO.clobbersPhysReg(Reg))
-          Plan.Registers.clobber(Reg);
+      Plan.Registers.clobber(MO.getRegMask());
   for (const MachineOperand &MO : MI.all_defs())
     if (!MO.isEarlyClobber() && !define(MO))
       return false;
@@ -887,25 +856,21 @@ bool FunctionAllocator::InstructionPlacement::applyInstruction() {
 }
 
 bool FunctionAllocator::InstructionPlacement::define(const MachineOperand &MO) {
-  auto Parts = Allocator.registerParts(Operands[MO.getOperandNo()]);
-  for (auto [SubReg, Reg] :
-       llvm::zip(Allocator.ValueNumbers.subRegIndices(MO.getReg()), Parts)) {
-    if (MO.getReg().isPhysical()) {
-      // Fixed liveness protects this result; a later COPY assigns its value
-      // number when it captures the physical contents into an SSA register.
-      Plan.Registers.clobber(Reg);
-      continue;
-    }
+  MCPhysReg Phys = Operands[MO.getOperandNo()];
+  auto Parts = Allocator.registerParts(Phys);
+  if (Parts.empty())
+    return true;
+  if (MO.getReg().isVirtual()) {
     bool TiedPhysicalUse =
         MO.isTied() && MI.getOperand(MI.findTiedOperandIdx(MO.getOperandNo()))
                            .getReg()
                            .isPhysical();
-    if (After.FixedRegs[Reg] ||
-        (MO.isEarlyClobber() && Before.FixedRegs[Reg] && !TiedPhysicalUse))
-      return false;
-    Plan.Registers.define(
-        Reg, Allocator.ValueNumbers.getValueNumber(MO.getReg(), SubReg));
+    for (MCPhysReg Reg : Parts)
+      if (After.FixedRegs[Reg] ||
+          (MO.isEarlyClobber() && Before.FixedRegs[Reg] && !TiedPhysicalUse))
+        return false;
   }
+  Plan.Registers.define(Phys, Allocator.ValueNumbers.getDefValueNumber(MO));
   return true;
 }
 
@@ -933,7 +898,7 @@ FunctionAllocator::getAllocationState(const RegisterContents &Registers,
   for (auto [I, R] : llvm::enumerate(HardwareRegs))
     State.Hardware[I] = Registers.read(R);
   forEachBacking(LiveRegs, [&](MCPhysReg R, ValueNumber V) {
-    if (!Registers.hasHardwareCopy(V)) {
+    if (!Registers.hasCopyIn(V, HardwareRegs)) {
       assert(Registers.read(R) == V &&
              "value absent from hardware requires every live backing");
       return;
@@ -946,17 +911,26 @@ FunctionAllocator::getAllocationState(const RegisterContents &Registers,
 
 RegisterContents FunctionAllocator::getRegisterContents(
     const AllocationState &State, const SparseBitVector<> &LiveRegs) const {
-  RegisterContents Registers;
+  RegisterContents Registers(TRI, ValueNumbers);
   for (auto [I, R] : llvm::enumerate(HardwareRegs))
     if (State.Hardware[I].Reg)
       Registers.define(R, State.Hardware[I]);
   forEachBacking(LiveRegs, [&](MCPhysReg R, ValueNumber V) {
-    if (Registers.hasHardwareCopy(V) && !State.ValidBackings[R])
+    if (Registers.hasCopyIn(V, HardwareRegs) && !State.ValidBackings[R])
       return;
     assert((!Registers.read(R).Reg || Registers.read(R) == V) &&
            "backing assignments interfere");
     Registers.define(R, V);
   });
+  for (unsigned I : LiveRegs) {
+    Register R = Register::index2VirtReg(I);
+    MCPhysReg Backing = getBackingRegister(R);
+    if (!Backing || ValueNumbers.subRegIndices(R).size() != 2)
+      continue;
+    ValueNumber V = ValueNumbers.getValueNumber(R);
+    if (Registers.contains(Backing, V))
+      Registers.define(Backing, V);
+  }
   return Registers;
 }
 
@@ -973,7 +947,7 @@ bool FunctionAllocator::materializeUnheldValues(
   });
   forEachBacking(LiveRegs, [&](MCPhysReg R, ValueNumber V) {
     if (!Valid || Plan.Registers.read(R) == V ||
-        Plan.Registers.hasHardwareCopy(V))
+        Plan.Registers.hasCopyIn(V, HardwareRegs))
       return;
     Valid = CanInsert && placeValue(V, R, Plan, LiveRegs, Locked);
     if (Valid)
@@ -981,8 +955,8 @@ bool FunctionAllocator::materializeUnheldValues(
   });
   if (!Valid)
     return false;
-  Plan.Registers.forget(
-      [&](ValueNumber V) { return !isLiveValue(V, LiveRegs); });
+  Plan.Registers.forgetIf(
+      [&](MCPhysReg, ValueNumber V) { return !isLiveValue(V, LiveRegs); });
   return true;
 }
 
@@ -1017,7 +991,7 @@ bool FunctionAllocator::placeValue(ValueNumber V, MCPhysReg Dst,
   if (Locked[Dst])
     return false;
   BitVector Avoid = Forbidden ? *Forbidden : BitVector(MOS::NUM_TARGET_REGS);
-  Implementation Best;
+  Implementation Best{RegisterContents(TRI, ValueNumbers)};
   Best.Cost = ~0u;
   auto Consider = [&](Implementation Trial) {
     if (Trial.Cost < Best.Cost)
@@ -1261,6 +1235,8 @@ bool FunctionAllocator::isLiveValue(ValueNumber V,
     return false;
   for (int I : LiveRegs) {
     Register R = Register::index2VirtReg(I);
+    if (ValueNumbers.sameValue(ValueNumbers.getValueNumber(R), V))
+      return true;
     for (unsigned SubReg : ValueNumbers.subRegIndices(R))
       if (ValueNumbers.getValueNumber(R, SubReg) == V)
         return true;

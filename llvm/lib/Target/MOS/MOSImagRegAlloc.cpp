@@ -63,6 +63,7 @@
 #include "MOSImagRegAlloc.h"
 #include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
+#include "MOSRegisterContents.h"
 #include "MOSRegisterInfo.h"
 #include "MOSValueNumbering.h"
 #include "llvm/ADT/DepthFirstIterator.h"
@@ -94,11 +95,13 @@ using namespace llvm;
 
 namespace {
 
-// For backing allocation, a whole COPY is a value-preserving tie. Keep that
-// interpretation local to this pass; COPY does not carry MIR tied operands.
+// A physical COPY connects its virtual operand to a fixed location. Virtual
+// COPYs need no location constraint: value equality permits ordinary sharing.
 static MachineOperand *tiedOperand(MachineOperand &MO) {
   MachineInstr &MI = *MO.getParent();
-  if (MI.isFullCopy() && MO.getOperandNo() < 2)
+  if (MI.isFullCopy() && MO.getOperandNo() < 2 &&
+      (MI.getOperand(0).getReg().isPhysical() ||
+       MI.getOperand(1).getReg().isPhysical()))
     return &MI.getOperand(1 - MO.getOperandNo());
   if (MO.isTied())
     return &MI.getOperand(MI.findTiedOperandIdx(MO.getOperandNo()));
@@ -202,9 +205,12 @@ private:
   void assign();
   void assignMBB(MachineBasicBlock &MBB);
   void assignMI(MachineInstr &MI);
+  void recordCopySourceValue(const MachineInstr &MI);
+  void recordPhysicalDefinition(const MachineOperand &MO);
+  bool isPhysicalRegisterAvailable(MCPhysReg Phys, Register Value) const;
   bool swapInto(MachineInstr &MI, Register R, MCPhysReg Phys);
   void prepareTiedUses(MachineInstr &MI);
-  void allocateDefinitions(MachineInstr &MI, bool Early);
+  void assignDefs(MachineInstr &MI, bool Early);
   void displace(MachineInstr &MI, MCPhysReg Phys, Register Value = Register(),
                 bool BeforeUses = false);
   // Storage is available if its occupants hold Value or are being moved/killed
@@ -302,6 +308,7 @@ private:
   // liveness. A virtual range may share its backing with a physical COPY of
   // the same value, but cannot overwrite it while this constraint remains.
   LivePhysRegs PhysRegs;
+  std::optional<MOSRegisterContents> PhysContents;
 
   // Physical liveness at instruction entry, captured by assignMI.
   // Repair copies are emitted before the instruction, even when we discover
@@ -327,8 +334,9 @@ bool MOSImagRegAlloc::runOnMachineFunction(MachineFunction &F) {
   ValueNumbers.emplace(*VRM);
   LiveRegs.init(F, *RCI, *LV, *ValueNumbers);
   PhysRegs.init(*TRI);
+  PhysContents.emplace(*TRI, *ValueNumbers);
   Changed = recomputeLiveIns(F.front());
-  IncomingPhysRegs.init(*TRI);
+
   ValueNumbers->recordCopyOrigins();
   checkPressure();
   assign();
@@ -450,6 +458,7 @@ void MOSImagRegAlloc::assignMBB(MachineBasicBlock &MBB) {
   Restorations.clear();
   ChangedRegs.clear();
   PhysRegs.clear();
+  PhysContents->clear();
   if (MBB.isEntryBlock())
     PhysRegs.addLiveInsNoPristines(MBB);
   // Restore before the first terminator so every outgoing edge sees global
@@ -582,22 +591,60 @@ void MOSImagRegAlloc::insertCopies(MachineBasicBlock &MBB,
 }
 
 void MOSImagRegAlloc::assignMI(MachineInstr &MI) {
-  IncomingPhysRegs.clear();
+  recordCopySourceValue(MI);
+  IncomingPhysRegs = LiveRegUnits(*TRI);
   for (MCPhysReg R : PhysRegs)
     IncomingPhysRegs.addReg(R);
 
   prepareTiedUses(MI);
-  allocateDefinitions(MI, true);
+  assignDefs(MI, true);
   releaseInputsAndClobbers(MI);
-  allocateDefinitions(MI, false);
+  assignDefs(MI, false);
   releaseDeadResults(MI);
+}
+
+void MOSImagRegAlloc::recordCopySourceValue(const MachineInstr &MI) {
+  if (!MI.isFullCopy() || !MI.getOperand(0).getReg().isVirtual() ||
+      !MI.getOperand(1).getReg().isPhysical() || MI.getOperand(1).isUndef())
+    return;
+  // Before allocating %v = COPY $phys, name unknown source contents with %v's
+  // identity. The new virtual range can then share its still-live constraint.
+  Register Source = MI.getOperand(1).getReg();
+  if (!PhysContents->read(Source).Reg)
+    PhysContents->define(Source,
+                         ValueNumbers->getDefValueNumber(MI.getOperand(0)));
+}
+
+void MOSImagRegAlloc::recordPhysicalDefinition(const MachineOperand &MO) {
+  MCPhysReg Phys = MO.getReg();
+  PhysRegs.removeReg(Phys);
+  PhysRegs.addReg(Phys);
+  PhysContents->define(Phys, ValueNumbers->getDefValueNumber(MO));
+}
+
+bool MOSImagRegAlloc::isPhysicalRegisterAvailable(MCPhysReg Phys,
+                                                  Register Value) const {
+  if (PhysRegs.available(*MRI, Phys) ||
+      PhysContents->contains(Phys, ValueNumbers->getValueNumber(Value)))
+    return true;
+  for (unsigned SubReg : ValueNumbers->subRegIndices(Phys)) {
+    MCPhysReg Part = Phys;
+    if (SubReg)
+      Part = TRI->getSubReg(Phys, SubReg);
+    if (!PhysRegs.available(*MRI, Part) &&
+        PhysContents->read(Part) != ValueNumbers->getValueNumber(Value, SubReg))
+      return false;
+  }
+  return true;
 }
 
 void MOSImagRegAlloc::releaseInputsAndClobbers(MachineInstr &MI) {
   removeKilledUses(MI);
   for (const MachineOperand &MO : MI.all_uses())
-    if (MO.getReg().isPhysical() && MO.isKill())
+    if (MO.getReg().isPhysical() && MO.isKill()) {
       PhysRegs.removeReg(MO.getReg());
+      PhysContents->clobber(MO.getReg());
+    }
 
   // Inputs are consumed before register-mask clobbers take effect. Preserve
   // surviving virtual values before releasing the clobbered physical ranges.
@@ -608,14 +655,14 @@ void MOSImagRegAlloc::releaseInputsAndClobbers(MachineInstr &MI) {
       if (MO.clobbersPhysReg(R))
         displace(MI, R);
     PhysRegs.removeRegsInMask(MO);
+    PhysContents->clobber(MO.getRegMask());
   }
 
-  // A kill of a tied input can remove the overlapping early-clobber result
-  // from the physical set. Reestablish those new values after releasing the
-  // old inputs; explicit results also survive the instruction's regmask.
+  // Kills of tied inputs can erase aliases of early results, and explicit
+  // early results survive register masks. Reestablish those new definitions.
   for (const MachineOperand &MO : MI.all_defs())
     if (MO.getReg().isPhysical() && MO.isEarlyClobber())
-      PhysRegs.addReg(MO.getReg());
+      recordPhysicalDefinition(MO);
 }
 
 void MOSImagRegAlloc::releaseDeadResults(const MachineInstr &MI) {
@@ -623,11 +670,14 @@ void MOSImagRegAlloc::releaseDeadResults(const MachineInstr &MI) {
   for (const MachineOperand &MO : MI.all_defs())
     if (MO.getReg().isPhysical() && MO.isDead())
       PhysRegs.removeReg(MO.getReg());
-  // Removing a dead scratch definition must not remove an overlapping live
-  // result from the same instruction.
+  // LiveVariables can mark a whole result dead and describe its surviving
+  // bytes with implicit defs. Keep both their lifetimes and known contents.
   for (const MachineOperand &MO : MI.all_defs())
     if (MO.getReg().isPhysical() && !MO.isDead())
       PhysRegs.addReg(MO.getReg());
+  PhysContents->forgetIf([&](MCPhysReg R, MOSValueNumbering::ValueNumber) {
+    return PhysRegs.available(*MRI, R);
+  });
 }
 
 bool MOSImagRegAlloc::backingAvailable(MCPhysReg Phys, Register Value,
@@ -677,7 +727,7 @@ bool MOSImagRegAlloc::isResultRegisterAvailable(const MachineInstr &MI,
                                                 Register R) const {
   // Account for fixed outputs not yet visited, including ordinary physical
   // definitions when choosing an early-clobber result's location.
-  return PhysRegs.available(*MRI, Phys) && !isPhysicalOutput(MI, Phys) &&
+  return isPhysicalRegisterAvailable(Phys, R) && !isPhysicalOutput(MI, Phys) &&
          backingAvailable(Phys, R);
 }
 
@@ -784,10 +834,9 @@ void MOSImagRegAlloc::prepareTiedUses(MachineInstr &MI) {
       if (VRM->getPhys(R) == Phys)
         continue;
     } else {
-      // A COPY can retain a surviving input's placement: the result has the
-      // same value. Destructive ties need a separate occurrence if either the
-      // virtual input or a physical copy still needs the old value.
-      if (PreservesValue || !hasImaginaryOption(R) || !hasImaginaryOption(D))
+      // Destructive ties need a separate occurrence if either another virtual
+      // copy or a physical constraint still needs the old value.
+      if (!hasImaginaryOption(R) || !hasImaginaryOption(D))
         continue;
       if (Use.getSubReg() || Def->getSubReg())
         report_fatal_error(
@@ -824,21 +873,18 @@ void MOSImagRegAlloc::prepareTiedUses(MachineInstr &MI) {
   }
 }
 
-void MOSImagRegAlloc::allocateDefinitions(MachineInstr &MI, bool Early) {
+void MOSImagRegAlloc::assignDefs(MachineInstr &MI, bool Early) {
   for (MachineOperand &MO : MI.all_defs()) {
-    if (MO.isEarlyClobber() != Early || !MO.getReg().isPhysical() ||
-        !needsReg(MO.getReg()))
+    if (MO.isEarlyClobber() != Early || !MO.getReg().isPhysical())
       continue;
-    // A COPY defines the source's value at this physical location, so that
-    // source is already compatible with the new constraint.
     Register Source;
-    MachineOperand *Input = tiedOperand(MO);
-    if (Input && MI.isCopy() && Input->getReg().isVirtual() &&
-        !Input->isUndef())
-      Source = Input->getReg();
-    displace(MI, MO.getReg(), Source, Early);
-    PhysRegs.removeReg(MO.getReg());
-    PhysRegs.addReg(MO.getReg());
+    // Implicit alias defs describe the same COPY write, so they preserve the
+    // source value just as the explicit whole-register definition does.
+    if (MI.isFullCopy() && ValueNumbers->getDefValueNumber(MO).Reg)
+      Source = MI.getOperand(1).getReg();
+    if (needsReg(MO.getReg()))
+      displace(MI, MO.getReg(), Source, Early);
+    recordPhysicalDefinition(MO);
   }
   // Fixed destinations are now clear. Pairs precede bytes because every
   // virtual register of a given width has the same imaginary domain.
@@ -849,12 +895,9 @@ void MOSImagRegAlloc::allocateDefinitions(MachineInstr &MI, bool Early) {
           (backingClass(R) == &MOS::Imag16RegClass ? 16u : 8u) != Bits)
         continue;
       MachineOperand *Input = tiedOperand(MO);
-      bool PreservesValue = MI.isCopy();
-      bool InheritBacking =
-          Input && Input->getReg().isVirtual() && !Input->isUndef() &&
-          (PreservesValue
-               ? VRM->hasPhys(Input->getReg())
-               : hasImaginaryOption(R) && hasImaginaryOption(Input->getReg()));
+      bool InheritBacking = Input && Input->getReg().isVirtual() &&
+                            !Input->isUndef() && hasImaginaryOption(R) &&
+                            hasImaginaryOption(Input->getReg());
       if (!needsReg(R) && !InheritBacking)
         continue;
       MCPhysReg Global = !needsReg(R)      ? MCPhysReg()
@@ -863,11 +906,11 @@ void MOSImagRegAlloc::allocateDefinitions(MachineInstr &MI, bool Early) {
       MCPhysReg Local = Global;
       if (InheritBacking)
         Local = VRM->getPhys(Input->getReg());
-      else if (Input && PreservesValue && Input->getReg().isPhysical() &&
-               needsReg(Input->getReg()) && Input->isKill() &&
+      else if (MI.isFullCopy() && Input && Input->getReg().isPhysical() &&
+               needsReg(Input->getReg()) &&
                isResultRegisterAvailable(MI, Input->getReg(), R))
-        // An incoming or instruction-defined physical value starts its SSA
-        // range at that location. Subsequent uses see this same assignment.
+        // Keep a captured value where it already exists, including when the
+        // physical constraint remains live and holds this same value.
         Local = Input->getReg();
       else if (!isReservation(R) && !isResultRegisterAvailable(MI, Local, R))
         Local = chooseResultRegister(MI, R);
@@ -886,7 +929,7 @@ void MOSImagRegAlloc::restoreRegisters(MachineBasicBlock &MBB,
     MCPhysReg Phys = globalBacking(R);
     if (VRM->getPhys(R) == Phys)
       continue;
-    if (!PhysRegs.available(*MRI, Phys))
+    if (!isPhysicalRegisterAvailable(Phys, R))
       report_fatal_error("MOS imaginary repairing cannot restore a backing "
                          "register across a fixed physical lifetime",
                          /*gen_crash_diag=*/false);

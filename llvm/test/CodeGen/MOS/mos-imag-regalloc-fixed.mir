@@ -342,3 +342,172 @@ body: |
     STAbs $a, 2001
     RTS
 ...
+
+# A new virtual copy may share a still-live physical constraint holding its
+# value. Ordinary definition allocation must recognize that compatibility.
+---
+name: copy_under_fixed_constraint
+# ASSIGN-LABEL: name: copy_under_fixed_constraint
+# ASSIGN: id: 0, {{.*}}assigned-phys: '$rc2'
+# ASSIGN: id: 1, {{.*}}split-from: '%0',
+# ASSIGN-NEXT: assigned-phys: '$rc2'
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: copy_under_fixed_constraint
+    ; CHECK: [[LDAbs:%[0-9]+]]:gpr = LDAbs 1000
+    ; CHECK-NEXT: $rc2 = COPY [[LDAbs]]
+    ; CHECK-NEXT: [[COPY:%[0-9]+]]:gpr = COPY [[LDAbs]]
+    ; CHECK-NEXT: JSR &callee, implicit killed $rc2
+    ; CHECK-NEXT: STAbs killed [[LDAbs]], 2000
+    ; CHECK-NEXT: STAbs killed [[COPY]], 2001
+    ; CHECK-NEXT: RTS
+    ;
+    ; HW-LABEL: name: copy_under_fixed_constraint
+    ; HW: $a = LDAbs 1000
+    ; HW-NEXT: $rc2 = STImag8 $a
+    ; HW-NEXT: JSR &callee, implicit killed $rc2
+    ; HW-NEXT: STAbs $a, 2000
+    ; HW-NEXT: STAbs killed $a, 2001
+    ; HW-NEXT: RTS
+    %0:gpr = LDAbs 1000
+    $rc2 = COPY %0
+    %1:gpr = COPY %0
+    JSR &callee, implicit $rc2
+    STAbs %0, 2000
+    STAbs %1, 2001
+    RTS
+...
+
+# Capturing an incoming value names its physical contents even when another
+# physical use keeps that constraint live beyond the COPY.
+---
+name: capture_live_constraint
+# ASSIGN-LABEL: name: capture_live_constraint
+# ASSIGN: id: 0, {{.*}}assigned-phys: '$rc2'
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rc2
+    ; CHECK-LABEL: name: capture_live_constraint
+    ; CHECK: liveins: $rc2
+    ; CHECK-NEXT: {{  $}}
+    ; CHECK-NEXT: [[COPY:%[0-9]+]]:gpr = COPY $rc2
+    ; CHECK-NEXT: JSR &callee, implicit killed $rc2
+    ; CHECK-NEXT: STAbs killed [[COPY]], 2000
+    ; CHECK-NEXT: RTS
+    ;
+    ; HW-LABEL: name: capture_live_constraint
+    ; HW: liveins: $rc2
+    ; HW-NEXT: {{  $}}
+    ; HW-NEXT: $a = LDImag8 $rc2
+    ; HW-NEXT: JSR &callee, implicit killed $rc2
+    ; HW-NEXT: STAbs killed $a, 2000
+    ; HW-NEXT: RTS
+    %0:gpr = COPY $rc2
+    JSR &callee, implicit $rc2
+    STAbs %0, 2000
+    RTS
+...
+
+# Overwriting one byte of a fixed pair preserves the other byte's identity.
+---
+name: partial_fixed_value
+# ASSIGN-LABEL: name: partial_fixed_value
+# ASSIGN: id: 3, {{.*}}split-from: '%1',
+# ASSIGN-NEXT: assigned-phys: '$rc3'
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: partial_fixed_value
+    ; CHECK: [[LDAbs:%[0-9]+]]:gpr = LDAbs 1000
+    ; CHECK-NEXT: [[LDAbs1:%[0-9]+]]:gpr = LDAbs 1001
+    ; CHECK-NEXT: [[REG_SEQUENCE:%[0-9]+]]:imag16 = REG_SEQUENCE killed [[LDAbs]], %subreg.sublo, [[LDAbs1]], %subreg.subhi
+    ; CHECK-NEXT: [[PCOPY:%[0-9]+]]:gpr, [[PCOPY1:%[0-9]+]]:imag16 = PCOPY killed [[LDAbs1]], killed [[REG_SEQUENCE]]
+    ; CHECK-NEXT: dead $rs1 = COPY killed [[PCOPY1]], implicit-def $rc3
+    ; CHECK-NEXT: JSR &overwrite_low, implicit-def $rc2
+    ; CHECK-NEXT: [[COPY:%[0-9]+]]:gpr = COPY [[PCOPY]]
+    ; CHECK-NEXT: JSR &callee, implicit killed $rc2, implicit killed $rc3
+    ; CHECK-NEXT: STAbs killed [[PCOPY]], 2000
+    ; CHECK-NEXT: STAbs killed [[COPY]], 2001
+    ; CHECK-NEXT: RTS
+    ;
+    ; HW-LABEL: name: partial_fixed_value
+    ; HW: $a = LDAbs 1000
+    ; HW-NEXT: $y = LDAbs 1001
+    ; HW-NEXT: dead $rc4 = STImag8 $a
+    ; HW-NEXT: dead $rc5 = STImag8 $y
+    ; HW-NEXT: dead $rc2 = STImag8 killed $a
+    ; HW-NEXT: $rc3 = STImag8 $y
+    ; HW-NEXT: JSR &overwrite_low, implicit-def $rc2
+    ; HW-NEXT: JSR &callee, implicit killed $rc2, implicit killed $rc3
+    ; HW-NEXT: STAbs $y, 2000
+    ; HW-NEXT: STAbs killed $y, 2001
+    ; HW-NEXT: RTS
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    %2:imag16 = REG_SEQUENCE %0, %subreg.sublo, %1, %subreg.subhi
+    $rs1 = COPY %2
+    JSR &overwrite_low, implicit-def $rc2
+    %3:gpr = COPY %1
+    JSR &callee, implicit $rc2, implicit $rc3
+    STAbs %1, 2000
+    STAbs %3, 2001
+    RTS
+...
+
+# A whole value can share a fixed pair. After an opaque definition overwrites
+# its low byte, that pair must no longer answer as containing the old value.
+---
+name: fixed_pair_overwrite
+# ASSIGN-LABEL: name: fixed_pair_overwrite
+# ASSIGN: id: 0, {{.*}}assigned-phys: '$rs1'
+# ASSIGN: id: 1, {{.*}}split-from: '%0',
+# ASSIGN-NEXT: assigned-phys: '$rs1'
+# ASSIGN: id: 2, {{.*}}split-from: '%0',
+# ASSIGN-NEXT: assigned-phys: '$rs2'
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: fixed_pair_overwrite
+    ; CHECK: [[COPY:%[0-9]+]]:imag16 = COPY $rs0
+    ; CHECK-NEXT: dead $rs1 = COPY [[COPY]], implicit-def $rc3
+    ; CHECK-NEXT: [[COPY1:%[0-9]+]]:imag16 = COPY [[COPY]]
+    ; CHECK-NEXT: [[PCOPY:%[0-9]+]]:imag16 = PCOPY killed [[COPY]]
+    ; CHECK-NEXT: [[PCOPY1:%[0-9]+]]:imag16 = PCOPY killed [[COPY1]]
+    ; CHECK-NEXT: JSR &overwrite_low, implicit-def $rc2
+    ; CHECK-NEXT: [[COPY2:%[0-9]+]]:imag16 = COPY [[PCOPY]]
+    ; CHECK-NEXT: JSR &callee, implicit killed $rc2, implicit killed $rc3
+    ; CHECK-NEXT: $rs0 = COPY killed [[PCOPY]]
+    ; CHECK-NEXT: $rs0 = COPY killed [[PCOPY1]]
+    ; CHECK-NEXT: $rs0 = COPY killed [[COPY2]]
+    ; CHECK-NEXT: RTS
+    ;
+    ; HW-LABEL: name: fixed_pair_overwrite
+    ; HW: $a = LDImag8 $rc0
+    ; HW-NEXT: $rc2 = STImag8 killed $a
+    ; HW-NEXT: $a = LDImag8 $rc1
+    ; HW-NEXT: $rc3 = STImag8 $a
+    ; HW-NEXT: $x = LDImag8 killed $rc2
+    ; HW-NEXT: dead $rc4 = STImag8 $x
+    ; HW-NEXT: JSR &overwrite_low, implicit-def $rc2
+    ; HW-NEXT: dead $rc5 = STImag8 $a
+    ; HW-NEXT: JSR &callee, implicit killed $rc2, implicit killed $rc3
+    ; HW-NEXT: $rc0 = STImag8 $x
+    ; HW-NEXT: $rc1 = STImag8 $a
+    ; HW-NEXT: $rc0 = STImag8 $x
+    ; HW-NEXT: $rc1 = STImag8 $a
+    ; HW-NEXT: $rc0 = STImag8 killed $x
+    ; HW-NEXT: $rc1 = STImag8 killed $a
+    ; HW-NEXT: RTS
+    %0:imag16 = COPY $rs0
+    $rs1 = COPY %0
+    %1:imag16 = COPY %0
+    JSR &overwrite_low, implicit-def $rc2
+    %2:imag16 = COPY %0
+    JSR &callee, implicit $rc2, implicit $rc3
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    RTS
+...
