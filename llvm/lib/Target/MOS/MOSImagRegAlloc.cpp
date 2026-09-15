@@ -10,12 +10,12 @@
 /// Allocate imaginary registers before MOS register allocation.
 ///
 /// MOSImagRegAlloc operates on conventional SSA machine IR. Its contract is to
-/// assign imaginary backing registers, inserting spills and reloads where
-/// necessary while preserving SSA form. Pressure is assessed assuming
-/// that values need backing even if subsequent hardware register allocation may
+/// assign imaginary registers, inserting spills and reloads where necessary
+/// while preserving SSA form. Pressure is assessed assuming that values need
+/// imaginary registers even if subsequent hardware register allocation may
 /// eliminate that need.
 ///
-/// A dominance-order treescan chooses global backing locations and repairs
+/// A dominance-order treescan chooses global imaginary registers and repairs
 /// imaginary constraints in the same scan, following Colombet et al.,
 /// "Graph-Coloring and Treescan Register Allocation Using Repairing", section
 /// 3.2. Global locations respect interference; temporary local locations
@@ -25,32 +25,32 @@
 /// their physical live ranges. A COPY to a physical imaginary register places
 /// its source there, sharing that location with the physical range. Physical
 /// liveness protects the location even after the virtual source dies. A later
-/// overwrite preserves any surviving virtual value in a new SSA range.
-/// Each VRM assignment belongs to one concrete SSA range and remains fixed.
-/// Pending restorations record temporary departures from global assignments.
-/// VirtRegMap carries the assignments between passes. Assignments may be
-/// outside the vregs' operand classes; MOSRegAlloc handles hardware
-/// register constraints and may eliminate backing operations by retaining
+/// overwrite preserves any surviving virtual value in a new SSA range. Each VRM
+/// assignment belongs to one concrete SSA range and remains fixed. Pending
+/// restorations record temporary departures from global assignments. VirtRegMap
+/// carries the assignments between passes. Assignments may be outside the
+/// vregs' operand classes; MOSRegAlloc handles hardware register constraints
+/// and may eliminate transfers to and from imaginary registers by retaining
 /// values in hardware registers. MOSValueNumbering identifies equal contents
-/// through copies and REG_SEQUENCE components. This pass records new splits
-/// in that shared analysis, so both allocators agree on value identities
-/// independently of backing assignments and live ranges.
+/// through copies and REG_SEQUENCE components. This pass records new splits in
+/// that shared analysis, so both allocators agree on value identities
+/// independently of imaginary assignments and live ranges.
 ///
-/// Each isolated PHI and its inputs share the backing register of the explicit
-/// IMPLICIT_DEF reservation supplied by MOSConventionalSSA. This reserves a
-/// location before the PHI's incoming values are defined. The location needs to
-/// hold those values only from the predecessor exit PCOPYs through the PHI to
-/// the entry PCOPY. Other values may reuse it if their lifetimes do not overlap
-/// those intervals.
+/// Each isolated PHI and its inputs share the imaginary register of the
+/// explicit IMPLICIT_DEF reservation supplied by MOSConventionalSSA. This
+/// reserves a location before the PHI's incoming values are defined. The
+/// location needs to hold those values only from the predecessor exit PCOPYs
+/// through the PHI to the entry PCOPY. Other values may reuse it if their
+/// lifetimes do not overlap those intervals.
 ///
-/// Before assigning new backing, the pass scans live registers to check that
-/// enough locations are available. Reservation IMPLICIT_DEFs predict conflicts
-/// at those future boundaries; other registers use their ordinary SSA
+/// Before assigning an imaginary register, the pass scans live registers to
+/// check that enough locations are available. Reservation IMPLICIT_DEFs predict
+/// conflicts at those future boundaries; other registers use their ordinary SSA
 /// lifetimes. Assignment uses the same conflict rule. Ordinary SSA registers
-/// with equal value numbers do not conflict and may share backing storage.
+/// with equal value numbers do not conflict and may share imaginary registers.
 ///
-/// This implementation handles Imag8 and Imag16 backing registers, with Imag8
-/// backing for flags. Physical imaginary definitions contribute ordinary
+/// This implementation handles Imag8 and Imag16 registers, with Imag8
+/// registers for flags. Physical imaginary definitions contribute ordinary
 /// demand; call clobbers contribute simultaneous dead definitions. Their
 /// required physical locations and whole-register ties are handled by local
 /// repairing. Repairing omits optimized restore placement and does not move
@@ -121,10 +121,10 @@ struct Copy {
   Register Use;
 };
 
-// Active backing demand, independent of placement constraints. Both virtual
-// and physical Imag16 definitions count as one Imag16. A partial kill of a
-// physical Imag16 leaves its surviving byte as Imag8 demand. The caller selects
-// values needing backing and advances their lifetimes.
+// Active imaginary register demand, independent of placement constraints. Both
+// virtual and physical Imag16 definitions count as one Imag16. A partial kill
+// of a physical Imag16 leaves its surviving byte as Imag8 demand. The caller
+// selects values needing imaginary registers and advances their lifetimes.
 class LiveRegisters {
 public:
   void init(const MachineFunction &MF, const RegisterClassInfo &RCI,
@@ -154,17 +154,18 @@ public:
   auto begin() const { return Regs.begin(); }
   auto end() const { return Regs.end(); }
 
-  // Return the backing reservation's IMPLICIT_DEF, or zero if there is none.
+  // Return the imaginary register reservation's IMPLICIT_DEF, or zero if there
+  // is none.
   Register getReservationRoot(Register R) const;
 
-  // Whether a new backing assignment conflicts with an earlier live register.
-  // PHI inputs and results inherit backing and never initiate this query.
-  // Only reservation roots predict conflicts at future boundaries.
+  // Whether a new imaginary assignment conflicts with an earlier live register.
+  // PHI inputs and results inherit imaginary assignments and never initiate
+  // this query. Only reservation roots predict conflicts at future boundaries.
   bool conflict(Register R, Register LiveReg) const;
 
-  // Capacity sufficient for R, measured in locations of its backing size.
-  // With B conflicting live Imag8s and P Imag16s, the bound is 1 + B + 2P for
-  // Imag8 or 1 + B + P for Imag16: each Imag8 could block a different pair.
+  // Capacity sufficient for R, measured in locations of its imaginary register
+  // size. With B conflicting live Imag8s and P Imag16s, the bound is 1 + B + 2P
+  // for Imag8 or 1 + B + P for Imag16: each Imag8 could block a different pair.
   // Physical redefinitions discount the aliases they replace.
   unsigned getRequiredCapacity(Register R) const;
   unsigned getCapacity(Register R) const {
@@ -214,7 +215,7 @@ private:
                 bool BeforeUses = false);
   // Storage is available if its occupants hold Value or are being moved/killed
   // (Vacated). With no Value, require empty storage rather than equal contents.
-  bool backingAvailable(MCPhysReg Phys, Register Value = Register(),
+  bool imagRegAvailable(MCPhysReg Phys, Register Value = Register(),
                         Register Vacated = Register()) const;
   bool isPhysicalInput(const MachineInstr &MI, MCPhysReg Phys) const;
   bool isPhysicalOutput(const MachineInstr &MI, MCPhysReg Phys) const;
@@ -241,18 +242,18 @@ private:
   void updateLiveOuts(LiveRegisters &Regs, const MachineBasicBlock &MBB);
   bool isLiveOut(Register R, const MachineBasicBlock &MBB) const;
 
-  const TargetRegisterClass *backingClass(Register R) const {
+  const TargetRegisterClass *imagRegClass(Register R) const {
     return TRI->getRegSizeInBits(R, *MRI) == 16 ? &MOS::Imag16RegClass
                                                 : &MOS::Imag8RegClass;
   }
   bool hasImaginaryOption(Register R) const {
-    return TRI->getCommonSubClass(MRI->getRegClass(R), backingClass(R));
+    return TRI->getCommonSubClass(MRI->getRegClass(R), imagRegClass(R));
   }
   bool isReservation(Register R) const {
     const MachineInstr *Def = MRI->getVRegDef(R);
     return Def && Def->isImplicitDef();
   }
-  MCPhysReg globalBacking(Register R) const {
+  MCPhysReg globalImagReg(Register R) const {
     auto I = Restorations.find(R);
     return I == Restorations.end() ? MCPhysReg(VRM->getPhys(R))
                                    : I->second.Phys;
@@ -270,7 +271,8 @@ private:
                     MachineBasicBlock::iterator InsertPt,
                     ArrayRef<Copy> Copies);
 
-  // Unused values and trivially rematerializable values need no backing.
+  // Unused values and trivially rematerializable values need no imaginary
+  // register.
   bool needsReg(Register R) const;
   // LiveVariables accounts for PHI edge uses in its kill flags.
   void removeKilledUses(const MachineInstr &MI);
@@ -304,8 +306,9 @@ private:
   // PHIs in these blocks; update their snapshots along with LiveVariables.
   SmallVector<std::pair<const MachineDomTreeNode *, LiveRegisters>> DomLiveRegs;
   // Fixed physical lifetimes protect their locations independently of virtual
-  // liveness. A virtual range may share its backing with a physical COPY of
-  // the same value, but cannot overwrite it while this constraint remains.
+  // liveness. A virtual range may share its imaginary register with a physical
+  // COPY of the same value, but cannot overwrite it while this constraint
+  // remains.
   LivePhysRegs PhysRegs;
   std::optional<MOSRegisterContents> PhysContents;
 
@@ -418,12 +421,13 @@ void MOSImagRegAlloc::checkDefPressure(MachineInstr &MI, Register R) {
     return;
   if (!LiveRegs.insert(R)) {
     bool IsImag16 = TRI->getRegSizeInBits(R, MF->getRegInfo()) == 16;
-    errs() << "MOSImagRegAlloc: cannot prove backing assignability in "
-           << MF->getName() << ", bb." << MI.getParent()->getNumber() << " for "
-           << (IsImag16 ? "Imag16" : "Imag8") << " backing: requires "
-           << LiveRegs.getRequiredCapacity(R) << ", " << LiveRegs.getCapacity(R)
-           << " available locations\n"
-           << MI;
+    errs()
+        << "MOSImagRegAlloc: cannot prove imaginary register assignability in "
+        << MF->getName() << ", bb." << MI.getParent()->getNumber() << " for "
+        << (IsImag16 ? "Imag16" : "Imag8") << ": requires "
+        << LiveRegs.getRequiredCapacity(R) << ", " << LiveRegs.getCapacity(R)
+        << " available locations\n"
+        << MI;
     report_fatal_error("MOSImagRegAlloc spill insertion is not implemented",
                        /*GenCrashDiag=*/false);
   }
@@ -462,8 +466,8 @@ void MOSImagRegAlloc::assignMBB(MachineBasicBlock &MBB) {
   if (MBB.isEntryBlock())
     PhysRegs.addLiveInsNoPristines(MBB);
   // Restore before the first terminator so every outgoing edge sees global
-  // backing assignments. Repairing a terminator must not move a value needed
-  // after that instruction away from its global backing assignment.
+  // imaginary assignments. Repairing a terminator must not move a value needed
+  // after that instruction away from its global imaginary assignment.
   auto FirstTerminator = MBB.getFirstTerminator();
   for (MachineInstr &MI : make_early_inc_range(MBB)) {
     if (MI.isDebugInstr())
@@ -513,18 +517,18 @@ MCPhysReg MOSImagRegAlloc::chooseGlobalRegister(const MachineInstr &MI,
                                                 Register R) const {
   Register Root = LiveRegs.getReservationRoot(R);
   if (Root && Root != R) {
-    assert(globalBacking(Root) && "reservation must be assigned first");
-    return globalBacking(Root);
+    assert(globalImagReg(Root) && "reservation must be assigned first");
+    return globalImagReg(Root);
   }
   auto Available = [&](MCPhysReg Candidate) {
     return llvm::none_of(LiveRegs, [&](Register LiveReg) {
       Register Root = LiveRegs.getReservationRoot(LiveReg);
-      MCPhysReg Backing = globalBacking(Root ? Root : LiveReg);
-      return Backing && TRI->regsOverlap(Candidate, Backing) &&
+      MCPhysReg ImagReg = globalImagReg(Root ? Root : LiveReg);
+      return ImagReg && TRI->regsOverlap(Candidate, ImagReg) &&
              LiveRegs.conflict(R, originalRange(LiveReg));
     });
   };
-  auto Order = RCI->getOrder(backingClass(R));
+  auto Order = RCI->getOrder(imagRegClass(R));
   auto Chosen = llvm::find_if(Order, [&](MCPhysReg Candidate) {
     return Available(Candidate) &&
            (Root == R || isResultRegisterAvailable(MI, Candidate, R));
@@ -532,7 +536,7 @@ MCPhysReg MOSImagRegAlloc::chooseGlobalRegister(const MachineInstr &MI,
   if (Chosen == Order.end())
     Chosen = llvm::find_if(Order, Available);
   assert(Chosen != Order.end() &&
-         "pressure check guaranteed a backing register");
+         "pressure check guaranteed an imaginary register");
   return *Chosen;
 }
 
@@ -680,7 +684,7 @@ void MOSImagRegAlloc::releaseDeadResults(const MachineInstr &MI) {
   });
 }
 
-bool MOSImagRegAlloc::backingAvailable(MCPhysReg Phys, Register Value,
+bool MOSImagRegAlloc::imagRegAvailable(MCPhysReg Phys, Register Value,
                                        Register Vacated) const {
   return llvm::none_of(LiveRegs, [&](Register R) {
     return R != Vacated && !isReservation(R) &&
@@ -707,7 +711,7 @@ bool MOSImagRegAlloc::isPhysicalOutput(const MachineInstr &MI,
 
 bool MOSImagRegAlloc::isRepairRegisterAvailable(const MachineInstr &MI,
                                                 MCPhysReg Phys) const {
-  if (!IncomingPhysRegs.available(Phys) || !backingAvailable(Phys) ||
+  if (!IncomingPhysRegs.available(Phys) || !imagRegAvailable(Phys) ||
       isPhysicalInput(MI, Phys) || isPhysicalOutput(MI, Phys))
     return false;
   for (const MachineOperand &MO : MI.operands()) {
@@ -729,12 +733,12 @@ bool MOSImagRegAlloc::isResultRegisterAvailable(const MachineInstr &MI,
   // Account for fixed outputs not yet visited, including ordinary physical
   // definitions when choosing an early-clobber result's location.
   return isPhysicalRegisterAvailable(Phys, R) && !isPhysicalOutput(MI, Phys) &&
-         backingAvailable(Phys, R);
+         imagRegAvailable(Phys, R);
 }
 
 MCPhysReg MOSImagRegAlloc::chooseRepairRegister(const MachineInstr &MI,
                                                 Register R) const {
-  for (MCPhysReg Phys : RCI->getOrder(backingClass(R)))
+  for (MCPhysReg Phys : RCI->getOrder(imagRegClass(R)))
     if (isRepairRegisterAvailable(MI, Phys))
       return Phys;
   report_fatal_error("MOS imaginary repairing requires spill insertion",
@@ -743,7 +747,7 @@ MCPhysReg MOSImagRegAlloc::chooseRepairRegister(const MachineInstr &MI,
 
 MCPhysReg MOSImagRegAlloc::chooseResultRegister(const MachineInstr &MI,
                                                 Register R) const {
-  for (MCPhysReg Phys : RCI->getOrder(backingClass(R)))
+  for (MCPhysReg Phys : RCI->getOrder(imagRegClass(R)))
     if (isResultRegisterAvailable(MI, Phys, R))
       return Phys;
   report_fatal_error("MOS imaginary repairing requires spill insertion",
@@ -790,7 +794,7 @@ void MOSImagRegAlloc::displace(MachineInstr &MI, MCPhysReg Phys, Register Value,
 
 bool MOSImagRegAlloc::swapInto(MachineInstr &MI, Register R, MCPhysReg Phys) {
   MCPhysReg Old = VRM->getPhys(R);
-  if (!Old || !backingAvailable(Old, Register(), R) ||
+  if (!Old || !imagRegAvailable(Old, Register(), R) ||
       !PhysRegs.available(*MRI, Old) || isPhysicalInput(MI, Old) ||
       isPhysicalInput(MI, Phys))
     return false;
@@ -801,8 +805,8 @@ bool MOSImagRegAlloc::swapInto(MachineInstr &MI, Register R, MCPhysReg Phys) {
         !TRI->regsOverlap(Phys, VRM->getPhys(Other)))
       continue;
     MCPhysReg Destination = Old;
-    if (backingClass(Other) != backingClass(R)) {
-      if (backingClass(R) != &MOS::Imag16RegClass)
+    if (imagRegClass(Other) != imagRegClass(R)) {
+      if (imagRegClass(R) != &MOS::Imag16RegClass)
         return false;
       unsigned Lane = TRI->getSubReg(Phys, MOS::sublo) == VRM->getPhys(Other)
                           ? MOS::sublo
@@ -846,7 +850,7 @@ void MOSImagRegAlloc::prepareTiedUses(MachineInstr &MI) {
             "MOS imaginary repairing requires whole-register ties",
             /*gen_crash_diag=*/false);
       if (Use.isKill() && VRM->hasPhys(R) &&
-          backingAvailable(VRM->getPhys(R), Register(), R) &&
+          imagRegAvailable(VRM->getPhys(R), Register(), R) &&
           PhysRegs.available(*MRI, VRM->getPhys(R)) &&
           !isPhysicalOutput(MI, VRM->getPhys(R)))
         continue;
@@ -895,19 +899,19 @@ void MOSImagRegAlloc::assignDefs(MachineInstr &MI, bool Early) {
     for (MachineOperand &MO : MI.all_defs()) {
       Register R = MO.getReg();
       if (MO.isEarlyClobber() != Early || !R.isVirtual() ||
-          (backingClass(R) == &MOS::Imag16RegClass ? 16u : 8u) != Bits)
+          (imagRegClass(R) == &MOS::Imag16RegClass ? 16u : 8u) != Bits)
         continue;
       MachineOperand *Input = tiedOperand(MO);
-      bool InheritBacking = Input && Input->getReg().isVirtual() &&
+      bool InheritImagReg = Input && Input->getReg().isVirtual() &&
                             !Input->isUndef() && hasImaginaryOption(R) &&
                             hasImaginaryOption(Input->getReg());
-      if (!needsReg(R) && !InheritBacking)
+      if (!needsReg(R) && !InheritImagReg)
         continue;
       MCPhysReg Global = !needsReg(R)      ? MCPhysReg()
                          : VRM->hasPhys(R) ? MCPhysReg(VRM->getPhys(R))
                                            : chooseGlobalRegister(MI, R);
       MCPhysReg Local = Global;
-      if (InheritBacking)
+      if (InheritImagReg)
         Local = VRM->getPhys(Input->getReg());
       else if (MI.isFullCopy() && Input && Input->getReg().isPhysical() &&
                needsReg(Input->getReg()) &&
@@ -929,11 +933,11 @@ void MOSImagRegAlloc::restoreRegisters(MachineBasicBlock &MBB,
   for (Register R : LiveRegs) {
     if (isReservation(R))
       continue;
-    MCPhysReg Phys = globalBacking(R);
+    MCPhysReg Phys = globalImagReg(R);
     if (VRM->getPhys(R) == Phys)
       continue;
     if (!isPhysicalRegisterAvailable(Phys, R))
-      report_fatal_error("MOS imaginary repairing cannot restore a backing "
+      report_fatal_error("MOS imaginary repairing cannot restore an imaginary "
                          "register across a fixed physical lifetime",
                          /*gen_crash_diag=*/false);
     Copies.push_back({split(R, Phys), R});
@@ -1016,9 +1020,9 @@ bool MOSImagRegAlloc::needsReg(Register R) const {
            (MOS::Imag8RegClass.contains(R) ||
             MOS::Imag16RegClass.contains(R)) &&
            !MRI.isReserved(R);
-  // A reservation's IMPLICIT_DEF is rematerializable, but reserves backing for
-  // its PHI. Its incoming copies must also inherit that backing even when their
-  // sources are rematerializable.
+  // A reservation's IMPLICIT_DEF is rematerializable, but reserves an imaginary
+  // register for its PHI. Its incoming copies must also inherit that register
+  // even when their sources are rematerializable.
   if (LiveRegs.getReservationRoot(R))
     return true;
   if (MRI.use_nodbg_empty(R))
@@ -1026,7 +1030,7 @@ bool MOSImagRegAlloc::needsReg(Register R) const {
   unsigned Bits = TRI->getRegSizeInBits(*MRI.getRegClass(R)).getFixedValue();
   if (Bits != 1 && Bits != 8 && Bits != 16)
     report_fatal_error(
-        "MOSImagRegAlloc only supports Imag8 and Imag16 backing registers",
+        "MOSImagRegAlloc only supports Imag8 and Imag16 registers",
         /*GenCrashDiag=*/false);
   auto V = ValueNumbers->getValueNumber(R);
   if (V.isUndef()) {
@@ -1084,7 +1088,8 @@ Register LiveRegisters::getReservationRoot(Register R) const {
     return Register();
   unsigned NumDefs = MI->getNumExplicitDefs();
   if (MI->getNumOperands() == 2 * NumDefs)
-    return Register(); // Entry PCOPY destinations have independent backing.
+    return Register(); // Entry PCOPY destinations have independent imaginary
+                       // assignments.
   assert(MI->getNumOperands() == 3 * NumDefs &&
          "expected exit PCOPY reservation operands");
   Register Root = MI->getOperand(2 * NumDefs + Def->getOperandNo()).getReg();
@@ -1097,7 +1102,7 @@ bool LiveRegisters::insert(Register R) {
   if (Regs.test(R))
     return true;
   // PHI inputs and results inherit the assignment guaranteed at their root's
-  // definition; they introduce no new backing assignment to check.
+  // definition; they introduce no new imaginary assignment to check.
   Register Root = getReservationRoot(R);
   if ((!Root || R == Root) && getRequiredCapacity(R) > getCapacity(R))
     return false;
@@ -1111,7 +1116,7 @@ bool LiveRegisters::conflict(Register R, Register LiveReg) const {
   if (R == LiveReg)
     return false;
   // Physical demand is repaired later; conservatively allow it to displace any
-  // backing register, including reservations.
+  // imaginary register, including reservations.
   if (R.isPhysical() || LiveReg.isPhysical())
     return true;
   if (R == getReservationRoot(R))
@@ -1129,7 +1134,8 @@ bool LiveRegisters::conflictsWithReservation(Register Root, Register R) const {
   for (const MachineInstr &Copy : MRI->use_nodbg_instructions(Root)) {
     assert(Copy.getOpcode() == MOS::PCOPY && "unexpected reservation use");
     // Roots conflict at shared exit PCOPYs. Other registers conflict if they
-    // need their backing anywhere from the exit PCOPY through the terminators.
+    // need their assigned register anywhere from the exit PCOPY through the
+    // terminators.
     if (IsReservation ? Copy.readsRegister(R, /*TRI=*/nullptr)
                       : overlapsExit(R, Copy))
       return true;
@@ -1139,8 +1145,9 @@ bool LiveRegisters::conflictsWithReservation(Register Root, Register R) const {
 
 bool LiveRegisters::overlapsExit(Register R, const MachineInstr &Copy) const {
   const MachineBasicBlock &MBB = *Copy.getParent();
-  // CSSA edge operands inherit backing rather than initiating allocation.
-  // Other values surviving the exit region are live in to a successor.
+  // CSSA edge operands inherit assignments rather than initiating
+  // allocation. Other values surviving the exit region are live in to a
+  // successor.
   if (llvm::any_of(MBB.successors(), [&](const MachineBasicBlock *Succ) {
         return LV->isLiveIn(R, *Succ);
       }))

@@ -8,7 +8,8 @@
 ///
 /// \file
 /// Identify equal values through whole copies, allocation splits, and the
-/// individual bytes of REG_SEQUENCE, independently of their backing registers.
+/// individual bytes of REG_SEQUENCE, independently of their imaginary
+/// registers.
 ///
 //===----------------------------------------------------------------------===//
 

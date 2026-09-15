@@ -147,7 +147,8 @@ body: |
 
 # The reservation starts in bb.1 while %0 is still live, but %0 dies before any
 # member is defined. It must not count against, or prevent reuse by, the new
-# reservation. Constant PHI inputs still get the reservation's backing register.
+# reservation. Constant PHI inputs still get the reservation's imaginary
+# register.
 ---
 name: inherited_local
 # CHECK-LABEL: name: inherited_local
@@ -246,7 +247,7 @@ body: |
 #--- overflow.mir
 # Only the final pair now survives across the PCOPY. It conflicts with the
 # reservation, so its definition needs fifteen potentially occupied pairs.
-# OVERFLOW: MOSImagRegAlloc: cannot prove backing assignability in reservation_overflow, bb.0 for Imag16 backing: requires 15, 14 available locations
+# OVERFLOW: MOSImagRegAlloc: cannot prove imaginary register assignability in reservation_overflow, bb.0 for Imag16: requires 15, 14 available locations
 # OVERFLOW: %13:imag16 = COPY $rs0
 # OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
 ---

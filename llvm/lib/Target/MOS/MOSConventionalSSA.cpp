@@ -7,19 +7,20 @@
 //===----------------------------------------------------------------------===//
 ///
 /// \file
-/// Isolate PHIs to put machine IR in conventional SSA form. Each PHI's inputs
-/// and result are fresh registers with mutually disjoint live ranges, allowing
-/// the allocator to give them a common backing location. Parallel copies before
-/// predecessor terminators and after PHI bundles connect these registers to the
-/// original values. All PHIs remain in SSA form, and the CFG is unchanged.
+/// Isolate PHIs to put machine IR in conventional SSA form. Each PHI's
+/// inputs and result are fresh registers with mutually disjoint live ranges,
+/// allowing the allocator to give them a common imaginary register. Parallel
+/// copies before predecessor terminators and after PHI bundles connect these
+/// registers to the original values. All PHIs remain in SSA form, and the CFG
+/// is unchanged.
 ///
-/// An IMPLICIT_DEF at the common dominator reserves each PHI's backing
-/// location. Exit PCOPYs carry this reservation as an implicit use, associating
-/// it with their destination without reading particular contents. The PCOPY
-/// destinations and PHI result carry the meaningful portions of the
+/// An IMPLICIT_DEF at the common dominator reserves each PHI's imaginary
+/// register location. Exit PCOPYs carry this reservation as an implicit use,
+/// associating it with their destination without reading particular contents.
+/// The PCOPY destinations and PHI result carry the meaningful portions of the
 /// reservation. Ordinary SSA liveness therefore describes both its undefined
 /// and meaningful portions. Entry PCOPYs end this association: their results
-/// have independent backing.
+/// have independent imaginary assignments.
 ///
 /// This implements the unoptimized copy insertion construction: it does not
 /// coalesce copies. PHI inputs defined at or after the predecessor's first
@@ -76,7 +77,7 @@ private:
   struct Copy {
     MachineOperand Def;
     MachineOperand Use;
-    // Exit copies inherit this reservation's backing location. Entry copies
+    // Exit copies inherit this reservation's imaginary register. Entry copies
     // have no reservation operand; they end the shared-location chain.
     Register Reservation;
   };

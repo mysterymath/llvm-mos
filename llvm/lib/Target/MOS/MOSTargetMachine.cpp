@@ -288,7 +288,8 @@ void MOSPassConfig::addMachineSSAOptimization() {
 }
 
 void MOSPassConfig::addOptimizedRegAlloc() {
-  // Process ordinary implicit defs before CSSA creates backing reservations.
+  // Process ordinary implicit defs before CSSA creates imaginary register
+  // reservations.
   addPass(&ProcessImplicitDefsID);
   addPass(createMOSConventionalSSAPass());
   addPass(createMOSImagRegAllocPass());

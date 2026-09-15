@@ -7,16 +7,18 @@
 //===----------------------------------------------------------------------===//
 ///
 /// \file
-/// Choose hardware registers for SSA instructions using dynamic programming at
-/// instruction boundaries. MOSImagRegAlloc supplies complete imaginary
-/// assignments through VirtRegMap. This pass may defer or eliminate
+/// Choose hardware registers for SSA instructions using dynamic
+/// programming at instruction boundaries. MOSImagRegAlloc supplies complete
+/// imaginary assignments through VirtRegMap. This pass may defer or eliminate
 /// their materialization while retaining the corresponding values in A/X/Y/C/V.
-/// An established backing copy remains valid until its SSA live range ends.
+/// An established copy in an imaginary register remains valid until its SSA
+/// live range ends.
 ///
-/// The DP key records hardware contents and the valid live backing registers
-/// for those values. Liveness and VirtRegMap determine each backing's value.
-/// Values absent from hardware must have all their live backing copies, so
-/// their validity is implicit and omitted from the key.
+/// The DP key records hardware contents and the valid live imaginary registers
+/// for those values. Liveness and VirtRegMap determine each imaginary
+/// register's value. Values absent from hardware must have all their live
+/// copies in imaginary registers, so their validity is implicit and omitted
+/// from the key.
 ///
 /// Each transition chooses hardware operands and realizes the instruction's
 /// transfers. Imaginary operands use their assigned locations. Parallel copies
@@ -27,8 +29,9 @@
 ///
 /// Each boundary table retains the cheapest implementation and predecessor for
 /// each allocation state. Code is emitted after planning an entire block. Block
-/// exits materialize live backing copies before the terminators. Value numbers
-/// identify equal contents independently of SSA names and backing assignments.
+/// exits materialize live copies in imaginary registers before the terminators.
+/// Value numbers identify equal contents independently of SSA names and
+/// imaginary assignments.
 ///
 /// This initial implementation retains the input schedule and supports the
 /// Imag8/Imag16 operations used by sieve. There is no beam pruning. Transfer
@@ -82,27 +85,28 @@ using RegisterContents = MOSRegisterContents;
 constexpr std::array<MCPhysReg, 5> HardwareRegs = {MOS::A, MOS::X, MOS::Y,
                                                    MOS::C, MOS::V};
 
-// The DP key at an instruction boundary. ValidBackings contains only physical
+// The DP key at an instruction boundary. ValidImagRegs contains only physical
 // Imag8 registers holding an assigned live value also present in Hardware.
 // Liveness and VirtRegMap associate each bit with its value, so this is one set
 // per distinct hardware value without duplicating sets for hardware copies.
-// Imag16 backings are tracked byte by byte. Dead backings are omitted; live
-// backings of values absent from Hardware are implicitly valid.
-// Index directly by physical register number, through the last Imag8 register.
-// Fixed-size storage avoids a separate allocation for each DP state.
+// Imag16 registers are tracked byte by byte. Dead imaginary registers are
+// omitted; live imaginary registers of values absent from Hardware are
+// implicitly valid. Index directly by physical register number, through the
+// last Imag8 register. Fixed-size storage avoids a separate allocation for each
+// DP state.
 struct AllocationState {
   std::array<ValueNumber, HardwareRegs.size()> Hardware = {};
-  std::bitset<MOS::RC255 + 1> ValidBackings;
+  std::bitset<MOS::RC255 + 1> ValidImagRegs;
 
   bool operator==(const AllocationState &Other) const {
-    return Hardware == Other.Hardware && ValidBackings == Other.ValidBackings;
+    return Hardware == Other.Hardware && ValidImagRegs == Other.ValidImagRegs;
   }
 };
 
 struct AllocationStateInfo {
   static unsigned getHashValue(const AllocationState &State) {
     unsigned Hash =
-        std::hash<decltype(State.ValidBackings)>{}(State.ValidBackings);
+        std::hash<decltype(State.ValidImagRegs)>{}(State.ValidImagRegs);
     for (ValueNumber V : State.Hardware)
       Hash = detail::combineHashValue(
           Hash, DenseMapInfo<ValueNumber>::getHashValue(V));
@@ -145,7 +149,7 @@ using AllocationTable = DenseMap<AllocationState, DPEntry, AllocationStateInfo>;
 
 // An instruction boundary: fixed facts from MIR and the alternatives found by
 // the DP. MI is the instruction leading to this point. A null MI denotes the
-// block entry or the restoration of backing registers before terminators.
+// block entry or the restoration of imaginary registers before terminators.
 struct ProgramPoint {
   explicit ProgramPoint(MachineInstr *MI) : MI(MI) {}
 
@@ -164,9 +168,9 @@ struct BlockPlan {
 };
 
 // Working contents and generated code for one instruction's implementation.
-// Registers records the effects of individual transfers, including the backing
-// copies they establish. Cost is local, in estimated bytes; it excludes
-// preceding instructions.
+// Registers records the effects of individual transfers, including the
+// imaginary register copies they establish. Cost is local, in estimated bytes;
+// it excludes preceding instructions.
 struct Implementation {
   explicit Implementation(RegisterContents Input)
       : Registers(std::move(Input)) {}
@@ -198,9 +202,9 @@ private:
   BitVector fixedRegisters(const LivePhysRegs &LiveRegs) const;
 
   bool isRematerialized(const MachineInstr &MI) const;
-  // Visit each live byte's required backing register and static value. Use
+  // Visit each live byte's required imaginary register and static value. Use
   // the live range's assignment, even when its value number names an ancestor.
-  void forEachBacking(const SparseBitVector<> &LiveRegs,
+  void forEachImagReg(const SparseBitVector<> &LiveRegs,
                       function_ref<void(MCPhysReg, ValueNumber)> Visit) const;
   AllocationState getAllocationState(const RegisterContents &Registers,
                                      const SparseBitVector<> &LiveRegs) const;
@@ -209,10 +213,8 @@ private:
   bool materializeUnheldValues(Implementation &Plan,
                                const SparseBitVector<> &LiveRegs,
                                BitVector Locked, bool CanInsert);
-  bool restoreBackingRegisters(Implementation &Plan,
-                               const SparseBitVector<> &LiveRegs,
-                               const SparseBitVector<> &Preserve,
-                               BitVector Locked);
+  bool restoreImagRegs(Implementation &Plan, const SparseBitVector<> &LiveRegs,
+                       const SparseBitVector<> &Preserve, BitVector Locked);
 
   // Locked registers may be read but not changed by inserted instructions.
   // Forbidden additionally protects registers about to be clobbered: evacuation
@@ -243,9 +245,9 @@ private:
   // Storage modeled by the search: A/X/Y/C/V and Imag8. An Imag16 denotes
   // its two Imag8s; implicit hardware aliases are not separate storage.
   SmallVector<MCPhysReg, 2> registerParts(MCPhysReg R) const;
-  // Backing storage belongs to a live range, not to its value number.
-  // Return zero if the live range has no backing assignment.
-  MCPhysReg getBackingRegister(Register R, unsigned SubReg = 0) const;
+  // An imaginary register assignment belongs to a live range, not to its value
+  // number. Return zero if the live range has no imaginary assignment.
+  MCPhysReg imagReg(Register R, unsigned SubReg = 0) const;
   const MachineInstr *rematerialization(ValueNumber V) const;
   [[noreturn]] void fail(const Twine &Reason,
                          const MachineInstr *MI = nullptr) const;
@@ -254,8 +256,9 @@ private:
   MachineRegisterInfo &MRI;
   const TargetInstrInfo &TII;
   const TargetRegisterInfo &TRI;
-  // VirtRegMap records backing storage here, independently of operand classes.
-  // This pass realizes the operands itself and consumes the map's assignments.
+  // VirtRegMap records imaginary registers here, independently of operand
+  // classes. This pass realizes the operands itself and consumes the map's
+  // assignments.
   const VirtRegMap &VRM;
   LiveVariables &LV;
   const MOSValueNumbering &ValueNumbers;
@@ -263,9 +266,9 @@ private:
 };
 
 // The DP visits instruction boundaries in schedule order. Only completed
-// instruction implementations, with the backing invariant restored, enter its
-// tables. All operand choices and temporary contents belong to the local
-// search.
+// instruction implementations, with the imaginary register validity invariant
+// restored, enter its tables. All operand choices and temporary contents belong
+// to the local search.
 class FunctionAllocator::BlockSearch {
 public:
   BlockSearch(FunctionAllocator &Allocator, MachineBasicBlock &MBB);
@@ -323,7 +326,7 @@ private:
   MachineInstr &MI;
   bool Defs;
   function_ref<void(ArrayRef<MCPhysReg>)> Accept;
-  // Domains depend on MIR and the assigned backing registers. Compute them
+  // Domains depend on MIR and the assigned imaginary registers. Compute them
   // once for this enumeration; only Assignment changes in search.
   SmallVector<SmallVector<MCPhysReg>> Domains;
   SmallVector<MCPhysReg> Assignment;
@@ -396,7 +399,8 @@ void FunctionAllocator::checkPHIAssignments() const {
 void FunctionAllocator::analyzeLiveness() {
   for (MachineBasicBlock &MBB : MF) {
     auto &Points = Blocks[&MBB].Points;
-    Points.emplace_back(nullptr); // Entry: all incoming backings are valid.
+    Points.emplace_back(
+        nullptr); // Entry: all incoming imaginary registers are valid.
     bool HasTerminators = false;
     for (MachineInstr &MI : MBB) {
       if (MI.isDebugInstr())
@@ -462,11 +466,11 @@ void FunctionAllocator::BlockSearch::run() {
 void FunctionAllocator::BlockSearch::initialize() {
   ProgramPoint &Entry = Block.Points.front();
   RegisterContents Registers(Allocator.TRI, Allocator.ValueNumbers);
-  Allocator.forEachBacking(Entry.LiveRegs, [&](MCPhysReg R, ValueNumber V) {
+  Allocator.forEachImagReg(Entry.LiveRegs, [&](MCPhysReg R, ValueNumber V) {
     if (Entry.FixedRegs[R])
-      Allocator.fail("pinned physical live-in overlaps a backing register");
+      Allocator.fail("pinned physical live-in overlaps an imaginary register");
     assert((!Registers.read(R) || Registers.read(R) == V) &&
-           "backing assignments interfere");
+           "imaginary assignments interfere");
     Registers.define(R, V);
   });
   Entry.Allocations.try_emplace(
@@ -499,8 +503,9 @@ void FunctionAllocator::BlockSearch::advance(const ProgramPoint &Before,
     ++Previous;
   }
   if (After.Allocations.empty())
-    Allocator.fail(After.MI ? "no supported placement continuation"
-                            : "cannot restore live values to backing registers",
+    Allocator.fail(After.MI
+                       ? "no supported placement continuation"
+                       : "cannot restore live values to imaginary registers",
                    After.MI);
   NumStates += After.Allocations.size();
   LLVM_DEBUG(dbgs() << "bb." << MBB.getNumber() << ": "
@@ -509,8 +514,8 @@ void FunctionAllocator::BlockSearch::advance(const ProgramPoint &Before,
 
 bool FunctionAllocator::BlockSearch::restoreLiveOuts(
     Implementation &Plan, const ProgramPoint &Before) {
-  return Allocator.restoreBackingRegisters(Plan, Block.Points.back().LiveRegs,
-                                           Before.LiveRegs, Before.FixedRegs) &&
+  return Allocator.restoreImagRegs(Plan, Block.Points.back().LiveRegs,
+                                   Before.LiveRegs, Before.FixedRegs) &&
          Allocator.materializeUnheldValues(Plan, Before.LiveRegs,
                                            Before.FixedRegs, true);
 }
@@ -541,7 +546,7 @@ void FunctionAllocator::InstructionSearch::run() {
     Register R = MI.getOperand(0).getReg();
     if (!Allocator.MRI.use_nodbg_empty(R))
       for (unsigned SubReg : Allocator.ValueNumbers.subRegIndices(R))
-        Plan.Registers.define(Allocator.getBackingRegister(R, SubReg),
+        Plan.Registers.define(Allocator.imagReg(R, SubReg),
                               Allocator.ValueNumbers.getValueNumber(R, SubReg));
     finish(std::move(Plan));
     return;
@@ -618,7 +623,7 @@ void FunctionAllocator::OperandChoices::buildDomain(unsigned I) {
   }
   Domains[I] = Allocator.destinations(R);
   // A fixed hardware input may also be the destination of a capture. Imaginary
-  // inputs use the destination's assigned backing register.
+  // inputs use the destination's assigned imaginary register.
   if (MI.isCopy() && MI.getOperand(1).getReg().isPhysical() &&
       llvm::is_contained(HardwareRegs, MI.getOperand(1).getReg()) &&
       !llvm::is_contained(Domains[I], MI.getOperand(1).getReg()))
@@ -630,7 +635,7 @@ void FunctionAllocator::OperandChoices::buildDomain(unsigned I) {
       RC = Allocator.MRI.getRegClass(R);
     llvm::erase_if(Domains[I], [&](MCPhysReg H) { return !RC->contains(H); });
     // ProcessImplicitDefs can leave an undef imaginary operand without a
-    // definition or backing assignment. Any member satisfies that read.
+    // definition or imaginary assignment. Any member satisfies that read.
     if (MO.isUndef() && Domains[I].empty())
       Domains[I].push_back(*RC->begin());
   }
@@ -898,7 +903,7 @@ bool FunctionAllocator::InstructionPlacement::define(const MachineOperand &MO) {
   return true;
 }
 
-void FunctionAllocator::forEachBacking(
+void FunctionAllocator::forEachImagReg(
     const SparseBitVector<> &LiveRegs,
     function_ref<void(MCPhysReg, ValueNumber)> Visit) const {
   for (unsigned I : LiveRegs) {
@@ -907,10 +912,10 @@ void FunctionAllocator::forEachBacking(
       ValueNumber V = ValueNumbers.getValueNumber(R, SubReg);
       if (V.isUndef() || rematerialization(V))
         continue;
-      MCPhysReg Backing = getBackingRegister(R, SubReg);
-      if (!Backing)
-        fail("live value has no backing register");
-      Visit(Backing, V);
+      MCPhysReg ImagReg = imagReg(R, SubReg);
+      if (!ImagReg)
+        fail("live value has no imaginary register");
+      Visit(ImagReg, V);
     }
   }
 }
@@ -921,14 +926,15 @@ FunctionAllocator::getAllocationState(const RegisterContents &Registers,
   AllocationState State;
   for (auto [I, R] : llvm::enumerate(HardwareRegs))
     State.Hardware[I] = Registers.read(R);
-  forEachBacking(LiveRegs, [&](MCPhysReg R, ValueNumber V) {
+  forEachImagReg(LiveRegs, [&](MCPhysReg R, ValueNumber V) {
     if (!Registers.hasCopyIn(V, HardwareRegs)) {
-      assert(Registers.read(R) == V &&
-             "value absent from hardware requires every live backing");
+      assert(
+          Registers.read(R) == V &&
+          "value absent from hardware requires every live imaginary register");
       return;
     }
     if (Registers.read(R) == V)
-      State.ValidBackings.set(R);
+      State.ValidImagRegs.set(R);
   });
   return State;
 }
@@ -939,21 +945,21 @@ RegisterContents FunctionAllocator::getRegisterContents(
   for (auto [I, R] : llvm::enumerate(HardwareRegs))
     if (State.Hardware[I])
       Registers.define(R, State.Hardware[I]);
-  forEachBacking(LiveRegs, [&](MCPhysReg R, ValueNumber V) {
-    if (Registers.hasCopyIn(V, HardwareRegs) && !State.ValidBackings[R])
+  forEachImagReg(LiveRegs, [&](MCPhysReg R, ValueNumber V) {
+    if (Registers.hasCopyIn(V, HardwareRegs) && !State.ValidImagRegs[R])
       return;
     assert((!Registers.read(R) || Registers.read(R) == V) &&
-           "backing assignments interfere");
+           "imaginary assignments interfere");
     Registers.define(R, V);
   });
   for (unsigned I : LiveRegs) {
     Register R = Register::index2VirtReg(I);
-    MCPhysReg Backing = getBackingRegister(R);
-    if (!Backing || ValueNumbers.subRegIndices(R).size() != 2)
+    MCPhysReg ImagReg = imagReg(R);
+    if (!ImagReg || ValueNumbers.subRegIndices(R).size() != 2)
       continue;
     ValueNumber V = ValueNumbers.getValueNumber(R);
-    if (Registers.contains(Backing, V))
-      Registers.define(Backing, V);
+    if (Registers.contains(ImagReg, V))
+      Registers.define(ImagReg, V);
   }
   return Registers;
 }
@@ -961,15 +967,16 @@ RegisterContents FunctionAllocator::getRegisterContents(
 bool FunctionAllocator::materializeUnheldValues(
     Implementation &Plan, const SparseBitVector<> &LiveRegs, BitVector Locked,
     bool CanInsert) {
-  // Copies can end one backing range and start another without changing the
-  // value. If hardware retains it, materializing the new backing may wait.
-  // Otherwise perform the assigned transfer before retaining this DP state.
+  // Copies can end one SSA live range and start another without changing the
+  // value. If hardware retains it, materializing the new imaginary register may
+  // wait. Otherwise perform the assigned transfer before retaining this DP
+  // state.
   bool Valid = true;
-  forEachBacking(LiveRegs, [&](MCPhysReg R, ValueNumber V) {
+  forEachImagReg(LiveRegs, [&](MCPhysReg R, ValueNumber V) {
     if (Plan.Registers.read(R) == V)
       Locked.set(R);
   });
-  forEachBacking(LiveRegs, [&](MCPhysReg R, ValueNumber V) {
+  forEachImagReg(LiveRegs, [&](MCPhysReg R, ValueNumber V) {
     if (!Valid || Plan.Registers.read(R) == V ||
         Plan.Registers.hasCopyIn(V, HardwareRegs))
       return;
@@ -984,18 +991,19 @@ bool FunctionAllocator::materializeUnheldValues(
   return true;
 }
 
-bool FunctionAllocator::restoreBackingRegisters(
-    Implementation &Plan, const SparseBitVector<> &LiveRegs,
-    const SparseBitVector<> &Preserve, BitVector Locked) {
+bool FunctionAllocator::restoreImagRegs(Implementation &Plan,
+                                        const SparseBitVector<> &LiveRegs,
+                                        const SparseBitVector<> &Preserve,
+                                        BitVector Locked) {
   for (int I : LiveRegs) {
     Register R = Register::index2VirtReg(I);
     for (unsigned SubReg : ValueNumbers.subRegIndices(R)) {
       ValueNumber A = ValueNumbers.getValueNumber(R, SubReg);
       if (A.isUndef())
         continue;
-      MCPhysReg H = getBackingRegister(R, SubReg);
-      // PHI inputs can be copies of constants. Their assigned backing must
-      // still be initialized before control reaches the PHI.
+      MCPhysReg H = imagReg(R, SubReg);
+      // PHI inputs can be copies of constants. Their assigned imaginary
+      // register must still be initialized before control reaches the PHI.
       if (const MachineInstr *Def = rematerialization(A))
         if (!H || Def->isImplicitDef())
           continue;
@@ -1113,11 +1121,12 @@ bool FunctionAllocator::evacuate(MCPhysReg Reg, Implementation &Plan,
     return true;
 
   if (MOS::Imag8RegClass.contains(Reg)) {
-    // An established backing cannot be displaced during its SSA live range.
-    // Parallel copies may overwrite a source whose range ends at the copy;
-    // preserve its value in hardware if another destination still needs it.
+    // A materialized imaginary register must retain its value throughout its
+    // SSA live range. Parallel copies may overwrite a source whose range ends
+    // at the copy; preserve its value in hardware if another destination still
+    // needs it.
     bool Required = false;
-    forEachBacking(LiveRegs, [&](MCPhysReg R, ValueNumber Value) {
+    forEachImagReg(LiveRegs, [&](MCPhysReg R, ValueNumber Value) {
       Required |= R == Reg && Value == V;
     });
     if (Required)
@@ -1143,11 +1152,12 @@ bool FunctionAllocator::evacuate(MCPhysReg Reg, Implementation &Plan,
     if (Copy != Reg && !Forbidden[Copy] && Plan.Registers.read(Copy) == V)
       return true;
 
-  // Releasing the last hardware copy must establish every live backing for
-  // this value. Those locations are fixed by the preceding imaginary passes.
+  // Releasing the last hardware copy must establish every live imaginary
+  // register for this value. Those locations are fixed by the preceding
+  // imaginary passes.
   Locked.set(Reg);
   bool Valid = true;
-  forEachBacking(LiveRegs, [&](MCPhysReg R, ValueNumber Value) {
+  forEachImagReg(LiveRegs, [&](MCPhysReg R, ValueNumber Value) {
     if (!Valid || Value != V || Plan.Registers.read(R) == V)
       return;
     Valid =
@@ -1240,8 +1250,8 @@ SmallVector<MCPhysReg> FunctionAllocator::destinations(Register R) const {
     else
       Result.append({MOS::A, MOS::X, MOS::Y});
   }
-  if (MCPhysReg Backing = VRM.getPhys(R))
-    Result.push_back(Backing);
+  if (MCPhysReg ImagReg = VRM.getPhys(R))
+    Result.push_back(ImagReg);
   return Result;
 }
 
@@ -1302,12 +1312,11 @@ SmallVector<MCPhysReg, 2> FunctionAllocator::registerParts(MCPhysReg R) const {
   return {};
 }
 
-MCPhysReg FunctionAllocator::getBackingRegister(Register R,
-                                                unsigned SubReg) const {
-  MCPhysReg BackingReg = VRM.getPhys(R);
-  if (BackingReg && SubReg)
-    return TRI.getSubReg(BackingReg, SubReg);
-  return BackingReg;
+MCPhysReg FunctionAllocator::imagReg(Register R, unsigned SubReg) const {
+  MCPhysReg ImagReg = VRM.getPhys(R);
+  if (ImagReg && SubReg)
+    return TRI.getSubReg(ImagReg, SubReg);
+  return ImagReg;
 }
 
 const MachineInstr *FunctionAllocator::rematerialization(ValueNumber V) const {

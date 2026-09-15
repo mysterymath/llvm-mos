@@ -169,8 +169,9 @@ body: |
     RTS
 ...
 
-# The first fixed COPY exchanges two occupied backings. The second argument
-# is then already in place; no scratch backing is needed for the exchange.
+# The first fixed COPY exchanges two occupied imaginary registers. The second
+# argument is then already in place; no scratch imaginary register is needed for
+# the exchange.
 ---
 name: swap_arguments
 tracksRegLiveness: true
@@ -238,8 +239,8 @@ body: |
     RTS
 ...
 
-# Killing the old tied input must not release the physical early-clobber
-# result. The following virtual definition must use a different backing.
+# Killing the old tied input must not release the physical early-clobber result.
+# The following virtual definition must use a different imaginary register.
 ---
 name: physical_early_tie
 # ASSIGN-LABEL: name: physical_early_tie

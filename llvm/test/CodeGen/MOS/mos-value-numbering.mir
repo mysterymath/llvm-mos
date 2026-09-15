@@ -5,7 +5,8 @@
 
 # Reconstructing an opaque pair from its projections recovers its whole value
 # number. Copies preserve both component and whole identities, so all these
-# simultaneously live whole values can share the incoming pair's backing.
+# simultaneously live whole values can share the incoming pair's imaginary
+# register.
 ---
 name: reconstruct_pair
 # ASSIGN-LABEL: name: reconstruct_pair
@@ -58,7 +59,7 @@ body: |
 ...
 
 # Separate constructions with the same components have one identity. Reversing
-# the components changes the value and needs a different backing pair while
+# the components changes the value and needs a different Imag16 register while
 # both are live. The repeated low component also exercises equal pair lanes.
 ---
 name: sequence_identity

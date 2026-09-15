@@ -5,7 +5,7 @@
 # hardware allocation. Parallel transfers execute in the original CFG.
 
 # The old PHI result remains live on the exit edge. Only the backedge may
-# overwrite its backing register with the incremented value.
+# overwrite its imaginary register with the incremented value.
 ---
 name: lost_copy
 tracksRegLiveness: true

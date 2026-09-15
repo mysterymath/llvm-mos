@@ -60,7 +60,8 @@ body: |
 ...
 
 # The first tied input remains live after the operation. Its killed local copy
-# shares backing with the result; the original value retains its own backing.
+# shares an imaginary register with the result; the original value retains its
+# own imaginary register.
 ---
 name: live_through_tie
 # ASSIGN-LABEL: name: live_through_tie
@@ -97,7 +98,7 @@ body: |
 
 # An INC reuses its input's temporary location. Its result gets a separate SSA
 # name for restoration; later definitions can prefer a globally and locally
-# free backing rather than displacing the INC result again.
+# a free imaginary register rather than displacing the INC result again.
 ---
 name: local_definition
 # ASSIGN-LABEL: name: local_definition
