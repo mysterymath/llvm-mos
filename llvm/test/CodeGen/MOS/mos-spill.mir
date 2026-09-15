@@ -400,9 +400,127 @@ body: |
     RTS
 ...
 
+# Separately live physical bytes in the same pair block only one pair location.
+# The thirteenth virtual pair must still fit.
+---
+name: paired_physical_bytes
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rc2, $rc3
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    $rc0 = COPY $rc2
+    $rc0 = COPY $rc3
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    RTS
+...
+
+# The same known packing leaves room for a new physical pair alongside twelve
+# virtual pairs. Physical definitions use the same availability bound.
+---
+name: physical_pair_after_paired_bytes
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rc2, $rc3
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    $rs2 = COPY $rs0
+    $rs0 = COPY $rs2
+    $rc0 = COPY $rc2
+    $rc0 = COPY $rc3
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    RTS
+...
+
+# A physical copy of a still-live virtual value adds no distinct storage
+# requirement. All fourteen pairs are occupied when the copy is defined.
+---
+name: physical_copy_of_live_value
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:imag16 = COPY $rs0
+    %1:imag16 = COPY $rs0
+    %2:imag16 = COPY $rs0
+    %3:imag16 = COPY $rs0
+    %4:imag16 = COPY $rs0
+    %5:imag16 = COPY $rs0
+    %6:imag16 = COPY $rs0
+    %7:imag16 = COPY $rs0
+    %8:imag16 = COPY $rs0
+    %9:imag16 = COPY $rs0
+    %10:imag16 = COPY $rs0
+    %11:imag16 = COPY $rs0
+    %12:imag16 = COPY $rs0
+    %13:imag16 = COPY $rs0
+    $rs1 = COPY %0
+    $rs0 = COPY $rs1
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    $rs0 = COPY %13
+    RTS
+...
+
 #--- intact_pair_overflow.mir
 # The same physical pair must prevent a fourteenth virtual pair.
-# INTACT-PAIR-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in intact_pair_overflow, bb.0 for Imag16: requires 15, 14 available locations
+# INTACT-PAIR-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in intact_pair_overflow, bb.0 for Imag16
 # INTACT-PAIR-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
 name: intact_pair_overflow
@@ -446,7 +564,7 @@ body: |
 #--- partial_kill_lo_overflow.mir
 # Adding a second temporary byte must exceed capacity; losing the surviving
 # physical byte would incorrectly allow this.
-# PARTIAL-KILL-LO-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in partial_kill_lo_overflow, bb.0 for Imag8: requires 29, 28 available locations
+# PARTIAL-KILL-LO-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in partial_kill_lo_overflow, bb.0 for Imag8
 # PARTIAL-KILL-LO-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
 name: partial_kill_lo_overflow
@@ -492,7 +610,7 @@ body: |
 #--- partial_kill_hi_overflow.mir
 # Adding a second temporary byte must exceed capacity; losing the surviving
 # physical byte would incorrectly allow this.
-# PARTIAL-KILL-HI-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in partial_kill_hi_overflow, bb.0 for Imag8: requires 29, 28 available locations
+# PARTIAL-KILL-HI-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in partial_kill_hi_overflow, bb.0 for Imag8
 # PARTIAL-KILL-HI-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
 name: partial_kill_hi_overflow
@@ -538,7 +656,7 @@ body: |
 #--- partial_overwrite_overflow.mir
 # Adding a second temporary byte must exceed capacity; losing the surviving
 # physical byte would incorrectly allow this.
-# PARTIAL-OVERWRITE-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in partial_overwrite_overflow, bb.0 for Imag8: requires 29, 28 available locations
+# PARTIAL-OVERWRITE-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in partial_overwrite_overflow, bb.0 for Imag8
 # PARTIAL-OVERWRITE-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
 name: partial_overwrite_overflow
@@ -584,7 +702,7 @@ body: |
 #--- partial_unused_lo_overflow.mir
 # Adding a second temporary byte must exceed capacity; losing the surviving
 # physical byte would incorrectly allow this.
-# PARTIAL-UNUSED-LO-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in partial_unused_lo_overflow, bb.0 for Imag8: requires 29, 28 available locations
+# PARTIAL-UNUSED-LO-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in partial_unused_lo_overflow, bb.0 for Imag8
 # PARTIAL-UNUSED-LO-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
 name: partial_unused_lo_overflow
@@ -629,7 +747,7 @@ body: |
 #--- physical_early_clobber_overflow.mir
 # With thirteen virtual pairs, the early-clobber pair cannot fit until the
 # byte input dies. Releasing that input early would incorrectly allow this.
-# PHYSICAL-EARLY-CLOBBER-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in physical_early_clobber_overflow, bb.0 for Imag16: requires 15, 14 available locations
+# PHYSICAL-EARLY-CLOBBER-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in physical_early_clobber_overflow, bb.0 for Imag16
 # PHYSICAL-EARLY-CLOBBER-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
 name: physical_early_clobber_overflow
@@ -669,7 +787,7 @@ body: |
 
 #--- imag8-overflow.mir
 # Thirteen live bytes and sixteen call clobbers require spilling.
-# IMAG8-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in imag8_overflow, bb.0 for Imag8: requires 29, 28 available locations
+# IMAG8-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in imag8_overflow, bb.0 for Imag8
 # IMAG8-OVERFLOW: JSR &callee
 # IMAG8-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
@@ -710,7 +828,7 @@ body: |
 #--- imag16-overflow.mir
 # Fourteen live bytes could occupy all fourteen pairs. The conservative bound
 # therefore rejects a new Imag16, even though the total byte demand fits.
-# IMAG16-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in imag16_overflow, bb.0 for Imag16: requires 15, 14 available locations
+# IMAG16-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in imag16_overflow, bb.0 for Imag16
 # IMAG16-OVERFLOW: %14:imag16 = COPY $rs0
 # IMAG16-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---

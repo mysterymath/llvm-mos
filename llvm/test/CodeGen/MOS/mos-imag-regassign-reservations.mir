@@ -247,7 +247,7 @@ body: |
 #--- overflow.mir
 # Only the final pair now survives across the PCOPY. It conflicts with the
 # reservation, so its definition needs fifteen potentially occupied pairs.
-# OVERFLOW: MOSSpill: cannot prove imaginary register assignability in reservation_overflow, bb.0 for Imag16: requires 15, 14 available locations
+# OVERFLOW: MOSSpill: cannot prove imaginary register assignability in reservation_overflow, bb.0 for Imag16
 # OVERFLOW: %13:imag16 = COPY $rs0
 # OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---

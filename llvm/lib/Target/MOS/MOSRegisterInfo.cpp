@@ -112,6 +112,24 @@ MOSRegisterInfo::getCrossCopyRegClass(const TargetRegisterClass *RC) const {
   return RC;
 }
 
+const TargetRegisterClass *
+MOSRegisterInfo::getImagRegClass(Register R,
+                                 const MachineRegisterInfo &MRI) const {
+  const TargetRegisterClass *RC =
+      R.isVirtual() ? MRI.getRegClass(R) : getMinimalPhysRegClass(R);
+  if (MOS::Imag16RegClass.hasSubClassEq(RC))
+    return &MOS::Imag16RegClass;
+  // Anyi1 includes the imaginary LSB aliases, but storing a flag occupies its
+  // entire byte. Operand restrictions within either family are repaired later.
+  if (MOS::Anyi8RegClass.hasSubClassEq(RC) ||
+      MOS::Anyi1RegClass.hasSubClassEq(RC) ||
+      MOS::FlagRegClass.hasSubClassEq(RC))
+    return &MOS::Imag8RegClass;
+  report_fatal_error(Twine("no imaginary storage class for ") +
+                         getRegClassName(RC),
+                     /*GenCrashDiag=*/false);
+}
+
 // These values were chosen empirically based on the desired behavior of llc
 // test cases. These values will likely need to be retuned as more examples come
 // up.  Unfortunately, the way the register allocator actually uses this is very

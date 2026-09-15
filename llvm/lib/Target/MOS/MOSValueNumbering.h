@@ -72,8 +72,8 @@ public:
   // An SSA definition (or component of it) representing V. This supplies the
   // recipe for rematerialization, not a register guaranteed to dominate a use.
   TargetInstrInfo::RegSubRegPair source(ValueNumber V) const;
-  // Both bytes of an Imag16, or index zero for an Imag8 or flag. Physical
-  // registers are accepted here only to describe their width.
+  // The sublo/subhi components when both are supported, otherwise index zero
+  // for the whole value. Physical registers describe structure, not contents.
   ArrayRef<unsigned> subRegIndices(Register R) const;
 
 private:

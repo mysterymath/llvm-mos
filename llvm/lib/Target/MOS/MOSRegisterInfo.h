@@ -47,6 +47,12 @@ public:
   const TargetRegisterClass *
   getCrossCopyRegClass(const TargetRegisterClass *RC) const override;
 
+  // Full imaginary storage class for R, independently of operand constraints.
+  // Flag values occupy a whole Imag8; paired values use Imag16. Unsupported
+  // register classes are diagnosed rather than assigned a default storage size.
+  const TargetRegisterClass *
+  getImagRegClass(Register R, const MachineRegisterInfo &MRI) const;
+
   unsigned getCSRCost(const MachineFunction &MF) const override;
 
   bool requiresRegisterScavenging(const MachineFunction &MF) const override {

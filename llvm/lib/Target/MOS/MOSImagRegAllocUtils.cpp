@@ -29,7 +29,6 @@ static bool overlapsExit(Register R, const MachineInstr &Copy,
 bool mos::needsImagReg(Register R, const MachineFunction &MF,
                        const MOSValueNumbering &ValueNumbers) {
   const MachineRegisterInfo &MRI = MF.getRegInfo();
-  const TargetRegisterInfo &TRI = *MF.getSubtarget().getRegisterInfo();
   if (R.isPhysical())
     return R &&
            (MOS::Imag8RegClass.contains(R) ||

@@ -99,10 +99,12 @@ TargetInstrInfo::RegSubRegPair MOSValueNumbering::source(ValueNumber V) const {
 ArrayRef<unsigned> MOSValueNumbering::subRegIndices(Register R) const {
   static constexpr unsigned Whole[] = {0};
   static constexpr unsigned Bytes[] = {MOS::sublo, MOS::subhi};
-  bool IsImag16 = R.isPhysical()
-                      ? MOS::Imag16RegClass.contains(R)
-                      : TRI.getRegSizeInBits(*MRI.getRegClass(R)) == 16;
-  return IsImag16 ? ArrayRef<unsigned>(Bytes) : ArrayRef<unsigned>(Whole);
+  bool HasBytes = llvm::all_of(Bytes, [&](unsigned SubReg) {
+    return R.isPhysical()
+               ? bool(TRI.getSubReg(R, SubReg))
+               : TRI.isSubRegValidForRegClass(MRI.getRegClass(R), SubReg);
+  });
+  return HasBytes ? ArrayRef<unsigned>(Bytes) : ArrayRef<unsigned>(Whole);
 }
 
 MOSValueNumbering::ValueNumber MOSValueNumbering::numberRegister(Register R) {

@@ -1329,7 +1329,8 @@ const MachineInstr *FunctionAllocator::rematerialization(ValueNumber V) const {
 SmallVector<MCPhysReg> FunctionAllocator::destinations(Register R) const {
   SmallVector<MCPhysReg> Result;
   if (ValueNumbers.subRegIndices(R).size() == 1) {
-    if (TRI.getRegSizeInBits(*MRI.getRegClass(R)) == 1)
+    if (MOS::Anyi1RegClass.hasSubClassEq(MRI.getRegClass(R)) ||
+        MOS::FlagRegClass.hasSubClassEq(MRI.getRegClass(R)))
       Result.append({MOS::C, MOS::V});
     else
       Result.append({MOS::A, MOS::X, MOS::Y});

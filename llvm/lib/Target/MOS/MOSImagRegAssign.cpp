@@ -62,6 +62,7 @@
 #include "MOSImagRegAllocUtils.h"
 #include "MOSRegisterContents.h"
 #include "MOSRegisterInfo.h"
+#include "MOSSubtarget.h"
 #include "MOSValueNumbering.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/MapVector.h"
@@ -238,12 +239,9 @@ private:
   bool isResultRegisterAvailable(const MachineInstr &MI, MCPhysReg Phys,
                                  ValueNumber Value) const;
 
-  const TargetRegisterClass *imagRegClass(Register R) const {
-    return TRI->getRegSizeInBits(R, *MRI) == 16 ? &MOS::Imag16RegClass
-                                                : &MOS::Imag8RegClass;
-  }
   bool hasImaginaryOption(Register R) const {
-    return TRI->getCommonSubClass(MRI->getRegClass(R), imagRegClass(R));
+    return TRI->getCommonSubClass(MRI->getRegClass(R),
+                                  TRI->getImagRegClass(R, *MRI));
   }
   MCPhysReg globalImagReg(Register R) const {
     auto I = Restorations.find(R);
@@ -259,7 +257,7 @@ private:
   MachineFunction *MF = nullptr;
   MachineRegisterInfo *MRI = nullptr;
   const TargetInstrInfo *TII = nullptr;
-  const TargetRegisterInfo *TRI = nullptr;
+  const MOSRegisterInfo *TRI = nullptr;
   VirtRegMap *VRM = nullptr;
   const RegisterClassInfo *RCI = nullptr;
   LiveVariables *LV = nullptr;
@@ -298,7 +296,7 @@ bool MOSImagRegAssign::runOnMachineFunction(MachineFunction &F) {
   MF = &F;
   MRI = &F.getRegInfo();
   TII = F.getSubtarget().getInstrInfo();
-  TRI = F.getSubtarget().getRegisterInfo();
+  TRI = F.getSubtarget<MOSSubtarget>().getRegisterInfo();
   F.getRegInfo().freezeReservedRegs();
   RCI = &getAnalysis<MachineRegisterClassInfoWrapperPass>().getRCI();
   VRM = &getAnalysis<VirtRegMapWrapperLegacy>().getVRM();
@@ -442,13 +440,13 @@ void MOSImagRegAssign::assignDefs(MachineInstr &MI, bool Early) {
       displace(MI, MO.getReg(), ValueNumbers->getValueNumber(MO), Early);
     LiveRegs.definePhysical(MO);
   }
-  // Fixed destinations are now clear. Pairs precede bytes because every
-  // virtual register of a given width has the same imaginary domain.
-  for (unsigned Bits : {16u, 8u}) {
+  // Fixed destinations are now clear. Assign the paired domain before bytes.
+  for (const TargetRegisterClass *RC :
+       {&MOS::Imag16RegClass, &MOS::Imag8RegClass}) {
     for (MachineOperand &MO : MI.all_defs()) {
       Register R = MO.getReg();
       if (MO.isEarlyClobber() != Early || !R.isVirtual() ||
-          (imagRegClass(R) == &MOS::Imag16RegClass ? 16u : 8u) != Bits)
+          TRI->getImagRegClass(R, *MRI) != RC)
         continue;
       const MachineOperand *CopySource =
           MI.isCopy() && MO.getOperandNo() == 0 ? &MI.getOperand(1) : nullptr;
@@ -519,7 +517,7 @@ MCPhysReg MOSImagRegAssign::chooseGlobalRegister(const MachineInstr &MI,
     assert(globalImagReg(Root) && "reservation must be assigned first");
     return globalImagReg(Root);
   }
-  auto Order = RCI->getOrder(imagRegClass(R));
+  auto Order = RCI->getOrder(TRI->getImagRegClass(R, *MRI));
   ValueNumber Value = ValueNumbers->getValueNumber(R);
   auto Chosen = llvm::find_if(Order, [&](MCPhysReg Candidate) {
     return isGlobalAssignmentAvailable(R, Candidate) &&
@@ -566,7 +564,7 @@ bool MOSImagRegAssign::isGlobalAssignmentAvailable(Register Def,
 
 MCPhysReg MOSImagRegAssign::chooseRepairRegister(const MachineInstr &MI,
                                                  Register R) const {
-  for (MCPhysReg Phys : RCI->getOrder(imagRegClass(R)))
+  for (MCPhysReg Phys : RCI->getOrder(TRI->getImagRegClass(R, *MRI)))
     if (isRepairRegisterAvailable(MI, Phys))
       return Phys;
   report_fatal_error("MOS imaginary repairing requires spill insertion",
@@ -576,7 +574,7 @@ MCPhysReg MOSImagRegAssign::chooseRepairRegister(const MachineInstr &MI,
 MCPhysReg MOSImagRegAssign::chooseResultRegister(const MachineInstr &MI,
                                                  Register R) const {
   ValueNumber Value = ValueNumbers->getValueNumber(R);
-  for (MCPhysReg Phys : RCI->getOrder(imagRegClass(R)))
+  for (MCPhysReg Phys : RCI->getOrder(TRI->getImagRegClass(R, *MRI)))
     if (isResultRegisterAvailable(MI, Phys, Value))
       return Phys;
   report_fatal_error("MOS imaginary repairing requires spill insertion",
