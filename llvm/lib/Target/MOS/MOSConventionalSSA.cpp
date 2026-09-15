@@ -7,12 +7,16 @@
 //===----------------------------------------------------------------------===//
 ///
 /// \file
-/// Isolate PHIs to put machine IR in conventional SSA form. Each PHI's
-/// inputs and result are fresh registers with mutually disjoint live ranges,
+/// Prepare conventional SSA and whole-register ties for imaginary allocation.
+/// Each PHI's inputs and result are fresh registers with disjoint live ranges,
 /// allowing the allocator to give them a common imaginary register. Parallel
 /// copies before predecessor terminators and after PHI bundles connect these
 /// registers to the original values. All PHIs remain in SSA form, and the CFG
 /// is unchanged.
+///
+/// Tied subregister uses are extracted into fresh registers of the tied
+/// result's class. Each tie then relates whole registers, leaving storage
+/// assignment and preservation of other live copies to imaginary allocation.
 ///
 /// An IMPLICIT_DEF at the common dominator reserves each PHI's imaginary
 /// register location. Exit PCOPYs carry this reservation as an implicit use,
@@ -83,6 +87,7 @@ private:
   };
 
   void isolatePHIs(MachineBasicBlock &MBB);
+  bool extractTiedSubRegs(MachineInstr &MI);
   void insertExitCopies(MachineBasicBlock &MBB, ArrayRef<Copy> Copies);
   void insertParallelCopy(MachineBasicBlock &MBB,
                           MachineBasicBlock::iterator InsertPt,
@@ -104,10 +109,12 @@ bool MOSConventionalSSA::runOnMachineFunction(MachineFunction &MF) {
 
   bool Changed = false;
   for (MachineBasicBlock &MBB : MF) {
-    if (MBB.phis().empty())
-      continue;
-    isolatePHIs(MBB);
-    Changed = true;
+    if (!MBB.phis().empty()) {
+      isolatePHIs(MBB);
+      Changed = true;
+    }
+    for (MachineInstr &MI : MBB)
+      Changed |= extractTiedSubRegs(MI);
   }
 
   for (MachineBasicBlock &MBB : MF) {
@@ -157,6 +164,33 @@ void MOSConventionalSSA::isolatePHIs(MachineBasicBlock &MBB) {
   // results on a backedge.
   insertParallelCopy(MBB, EntryCopyInsertPt, EntryCopies,
                      MBB.front().getDebugLoc());
+}
+
+bool MOSConventionalSSA::extractTiedSubRegs(MachineInstr &MI) {
+  bool Changed = false;
+  for (MachineOperand &Use : MI.all_uses()) {
+    if (!Use.isTied() || !Use.getSubReg())
+      continue;
+    const MachineOperand &Def =
+        MI.getOperand(MI.findTiedOperandIdx(Use.getOperandNo()));
+    assert(Def.getReg().isVirtual() && !Def.getSubReg() &&
+           "expected a whole virtual definition for an SSA tie");
+    Register Extracted = MRI->cloneVirtualRegister(Def.getReg());
+    if (Use.isUndef())
+      BuildMI(*MI.getParent(), MI, MI.getDebugLoc(),
+              TII->get(TargetOpcode::IMPLICIT_DEF), Extracted);
+    else
+      // Other operands may still read the source, so do not transfer its kill
+      // flag to this earlier COPY. LiveVariables recomputes kills before RA.
+      BuildMI(*MI.getParent(), MI, MI.getDebugLoc(),
+              TII->get(TargetOpcode::COPY), Extracted)
+          .addReg(Use.getReg(), {}, Use.getSubReg());
+    Use.setReg(Extracted);
+    Use.setSubReg(0);
+    Use.setIsKill(!Use.isUndef());
+    Changed = true;
+  }
+  return Changed;
 }
 
 void MOSConventionalSSA::insertExitCopies(MachineBasicBlock &MBB,

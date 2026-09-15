@@ -109,7 +109,8 @@ body: |
     RTS
 ...
 
-# Two overlapping physical lifetimes need two occurrences of the same value.
+# Two overlapping physical lifetimes can copy the same virtual source without
+# splitting it into separate SSA ranges.
 ---
 name: two_fixed_lifetimes
 tracksRegLiveness: true
@@ -118,8 +119,7 @@ body: |
     ; CHECK-LABEL: name: two_fixed_lifetimes
     ; CHECK: [[LDAbs:%[0-9]+]]:gpr = LDAbs 1000
     ; CHECK-NEXT: $rc2 = COPY [[LDAbs]]
-    ; CHECK-NEXT: [[PCOPY:%[0-9]+]]:gpr = PCOPY [[LDAbs]]
-    ; CHECK-NEXT: $rc3 = COPY killed [[PCOPY]]
+    ; CHECK-NEXT: $rc3 = COPY [[LDAbs]]
     ; CHECK-NEXT: JSR &callee, implicit killed $rc2, implicit killed $rc3
     ; CHECK-NEXT: STAbs killed [[LDAbs]], 2000
     ; CHECK-NEXT: RTS
@@ -169,9 +169,9 @@ body: |
     RTS
 ...
 
-# The first fixed COPY exchanges two occupied imaginary registers. The second
-# argument is then already in place; no scratch imaginary register is needed for
-# the exchange.
+# The arguments are copied into each other's original imaginary registers.
+# Preserve the displaced values without forcing either source into its COPY's
+# destination. Hardware allocation can eliminate the intermediate transfers.
 ---
 name: swap_arguments
 tracksRegLiveness: true
@@ -180,8 +180,9 @@ body: |
     ; CHECK-LABEL: name: swap_arguments
     ; CHECK: [[LDAbs:%[0-9]+]]:gpr = LDAbs 1000
     ; CHECK-NEXT: [[LDAbs1:%[0-9]+]]:gpr = LDAbs 1001
-    ; CHECK-NEXT: [[PCOPY:%[0-9]+]]:gpr, [[PCOPY1:%[0-9]+]]:gpr = PCOPY killed [[LDAbs]], killed [[LDAbs1]]
-    ; CHECK-NEXT: $rc2 = COPY [[PCOPY1]]
+    ; CHECK-NEXT: [[PCOPY:%[0-9]+]]:gpr = PCOPY killed [[LDAbs]]
+    ; CHECK-NEXT: $rc2 = COPY [[LDAbs1]]
+    ; CHECK-NEXT: [[PCOPY1:%[0-9]+]]:gpr = PCOPY killed [[LDAbs1]]
     ; CHECK-NEXT: $rc3 = COPY [[PCOPY]]
     ; CHECK-NEXT: JSR &callee, implicit killed $rc2, implicit killed $rc3
     ; CHECK-NEXT: STAbs killed [[PCOPY]], 2000
@@ -189,13 +190,13 @@ body: |
     ; CHECK-NEXT: RTS
     ;
     ; HW-LABEL: name: swap_arguments
-    ; HW: $a = LDAbs 1000
-    ; HW-NEXT: $x = LDAbs 1001
-    ; HW-NEXT: $rc2 = STImag8 $x
-    ; HW-NEXT: $rc3 = STImag8 $a
+    ; HW: $x = LDAbs 1000
+    ; HW-NEXT: $y = LDAbs 1001
+    ; HW-NEXT: $rc2 = STImag8 $y
+    ; HW-NEXT: $rc3 = STImag8 $x
     ; HW-NEXT: JSR &callee, implicit killed $rc2, implicit killed $rc3
-    ; HW-NEXT: STAbs killed $a, 2000
-    ; HW-NEXT: STAbs killed $x, 2001
+    ; HW-NEXT: STAbs killed $x, 2000
+    ; HW-NEXT: STAbs killed $y, 2001
     ; HW-NEXT: RTS
     %0:gpr = LDAbs 1000
     %1:gpr = LDAbs 1001
@@ -421,12 +422,11 @@ body: |
     ; CHECK: [[LDAbs:%[0-9]+]]:gpr = LDAbs 1000
     ; CHECK-NEXT: [[LDAbs1:%[0-9]+]]:gpr = LDAbs 1001
     ; CHECK-NEXT: [[REG_SEQUENCE:%[0-9]+]]:imag16 = REG_SEQUENCE killed [[LDAbs]], %subreg.sublo, [[LDAbs1]], %subreg.subhi
-    ; CHECK-NEXT: [[PCOPY:%[0-9]+]]:gpr, [[PCOPY1:%[0-9]+]]:imag16 = PCOPY killed [[LDAbs1]], killed [[REG_SEQUENCE]]
-    ; CHECK-NEXT: dead $rs1 = COPY killed [[PCOPY1]], implicit-def $rc3
+    ; CHECK-NEXT: dead $rs1 = COPY killed [[REG_SEQUENCE]], implicit-def $rc3
     ; CHECK-NEXT: JSR &overwrite_low, implicit-def $rc2
-    ; CHECK-NEXT: [[COPY:%[0-9]+]]:gpr = COPY [[PCOPY]]
+    ; CHECK-NEXT: [[COPY:%[0-9]+]]:gpr = COPY [[LDAbs1]]
     ; CHECK-NEXT: JSR &callee, implicit killed $rc2, implicit killed $rc3
-    ; CHECK-NEXT: STAbs killed [[PCOPY]], 2000
+    ; CHECK-NEXT: STAbs killed [[LDAbs1]], 2000
     ; CHECK-NEXT: STAbs killed [[COPY]], 2001
     ; CHECK-NEXT: RTS
     ;
@@ -505,5 +505,66 @@ body: |
     $rs0 = COPY %0
     $rs0 = COPY %1
     $rs0 = COPY %2
+    RTS
+...
+
+# Copying the low byte onto itself preserves the pair. Copying the high byte
+# over the low byte must first preserve the pair for the later low-byte use.
+# Virtual extractions also share the identities of the physical COPY results.
+---
+name: physical_pair_projections
+# ASSIGN-LABEL: name: physical_pair_projections
+# ASSIGN: id: 5, {{.*}}assigned-phys: '$rc2'
+tracksRegLiveness: true
+body: |
+  bb.0:
+    ; CHECK-LABEL: name: physical_pair_projections
+    ; CHECK: [[LDAbs:%[0-9]+]]:gpr = LDAbs 1000
+    ; CHECK-NEXT: [[LDAbs1:%[0-9]+]]:gpr = LDAbs 1001
+    ; CHECK-NEXT: [[REG_SEQUENCE:%[0-9]+]]:imag16 = REG_SEQUENCE killed [[LDAbs]], %subreg.sublo, killed [[LDAbs1]], %subreg.subhi
+    ; CHECK-NEXT: $rc2 = COPY [[REG_SEQUENCE]].sublo
+    ; CHECK-NEXT: [[COPY:%[0-9]+]]:gpr = COPY [[REG_SEQUENCE]].sublo
+    ; CHECK-NEXT: $a = COPY killed $rc2
+    ; CHECK-NEXT: STAbs killed $a, 1002
+    ; CHECK-NEXT: STAbs killed [[COPY]], 1003
+    ; CHECK-NEXT: [[PCOPY:%[0-9]+]]:imag16 = PCOPY killed [[REG_SEQUENCE]]
+    ; CHECK-NEXT: $rc2 = COPY [[PCOPY]].subhi
+    ; CHECK-NEXT: [[COPY1:%[0-9]+]]:gpr = COPY [[PCOPY]].sublo
+    ; CHECK-NEXT: [[COPY2:%[0-9]+]]:gpr = COPY killed [[PCOPY]].subhi
+    ; CHECK-NEXT: $a = COPY killed $rc2
+    ; CHECK-NEXT: STAbs killed $a, 1004
+    ; CHECK-NEXT: STAbs killed [[COPY2]], 1005
+    ; CHECK-NEXT: STAbs killed [[COPY1]], 1006
+    ; CHECK-NEXT: RTS
+    ;
+    ; HW-LABEL: name: physical_pair_projections
+    ; HW: $x = LDAbs 1000
+    ; HW-NEXT: $y = LDAbs 1001
+    ; HW-NEXT: $rc2 = STImag8 $x
+    ; HW-NEXT: dead $rc3 = STImag8 $y
+    ; HW-NEXT: $a = COPY killed $rc2
+    ; HW-NEXT: STAbs killed $a, 1002
+    ; HW-NEXT: STAbs $x, 1003
+    ; HW-NEXT: $rc2 = STImag8 $y
+    ; HW-NEXT: $a = COPY killed $rc2
+    ; HW-NEXT: STAbs killed $a, 1004
+    ; HW-NEXT: STAbs killed $y, 1005
+    ; HW-NEXT: STAbs killed $x, 1006
+    ; HW-NEXT: RTS
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    %2:imag16 = REG_SEQUENCE %0, %subreg.sublo, %1, %subreg.subhi
+    $rc2 = COPY %2.sublo
+    %3:gpr = COPY %2.sublo
+    $a = COPY $rc2
+    STAbs $a, 1002
+    STAbs %3, 1003
+    $rc2 = COPY %2.subhi
+    %5:gpr = COPY %2.sublo
+    %4:gpr = COPY %2.subhi
+    $a = COPY $rc2
+    STAbs $a, 1004
+    STAbs %4, 1005
+    STAbs %5, 1006
     RTS
 ...

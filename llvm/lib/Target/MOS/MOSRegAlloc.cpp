@@ -646,8 +646,6 @@ void FunctionAllocator::OperandChoices::run() {
 
 void FunctionAllocator::OperandChoices::buildDomain(unsigned I) {
   const MachineOperand &MO = MI.getOperand(I);
-  if (MO.getSubReg())
-    Allocator.fail("subregister operands are not implemented", &MI);
   Register R = MO.getReg();
   if ((MI.isCopy() && I == 1) ||
       (MI.getOpcode() == TargetOpcode::REG_SEQUENCE && I != 0)) {
@@ -655,6 +653,8 @@ void FunctionAllocator::OperandChoices::buildDomain(unsigned I) {
     Domains[I].push_back(0);
     return;
   }
+  if (MO.getSubReg())
+    Allocator.fail("subregister operands are not implemented", &MI);
   Domains[I] = Allocator.destinations(R);
   // A fixed hardware input may also be the destination of a capture. Imaginary
   // inputs use the destination's assigned imaginary register.
@@ -898,22 +898,24 @@ bool FunctionAllocator::InstructionPlacement::planCopy() {
               After.LiveRegs, Locked))
         return false;
   } else {
-    for (auto [SubReg, Reg] :
-         llvm::zip_equal(Allocator.ValueNumbers.subRegIndices(S), Dst)) {
-      ValueNumber V = Allocator.ValueNumbers.getValueNumber(S, SubReg);
+    ValueNumber Source =
+        Allocator.ValueNumbers.getValueNumber(MI.getOperand(1));
+    for (auto [SubReg, Reg] : llvm::zip_equal(
+             Allocator.ValueNumbers.subRegIndices(Operands[0]), Dst)) {
+      ValueNumber V = Allocator.ValueNumbers.getSubValue(Source, SubReg);
       if (V.isUndef())
         continue;
       if (!Allocator.placeValue(V, Reg, Plan, After.LiveRegs, Locked))
         return false;
       Locked.set(Reg);
     }
-    if (D.isVirtual() && Allocator.ValueNumbers.getValueNumber(D) !=
-                             Allocator.ValueNumbers.getValueNumber(S))
+    if (D.isVirtual() && Allocator.ValueNumbers.getValueNumber(D) != Source)
       Allocator.fail("COPY changes value identity", &MI);
   }
   Plan.Registers.define(
-      Operands[0], D.isVirtual() ? Allocator.ValueNumbers.getValueNumber(D)
-                                 : Allocator.ValueNumbers.getValueNumber(S));
+      Operands[0],
+      D.isVirtual() ? Allocator.ValueNumbers.getValueNumber(D)
+                    : Allocator.ValueNumbers.getValueNumber(MI.getOperand(1)));
   return Allocator.hasLiveValues(Plan.Registers, After.LiveRegs);
 }
 
