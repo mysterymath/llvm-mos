@@ -128,11 +128,11 @@ public:
   // The caller has chosen and recorded this virtual range's assignment in VRM.
   void insert(Register R) {
     assert(R.isVirtual() && VRM->hasPhys(R));
-    ImagRanges.set(R);
+    LiveVirtRegs.set(R);
   }
   void erase(Register R);
   void clear() {
-    ImagRanges.clear();
+    LiveVirtRegs.clear();
     PhysRegs.clear();
     PhysContents->clear();
   }
@@ -170,15 +170,15 @@ public:
   LiveRegUnits physicalUnits() const;
 
   // Only virtual ranges cross block boundaries; physical lifetimes stay local.
-  const SparseBitVector<> &imagRanges() const { return ImagRanges; }
-  void inherit(const SparseBitVector<> &LiveOuts) { ImagRanges = LiveOuts; }
+  const SparseBitVector<> &liveVirtRegs() const { return LiveVirtRegs; }
+  void inherit(const SparseBitVector<> &LiveOuts) { LiveVirtRegs = LiveOuts; }
 
 private:
   const MachineRegisterInfo *MRI = nullptr;
   const TargetRegisterInfo *TRI = nullptr;
   const MOSValueNumbering *ValueNumbers = nullptr;
   const VirtRegMap *VRM = nullptr;
-  SparseBitVector<> ImagRanges;
+  SparseBitVector<> LiveVirtRegs;
   LivePhysRegs PhysRegs;
   std::optional<MOSRegisterContents> PhysContents;
 };
@@ -346,8 +346,8 @@ void MOSImagRegAssign::assign() {
     if (!DomLiveRegs.empty()) {
       LiveRegs.inherit(DomLiveRegs.back().second);
       // Trim the inherited virtual live ranges to this block's live-ins.
-      for (auto I = LiveRegs.imagRanges().begin(),
-                E = LiveRegs.imagRanges().end();
+      for (auto I = LiveRegs.liveVirtRegs().begin(),
+                E = LiveRegs.liveVirtRegs().end();
            I != E;) {
         Register R = *I;
         ++I;
@@ -357,10 +357,10 @@ void MOSImagRegAssign::assign() {
     }
 
     assignMBB(MBB);
-    assert(llvm::all_of(LiveRegs.imagRanges(),
+    assert(llvm::all_of(LiveRegs.liveVirtRegs(),
                         [](Register R) { return R.isVirtual(); }) &&
            "physical register live out of basic block");
-    DomLiveRegs.emplace_back(Node, LiveRegs.imagRanges());
+    DomLiveRegs.emplace_back(Node, LiveRegs.liveVirtRegs());
   }
 }
 
@@ -540,7 +540,7 @@ bool MOSImagRegAssign::isGlobalAssignmentAvailable(Register Def,
   if (Root && Root != Def)
     return Candidate == globalImagReg(Root);
   ValueNumber Value = ValueNumbers->getValueNumber(Def);
-  for (Register LiveReg : LiveRegs.imagRanges()) {
+  for (Register LiveReg : LiveRegs.liveVirtRegs()) {
     if (LiveReg == Def)
       continue;
     MCPhysReg Assigned = globalImagReg(LiveReg);
@@ -598,7 +598,7 @@ void MOSImagRegAssign::displace(MachineInstr &MI, MCPhysReg Phys,
   SmallVector<Register, 2> Occupants;
   // Preserve incoming values, not results produced by MI itself. In
   // particular, a regmask does not invalidate a new early-clobber result.
-  for (Register R : LiveRegs.imagRanges())
+  for (Register R : LiveRegs.liveVirtRegs())
     if (MRI->getVRegDef(R) != &MI && !LiveRegs.preservesValue(R, Phys, Value))
       Occupants.push_back(R);
   for (Register R : Occupants) {
@@ -666,7 +666,7 @@ void MOSImagRegAssign::replaceLocalUses(Register R, Register New,
     for (MachineOperand &MO : MI.operands())
       if (MO.isReg() && MO.isUse() && MO.getReg() == R)
         MO.setReg(New);
-  if (LiveRegs.imagRanges().test(R)) {
+  if (LiveRegs.liveVirtRegs().test(R)) {
     LiveRegs.erase(R);
     LiveRegs.insert(New);
   }
@@ -675,7 +675,7 @@ void MOSImagRegAssign::replaceLocalUses(Register R, Register New,
 void MOSImagRegAssign::restoreRegisters(MachineBasicBlock &MBB,
                                         MachineBasicBlock::iterator InsertPt) {
   SmallVector<Copy> Copies;
-  for (Register R : LiveRegs.imagRanges()) {
+  for (Register R : LiveRegs.liveVirtRegs()) {
     MCPhysReg Phys = globalImagReg(R);
     if (VRM->getPhys(R) == Phys)
       continue;
@@ -693,7 +693,7 @@ void MOSImagRegAssign::restoreRegisters(MachineBasicBlock &MBB,
 
 void MOSImagRegAssign::repairOutgoingUses(MachineBasicBlock &MBB) {
   for (auto [Current, Restore] : Restorations) {
-    if (!LiveRegs.imagRanges().test(Current))
+    if (!LiveRegs.liveVirtRegs().test(Current))
       continue;
     assert(VRM->getPhys(Current) == Restore.Phys &&
            "live-out range was not restored");
@@ -817,7 +817,7 @@ void LiveRegisters::erase(Register R) {
     PhysRegs.removeReg(R);
     PhysContents->clobber(R);
   } else {
-    ImagRanges.reset(R);
+    LiveVirtRegs.reset(R);
   }
 }
 
@@ -902,7 +902,7 @@ bool LiveRegisters::haveCompatibleContents(MCPhysReg Reg, ValueNumber Value,
 
 bool LiveRegisters::canPlace(MCPhysReg Phys, ValueNumber Value) const {
   return preservesPhysicalValues(Phys, Value) &&
-         llvm::all_of(ImagRanges, [&](Register R) {
+         llvm::all_of(LiveVirtRegs, [&](Register R) {
            return preservesValue(R, Phys, Value);
          });
 }
@@ -910,7 +910,7 @@ bool LiveRegisters::canPlace(MCPhysReg Phys, ValueNumber Value) const {
 bool LiveRegisters::canReuse(Register Input, ValueNumber Value) const {
   MCPhysReg Phys = VRM->getPhys(Input);
   return preservesPhysicalValues(Phys, Value) &&
-         llvm::all_of(ImagRanges, [&](Register R) {
+         llvm::all_of(LiveVirtRegs, [&](Register R) {
            return R == Input || preservesValue(R, Phys, Value);
          });
 }
