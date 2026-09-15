@@ -50,19 +50,6 @@ void MOSRegisterContents::define(MCPhysReg R, ValueNumber V) {
   }
 }
 
-void MOSRegisterContents::clobber(MCPhysReg R) {
-  Contents.remove_if(
-      [&](const auto &Entry) { return TRI->regsOverlap(R, Entry.first); });
-}
-
-void MOSRegisterContents::clobber(const uint32_t *RegMask) {
-  Contents.remove_if([&](const auto &Entry) {
-    return llvm::any_of(TRI->subregs_inclusive(Entry.first), [&](MCPhysReg R) {
-      return MachineOperand::clobbersPhysReg(RegMask, R);
-    });
-  });
-}
-
 bool MOSRegisterContents::contains(MCPhysReg R, ValueNumber V) const {
   if (!V)
     return false;
@@ -98,6 +85,19 @@ SmallVector<MCPhysReg> MOSRegisterContents::copies(ValueNumber V) const {
   // Transfer selection must not depend on hash table iteration order.
   llvm::sort(Regs);
   return Regs;
+}
+
+void MOSRegisterContents::clobber(MCPhysReg R) {
+  Contents.remove_if(
+      [&](const auto &Entry) { return TRI->regsOverlap(R, Entry.first); });
+}
+
+void MOSRegisterContents::clobber(const uint32_t *RegMask) {
+  Contents.remove_if([&](const auto &Entry) {
+    return llvm::any_of(TRI->subregs_inclusive(Entry.first), [&](MCPhysReg R) {
+      return MachineOperand::clobbersPhysReg(RegMask, R);
+    });
+  });
 }
 
 void MOSRegisterContents::forgetIf(

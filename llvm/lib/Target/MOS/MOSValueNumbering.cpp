@@ -33,15 +33,6 @@ MOSValueNumbering::MOSValueNumbering(MachineFunction &MF)
   }
 }
 
-ArrayRef<unsigned> MOSValueNumbering::subRegIndices(Register R) const {
-  static constexpr unsigned Whole[] = {0};
-  static constexpr unsigned Bytes[] = {MOS::sublo, MOS::subhi};
-  bool IsImag16 = R.isPhysical()
-                      ? MOS::Imag16RegClass.contains(R)
-                      : TRI.getRegSizeInBits(*MRI.getRegClass(R)) == 16;
-  return IsImag16 ? ArrayRef<unsigned>(Bytes) : ArrayRef<unsigned>(Whole);
-}
-
 MOSValueNumbering::ValueNumber
 MOSValueNumbering::getValueNumber(Register R, unsigned SubReg) const {
   if (!R.isVirtual())
@@ -105,6 +96,15 @@ TargetInstrInfo::RegSubRegPair MOSValueNumbering::source(ValueNumber V) const {
   return ValueNumbers[V.ID];
 }
 
+ArrayRef<unsigned> MOSValueNumbering::subRegIndices(Register R) const {
+  static constexpr unsigned Whole[] = {0};
+  static constexpr unsigned Bytes[] = {MOS::sublo, MOS::subhi};
+  bool IsImag16 = R.isPhysical()
+                      ? MOS::Imag16RegClass.contains(R)
+                      : TRI.getRegSizeInBits(*MRI.getRegClass(R)) == 16;
+  return IsImag16 ? ArrayRef<unsigned>(Bytes) : ArrayRef<unsigned>(Whole);
+}
+
 MOSValueNumbering::ValueNumber MOSValueNumbering::numberRegister(Register R) {
   if (ValueNumber V = RegValueNumbers.lookup({R}))
     return V;
@@ -161,27 +161,6 @@ MOSValueNumbering::numberOperand(const MachineOperand &MO) {
   return getSubValue(numberRegister(MO.getReg()), MO.getSubReg());
 }
 
-MOSValueNumbering::ValueNumber
-MOSValueNumbering::newValue(TargetInstrInfo::RegSubRegPair Source) {
-  ValueNumber V(ValueNumbers.size());
-  ValueNumbers.push_back(Source);
-  return V;
-}
-
-MOSValueNumbering::ValueNumber
-MOSValueNumbering::numberRegSequence(Register R, ValueNumber Lo,
-                                     ValueNumber Hi) {
-  if (Lo.isUndef() && Hi.isUndef())
-    return ValueNumber(ValueNumber::UndefID);
-  auto [I, Inserted] = RegSequenceValueNumbers.try_emplace({Lo, Hi});
-  if (Inserted) {
-    I->second = newValue({R});
-    RegValueNumbers[{R, MOS::sublo}] = Lo;
-    RegValueNumbers[{R, MOS::subhi}] = Hi;
-  }
-  return I->second;
-}
-
 const MachineOperand *MOSValueNumbering::copySource(Register R) const {
   const MachineInstr *Def = MRI.getVRegDef(R);
   if (!Def)
@@ -198,6 +177,27 @@ const MachineOperand *MOSValueNumbering::copySource(Register R) const {
   return nullptr;
 }
 
+MOSValueNumbering::ValueNumber
+MOSValueNumbering::numberRegSequence(Register R, ValueNumber Lo,
+                                     ValueNumber Hi) {
+  if (Lo.isUndef() && Hi.isUndef())
+    return ValueNumber(ValueNumber::UndefID);
+  auto [I, Inserted] = RegSequenceValueNumbers.try_emplace({Lo, Hi});
+  if (Inserted) {
+    I->second = newValue({R});
+    RegValueNumbers[{R, MOS::sublo}] = Lo;
+    RegValueNumbers[{R, MOS::subhi}] = Hi;
+  }
+  return I->second;
+}
+
+MOSValueNumbering::ValueNumber
+MOSValueNumbering::newValue(TargetInstrInfo::RegSubRegPair Source) {
+  ValueNumber V(ValueNumbers.size());
+  ValueNumbers.push_back(Source);
+  return V;
+}
+
 MOSValueNumberingWrapperPass::MOSValueNumberingWrapperPass()
     : MachineFunctionPass(ID) {
   initializeMOSValueNumberingWrapperPassPass(*PassRegistry::getPassRegistry());
@@ -208,14 +208,14 @@ bool MOSValueNumberingWrapperPass::runOnMachineFunction(MachineFunction &MF) {
   return false;
 }
 
-void MOSValueNumberingWrapperPass::getAnalysisUsage(AnalysisUsage &AU) const {
-  MachineFunctionPass::getAnalysisUsage(AU);
-  AU.setPreservesAll();
-}
-
 MachineFunctionProperties
 MOSValueNumberingWrapperPass::getRequiredProperties() const {
   return MachineFunctionProperties().setIsSSA();
+}
+
+void MOSValueNumberingWrapperPass::getAnalysisUsage(AnalysisUsage &AU) const {
+  MachineFunctionPass::getAnalysisUsage(AU);
+  AU.setPreservesAll();
 }
 
 char MOSValueNumberingWrapperPass::ID = 0;

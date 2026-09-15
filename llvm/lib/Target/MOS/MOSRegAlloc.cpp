@@ -192,43 +192,41 @@ private:
   class OperandChoices;
   class InstructionPlacement;
 
+  void checkPHIAssignments() const;
   void analyzeLiveness();
   void planBlock(MachineBasicBlock &MBB);
-  void checkPHIAssignments() const;
   void emitSolution(MachineBasicBlock &MBB, const BlockPlan &Block);
   void eraseVirtualInstructions();
   void recomputePhysicalLiveness();
 
-  BitVector fixedRegisters(const LivePhysRegs &LiveRegs) const;
-
-  bool isRematerialized(const MachineInstr &MI) const;
-  // Visit each live byte's required imaginary register and static value. Use
-  // the live range's assignment, even when its value number names an ancestor.
-  void forEachImagReg(const SparseBitVector<> &LiveRegs,
-                      function_ref<void(MCPhysReg, ValueNumber)> Visit) const;
   AllocationState getAllocationState(const RegisterContents &Registers,
                                      const SparseBitVector<> &LiveRegs) const;
   RegisterContents getRegisterContents(const AllocationState &State,
                                        const SparseBitVector<> &LiveRegs) const;
+  // Visit each live byte's required imaginary register and static value. Use
+  // the live range's assignment, even when its value number names an ancestor.
+  void forEachImagReg(const SparseBitVector<> &LiveRegs,
+                      function_ref<void(MCPhysReg, ValueNumber)> Visit) const;
+
   bool materializeUnheldValues(Implementation &Plan,
                                const SparseBitVector<> &LiveRegs,
                                BitVector Locked, bool CanInsert);
   bool restoreImagRegs(Implementation &Plan, const SparseBitVector<> &LiveRegs,
                        const SparseBitVector<> &Preserve, BitVector Locked);
-
   // Locked registers may be read but not changed by inserted instructions.
   // Forbidden additionally protects registers about to be clobbered: evacuation
   // must not preserve a value in another member of that same clobber set.
   bool placeValue(ValueNumber V, MCPhysReg Dst, Implementation &Plan,
                   const SparseBitVector<> &LiveRegs, BitVector Locked,
                   const BitVector *Forbidden = nullptr);
-  bool rematerialize(ValueNumber V, MCPhysReg Reg, Implementation &Plan,
-                     const SparseBitVector<> &LiveRegs, BitVector Locked,
-                     const BitVector &Forbidden);
   bool evacuate(MCPhysReg Reg, Implementation &Plan,
                 const SparseBitVector<> &LiveRegs, BitVector Locked,
                 const BitVector &Forbidden);
+  bool rematerialize(ValueNumber V, MCPhysReg Reg, Implementation &Plan,
+                     const SparseBitVector<> &LiveRegs, BitVector Locked,
+                     const BitVector &Forbidden);
   bool copyRegister(MCPhysReg Dst, MCPhysReg Src, Implementation &Plan);
+
   void emitInstructions(MachineBasicBlock &MBB, MachineBasicBlock::iterator At,
                         const DebugLoc &DL,
                         ArrayRef<EmittedInstruction> Instructions,
@@ -236,19 +234,22 @@ private:
   unsigned instructionCost(const MachineInstr &MI,
                            ArrayRef<MCPhysReg> Operands) const;
 
+  bool isRematerialized(const MachineInstr &MI) const;
+  const MachineInstr *rematerialization(ValueNumber V) const;
   SmallVector<MCPhysReg> destinations(Register R) const;
-  bool hasLiveValues(const RegisterContents &S,
-                     const SparseBitVector<> &LiveRegs) const;
-  bool isLiveValue(ValueNumber V, const SparseBitVector<> &LiveRegs) const;
-  SparseBitVector<> liveOuts(MachineBasicBlock &MBB) const;
-
   // Storage modeled by the search: A/X/Y/C/V and Imag8. An Imag16 denotes
   // its two Imag8s; implicit hardware aliases are not separate storage.
   SmallVector<MCPhysReg, 2> registerParts(MCPhysReg R) const;
   // An imaginary register assignment belongs to a live range, not to its value
   // number. Return zero if the live range has no imaginary assignment.
   MCPhysReg imagReg(Register R, unsigned SubReg = 0) const;
-  const MachineInstr *rematerialization(ValueNumber V) const;
+
+  bool hasLiveValues(const RegisterContents &S,
+                     const SparseBitVector<> &LiveRegs) const;
+  bool isLiveValue(ValueNumber V, const SparseBitVector<> &LiveRegs) const;
+  SparseBitVector<> liveOuts(MachineBasicBlock &MBB) const;
+  BitVector fixedRegisters(const LivePhysRegs &LiveRegs) const;
+
   [[noreturn]] void fail(const Twine &Reason,
                          const MachineInstr *MI = nullptr) const;
 
@@ -317,10 +318,11 @@ public:
 
 private:
   void buildDomain(unsigned OpIdx);
+  void search(unsigned OpIdx);
+
   bool isLegal(unsigned OpIdx, MCPhysReg R) const;
   bool isTiedUseAlias(const MachineOperand &Def,
                       const MachineOperand &Use) const;
-  void search(unsigned OpIdx);
 
   FunctionAllocator &Allocator;
   MachineInstr &MI;
@@ -344,13 +346,14 @@ public:
   bool execute();
 
 private:
-  bool planCopy();
-  bool planRegSequence();
   bool prepareUses(bool InGPRs);
   void protectUses();
   bool preserveLiveThroughValues();
   bool applyInstruction();
   bool define(const MachineOperand &MO);
+
+  bool planCopy();
+  bool planRegSequence();
 
   FunctionAllocator &Allocator;
   MachineInstr &MI;
@@ -436,20 +439,64 @@ void FunctionAllocator::analyzeLiveness() {
   }
 }
 
-BitVector
-FunctionAllocator::fixedRegisters(const LivePhysRegs &LiveRegs) const {
-  // Compare/branch pseudos keep N/Z internal until late optimization.
-  assert(!LiveRegs.contains(MOS::N) && !LiveRegs.contains(MOS::Z) &&
-         "N/Z must not be live during MOS register allocation");
-  BitVector FixedRegs(MOS::NUM_TARGET_REGS);
-  for (MCPhysReg R : LiveRegs)
-    for (MCPhysReg Part : registerParts(R))
-      FixedRegs.set(Part);
-  return FixedRegs;
-}
-
 void FunctionAllocator::planBlock(MachineBasicBlock &MBB) {
   BlockSearch(*this, MBB).run();
+}
+
+void FunctionAllocator::emitSolution(MachineBasicBlock &MBB,
+                                     const BlockPlan &Block) {
+  const AllocationTable &Final = Block.Points.back().Allocations;
+  auto Best = llvm::min_element(Final, [](const auto &A, const auto &B) {
+    return A.second.Cost < B.second.Cost;
+  });
+  unsigned Index = std::distance(Final.begin(), Best);
+  SmallVector<const DPEntry *> Selected(Block.Points.size());
+  for (unsigned I = Block.Points.size(); I-- > 0;) {
+    const DPEntry &Entry =
+        std::next(Block.Points[I].Allocations.begin(), Index)->second;
+    Selected[I] = &Entry;
+    Index = Entry.Previous;
+  }
+  for (auto [Point, Entry] : llvm::zip_equal(Block.Points, Selected)) {
+    MachineInstr *MI = Point.MI;
+    auto At = MI ? MI->getIterator() : MBB.getFirstTerminator();
+    emitInstructions(MBB, At, MI ? MI->getDebugLoc() : DebugLoc(),
+                     Entry->Instructions, MI);
+  }
+}
+
+void FunctionAllocator::eraseVirtualInstructions() {
+  for (auto &[MBB, B] : Blocks)
+    for (const ProgramPoint &Point : B.Points) {
+      MachineInstr *MI = Point.MI;
+      if (!MI)
+        continue;
+      if (MI->isPHI() || MI->getOpcode() == MOS::PCOPY ||
+          (MI->isCopy() && (MI->getOperand(0).getReg().isVirtual() ||
+                            MI->getOperand(1).getReg().isVirtual())) ||
+          (TII.isTriviallyReMaterializable(*MI) &&
+           MI->getOperand(0).getReg().isVirtual()) ||
+          MI->getOpcode() == TargetOpcode::REG_SEQUENCE)
+        MI->eraseFromParent();
+    }
+  for (MachineBasicBlock &MBB : MF)
+    for (MachineInstr &MI : MBB)
+      if (MI.isDebugInstr())
+        for (MachineOperand &MO : MI.operands())
+          if (MO.isReg() && MO.getReg().isVirtual())
+            MO.setReg(0);
+  MRI.clearVirtRegs();
+}
+
+void FunctionAllocator::recomputePhysicalLiveness() {
+  SmallVector<MachineBasicBlock *> BlocksToUpdate;
+  for (MachineBasicBlock &MBB : reverse(MF)) {
+    MBB.clearLiveIns();
+    BlocksToUpdate.push_back(&MBB);
+  }
+  fullyRecomputeLiveIns(BlocksToUpdate);
+  for (MachineBasicBlock &MBB : MF)
+    recomputeLivenessFlags(MBB);
 }
 
 FunctionAllocator::BlockSearch::BlockSearch(FunctionAllocator &Allocator,
@@ -518,19 +565,6 @@ bool FunctionAllocator::BlockSearch::restoreLiveOuts(
                                    Before.LiveRegs, Before.FixedRegs) &&
          Allocator.materializeUnheldValues(Plan, Before.LiveRegs,
                                            Before.FixedRegs, true);
-}
-
-bool FunctionAllocator::isRematerialized(const MachineInstr &MI) const {
-  return (TII.isTriviallyReMaterializable(MI) &&
-          MI.getOperand(0).getReg().isVirtual()) ||
-         ((MI.isCopy() || MI.isRegSequence()) &&
-          MI.getOperand(0).getReg().isVirtual() &&
-          llvm::all_of(ValueNumbers.subRegIndices(MI.getOperand(0).getReg()),
-                       [&](unsigned SubReg) {
-                         ValueNumber V = ValueNumbers.getValueNumber(
-                             MI.getOperand(0).getReg(), SubReg);
-                         return V.isUndef() || rematerialization(V);
-                       }));
 }
 
 FunctionAllocator::InstructionSearch::InstructionSearch(
@@ -643,6 +677,24 @@ void FunctionAllocator::OperandChoices::buildDomain(unsigned I) {
     Allocator.fail("empty operand placement domain", &MI);
 }
 
+void FunctionAllocator::OperandChoices::search(unsigned I) {
+  if (I == MI.getNumOperands()) {
+    Accept(Assignment);
+    return;
+  }
+  if (Domains[I].empty()) {
+    search(I + 1);
+    return;
+  }
+  for (MCPhysReg R : Domains[I]) {
+    if (!isLegal(I, R))
+      continue;
+    Assignment[I] = R;
+    search(I + 1);
+  }
+  Assignment[I] = 0;
+}
+
 bool FunctionAllocator::OperandChoices::isLegal(unsigned I, MCPhysReg R) const {
   const MachineOperand &MO = MI.getOperand(I);
   if (MI.isCopy() || MI.getOpcode() == TargetOpcode::REG_SEQUENCE ||
@@ -699,24 +751,6 @@ bool FunctionAllocator::OperandChoices::isTiedUseAlias(
          Allocator.TRI.isSubRegisterEq(TiedReg, Use.getReg());
 }
 
-void FunctionAllocator::OperandChoices::search(unsigned I) {
-  if (I == MI.getNumOperands()) {
-    Accept(Assignment);
-    return;
-  }
-  if (Domains[I].empty()) {
-    search(I + 1);
-    return;
-  }
-  for (MCPhysReg R : Domains[I]) {
-    if (!isLegal(I, R))
-      continue;
-    Assignment[I] = R;
-    search(I + 1);
-  }
-  Assignment[I] = 0;
-}
-
 FunctionAllocator::InstructionPlacement::InstructionPlacement(
     FunctionAllocator &Allocator, const ProgramPoint &Before,
     const ProgramPoint &After, Implementation &Plan,
@@ -733,15 +767,6 @@ bool FunctionAllocator::InstructionPlacement::prepareInputs() {
   return prepareUses(false) && prepareUses(true);
 }
 
-void FunctionAllocator::InstructionPlacement::protectUses() {
-  for (unsigned I = 0; I < MI.getNumOperands(); ++I) {
-    const MachineOperand &MO = MI.getOperand(I);
-    if (MO.isReg() && MO.isUse() && !MO.isUndef())
-      for (MCPhysReg R : Allocator.registerParts(Operands[I]))
-        Locked.set(R);
-  }
-}
-
 bool FunctionAllocator::InstructionPlacement::execute() {
   if (MI.isCopy() && (MI.getOperand(0).getReg().isVirtual() ||
                       MI.getOperand(1).getReg().isVirtual()))
@@ -755,6 +780,92 @@ bool FunctionAllocator::InstructionPlacement::execute() {
   Plan.Instructions.push_back(
       OperandAssignment{SmallVector<MCPhysReg>(Operands)});
   return Allocator.hasLiveValues(Plan.Registers, After.LiveRegs);
+}
+
+bool FunctionAllocator::InstructionPlacement::prepareUses(bool InGPRs) {
+  for (unsigned I = 0; I < MI.getNumOperands(); ++I) {
+    const MachineOperand &MO = MI.getOperand(I);
+    if (!MO.isReg() || !MO.isUse() || !MO.getReg().isVirtual())
+      continue;
+    auto Parts = Allocator.registerParts(Operands[I]);
+    if (Parts.empty() || MOS::GPRRegClass.contains(Parts.front()) != InGPRs)
+      continue;
+    ValueNumber Value = Allocator.ValueNumbers.getValueNumber(MO);
+    for (auto [SubReg, Reg] : llvm::zip_equal(
+             Allocator.ValueNumbers.subRegIndices(MO.getReg()), Parts)) {
+      ValueNumber V = Allocator.ValueNumbers.getSubValue(Value, SubReg);
+      if (V.isUndef())
+        continue;
+      if (!Allocator.placeValue(V, Reg, Plan, Before.LiveRegs, Locked))
+        return false;
+      Locked.set(Reg);
+    }
+  }
+  return true;
+}
+
+void FunctionAllocator::InstructionPlacement::protectUses() {
+  for (unsigned I = 0; I < MI.getNumOperands(); ++I) {
+    const MachineOperand &MO = MI.getOperand(I);
+    if (MO.isReg() && MO.isUse() && !MO.isUndef())
+      for (MCPhysReg R : Allocator.registerParts(Operands[I]))
+        Locked.set(R);
+  }
+}
+
+bool FunctionAllocator::InstructionPlacement::preserveLiveThroughValues() {
+  // Evacuations must avoid every impending clobber, including destinations of
+  // later operands. The small physical mask is shared by all evacuations.
+  BitVector Clobbered(MOS::NUM_TARGET_REGS);
+  for (unsigned I = 0; I < MI.getNumOperands(); ++I) {
+    const MachineOperand &MO = MI.getOperand(I);
+    if (MO.isReg() && MO.isDef())
+      for (MCPhysReg Reg : Allocator.registerParts(Operands[I]))
+        Clobbered.set(Reg);
+    if (MO.isRegMask())
+      for (MCPhysReg Reg = 1; Reg < MOS::NUM_TARGET_REGS; ++Reg)
+        if (MO.clobbersPhysReg(Reg))
+          Clobbered.set(Reg);
+  }
+  for (int Reg : Clobbered.set_bits())
+    if (!Allocator.evacuate(Reg, Plan, After.LiveRegs, Locked, Clobbered))
+      return false;
+  return true;
+}
+
+bool FunctionAllocator::InstructionPlacement::applyInstruction() {
+  // Repairs execute before MI, so preservation above protects every input.
+  // Now simulate MI's effects. Killed inputs need no explicit erasure: their
+  // copies remain usable until overwritten or forgotten at the end of the step.
+  for (const MachineOperand &MO : MI.all_defs())
+    if (MO.isEarlyClobber() && !define(MO))
+      return false;
+  for (const MachineOperand &MO : MI.operands())
+    if (MO.isRegMask())
+      Plan.Registers.clobber(MO.getRegMask());
+  for (const MachineOperand &MO : MI.all_defs())
+    if (!MO.isEarlyClobber() && !define(MO))
+      return false;
+  return true;
+}
+
+bool FunctionAllocator::InstructionPlacement::define(const MachineOperand &MO) {
+  MCPhysReg Phys = Operands[MO.getOperandNo()];
+  auto Parts = Allocator.registerParts(Phys);
+  if (Parts.empty())
+    return true;
+  if (MO.getReg().isVirtual()) {
+    bool TiedPhysicalUse =
+        MO.isTied() && MI.getOperand(MI.findTiedOperandIdx(MO.getOperandNo()))
+                           .getReg()
+                           .isPhysical();
+    for (MCPhysReg Reg : Parts)
+      if (After.FixedRegs[Reg] ||
+          (MO.isEarlyClobber() && Before.FixedRegs[Reg] && !TiedPhysicalUse))
+        return false;
+  }
+  Plan.Registers.define(Phys, Allocator.ValueNumbers.getValueNumber(MO));
+  return true;
 }
 
 bool FunctionAllocator::InstructionPlacement::planCopy() {
@@ -826,100 +937,6 @@ bool FunctionAllocator::InstructionPlacement::planRegSequence() {
   return Allocator.hasLiveValues(Plan.Registers, After.LiveRegs);
 }
 
-bool FunctionAllocator::InstructionPlacement::prepareUses(bool InGPRs) {
-  for (unsigned I = 0; I < MI.getNumOperands(); ++I) {
-    const MachineOperand &MO = MI.getOperand(I);
-    if (!MO.isReg() || !MO.isUse() || !MO.getReg().isVirtual())
-      continue;
-    auto Parts = Allocator.registerParts(Operands[I]);
-    if (Parts.empty() || MOS::GPRRegClass.contains(Parts.front()) != InGPRs)
-      continue;
-    ValueNumber Value = Allocator.ValueNumbers.getValueNumber(MO);
-    for (auto [SubReg, Reg] : llvm::zip_equal(
-             Allocator.ValueNumbers.subRegIndices(MO.getReg()), Parts)) {
-      ValueNumber V = Allocator.ValueNumbers.getSubValue(Value, SubReg);
-      if (V.isUndef())
-        continue;
-      if (!Allocator.placeValue(V, Reg, Plan, Before.LiveRegs, Locked))
-        return false;
-      Locked.set(Reg);
-    }
-  }
-  return true;
-}
-
-bool FunctionAllocator::InstructionPlacement::preserveLiveThroughValues() {
-  // Evacuations must avoid every impending clobber, including destinations of
-  // later operands. The small physical mask is shared by all evacuations.
-  BitVector Clobbered(MOS::NUM_TARGET_REGS);
-  for (unsigned I = 0; I < MI.getNumOperands(); ++I) {
-    const MachineOperand &MO = MI.getOperand(I);
-    if (MO.isReg() && MO.isDef())
-      for (MCPhysReg Reg : Allocator.registerParts(Operands[I]))
-        Clobbered.set(Reg);
-    if (MO.isRegMask())
-      for (MCPhysReg Reg = 1; Reg < MOS::NUM_TARGET_REGS; ++Reg)
-        if (MO.clobbersPhysReg(Reg))
-          Clobbered.set(Reg);
-  }
-  for (int Reg : Clobbered.set_bits())
-    if (!Allocator.evacuate(Reg, Plan, After.LiveRegs, Locked, Clobbered))
-      return false;
-  return true;
-}
-
-bool FunctionAllocator::InstructionPlacement::applyInstruction() {
-  // Repairs execute before MI, so preservation above protects every input.
-  // Now simulate MI's effects. Killed inputs need no explicit erasure: their
-  // copies remain usable until overwritten or forgotten at the end of the step.
-  for (const MachineOperand &MO : MI.all_defs())
-    if (MO.isEarlyClobber() && !define(MO))
-      return false;
-  for (const MachineOperand &MO : MI.operands())
-    if (MO.isRegMask())
-      Plan.Registers.clobber(MO.getRegMask());
-  for (const MachineOperand &MO : MI.all_defs())
-    if (!MO.isEarlyClobber() && !define(MO))
-      return false;
-  return true;
-}
-
-bool FunctionAllocator::InstructionPlacement::define(const MachineOperand &MO) {
-  MCPhysReg Phys = Operands[MO.getOperandNo()];
-  auto Parts = Allocator.registerParts(Phys);
-  if (Parts.empty())
-    return true;
-  if (MO.getReg().isVirtual()) {
-    bool TiedPhysicalUse =
-        MO.isTied() && MI.getOperand(MI.findTiedOperandIdx(MO.getOperandNo()))
-                           .getReg()
-                           .isPhysical();
-    for (MCPhysReg Reg : Parts)
-      if (After.FixedRegs[Reg] ||
-          (MO.isEarlyClobber() && Before.FixedRegs[Reg] && !TiedPhysicalUse))
-        return false;
-  }
-  Plan.Registers.define(Phys, Allocator.ValueNumbers.getValueNumber(MO));
-  return true;
-}
-
-void FunctionAllocator::forEachImagReg(
-    const SparseBitVector<> &LiveRegs,
-    function_ref<void(MCPhysReg, ValueNumber)> Visit) const {
-  for (unsigned I : LiveRegs) {
-    Register R = Register::index2VirtReg(I);
-    for (unsigned SubReg : ValueNumbers.subRegIndices(R)) {
-      ValueNumber V = ValueNumbers.getValueNumber(R, SubReg);
-      if (V.isUndef() || rematerialization(V))
-        continue;
-      MCPhysReg ImagReg = imagReg(R, SubReg);
-      if (!ImagReg)
-        fail("live value has no imaginary register");
-      Visit(ImagReg, V);
-    }
-  }
-}
-
 AllocationState
 FunctionAllocator::getAllocationState(const RegisterContents &Registers,
                                       const SparseBitVector<> &LiveRegs) const {
@@ -962,6 +979,23 @@ RegisterContents FunctionAllocator::getRegisterContents(
       Registers.define(ImagReg, V);
   }
   return Registers;
+}
+
+void FunctionAllocator::forEachImagReg(
+    const SparseBitVector<> &LiveRegs,
+    function_ref<void(MCPhysReg, ValueNumber)> Visit) const {
+  for (unsigned I : LiveRegs) {
+    Register R = Register::index2VirtReg(I);
+    for (unsigned SubReg : ValueNumbers.subRegIndices(R)) {
+      ValueNumber V = ValueNumbers.getValueNumber(R, SubReg);
+      if (V.isUndef() || rematerialization(V))
+        continue;
+      MCPhysReg ImagReg = imagReg(R, SubReg);
+      if (!ImagReg)
+        fail("live value has no imaginary register");
+      Visit(ImagReg, V);
+    }
+  }
 }
 
 bool FunctionAllocator::materializeUnheldValues(
@@ -1065,54 +1099,6 @@ bool FunctionAllocator::placeValue(ValueNumber V, MCPhysReg Dst,
   return true;
 }
 
-// Rematerialize the complete definition, even when only one byte was requested.
-// The other byte is a clobber during preparation and an available copy
-// afterward.
-bool FunctionAllocator::rematerialize(ValueNumber V, MCPhysReg Reg,
-                                      Implementation &Plan,
-                                      const SparseBitVector<> &LiveRegs,
-                                      BitVector Locked,
-                                      const BitVector &Forbidden) {
-  const MachineInstr *Def = rematerialization(V);
-  if (!Def)
-    return false;
-  auto SourceValue = ValueNumbers.source(V);
-  Register Source = SourceValue.Reg;
-  MCPhysReg Dst = Reg;
-  if (ValueNumbers.subRegIndices(Source).size() == 2) {
-    Dst =
-        TRI.getMatchingSuperReg(Dst, SourceValue.SubReg, &MOS::Imag16RegClass);
-    if (!Dst)
-      return false;
-  }
-  const TargetRegisterClass *RC = Def->getRegClassConstraint(0, &TII, &TRI);
-  if (!RC)
-    RC = MRI.getRegClass(Source);
-  if (!RC->contains(Dst))
-    return false;
-
-  auto Parts = registerParts(Dst);
-  if (Parts.size() != ValueNumbers.subRegIndices(Source).size())
-    return false;
-  BitVector Clobbered = Forbidden;
-  for (MCPhysReg Part : Parts) {
-    if (Locked[Part])
-      return false;
-    Clobbered.set(Part);
-  }
-  for (MCPhysReg Part : Parts)
-    if (!evacuate(Part, Plan, LiveRegs, Locked, Clobbered))
-      return false;
-  SmallVector<MCPhysReg> Ops(Def->getNumOperands());
-  Ops[0] = Dst;
-  Plan.Instructions.push_back(Rematerialization{Def, Dst});
-  Plan.Cost += instructionCost(*Def, Ops);
-  for (auto [SubReg, Part] :
-       llvm::zip_equal(ValueNumbers.subRegIndices(Source), Parts))
-    Plan.Registers.define(Part, ValueNumbers.getValueNumber(Source, SubReg));
-  return true;
-}
-
 bool FunctionAllocator::evacuate(MCPhysReg Reg, Implementation &Plan,
                                  const SparseBitVector<> &LiveRegs,
                                  BitVector Locked, const BitVector &Forbidden) {
@@ -1166,6 +1152,54 @@ bool FunctionAllocator::evacuate(MCPhysReg Reg, Implementation &Plan,
   return Valid;
 }
 
+// Rematerialize the complete definition, even when only one byte was requested.
+// The other byte is a clobber during preparation and an available copy
+// afterward.
+bool FunctionAllocator::rematerialize(ValueNumber V, MCPhysReg Reg,
+                                      Implementation &Plan,
+                                      const SparseBitVector<> &LiveRegs,
+                                      BitVector Locked,
+                                      const BitVector &Forbidden) {
+  const MachineInstr *Def = rematerialization(V);
+  if (!Def)
+    return false;
+  auto SourceValue = ValueNumbers.source(V);
+  Register Source = SourceValue.Reg;
+  MCPhysReg Dst = Reg;
+  if (ValueNumbers.subRegIndices(Source).size() == 2) {
+    Dst =
+        TRI.getMatchingSuperReg(Dst, SourceValue.SubReg, &MOS::Imag16RegClass);
+    if (!Dst)
+      return false;
+  }
+  const TargetRegisterClass *RC = Def->getRegClassConstraint(0, &TII, &TRI);
+  if (!RC)
+    RC = MRI.getRegClass(Source);
+  if (!RC->contains(Dst))
+    return false;
+
+  auto Parts = registerParts(Dst);
+  if (Parts.size() != ValueNumbers.subRegIndices(Source).size())
+    return false;
+  BitVector Clobbered = Forbidden;
+  for (MCPhysReg Part : Parts) {
+    if (Locked[Part])
+      return false;
+    Clobbered.set(Part);
+  }
+  for (MCPhysReg Part : Parts)
+    if (!evacuate(Part, Plan, LiveRegs, Locked, Clobbered))
+      return false;
+  SmallVector<MCPhysReg> Ops(Def->getNumOperands());
+  Ops[0] = Dst;
+  Plan.Instructions.push_back(Rematerialization{Def, Dst});
+  Plan.Cost += instructionCost(*Def, Ops);
+  for (auto [SubReg, Part] :
+       llvm::zip_equal(ValueNumbers.subRegIndices(Source), Parts))
+    Plan.Registers.define(Part, ValueNumbers.getValueNumber(Source, SubReg));
+  return true;
+}
+
 bool FunctionAllocator::copyRegister(MCPhysReg Dst, MCPhysReg Src,
                                      Implementation &Plan) {
   if (Dst == Src)
@@ -1188,6 +1222,34 @@ bool FunctionAllocator::copyRegister(MCPhysReg Dst, MCPhysReg Src,
   Plan.Cost += Cost;
   Plan.Registers.copy(Dst, Src);
   return true;
+}
+
+void FunctionAllocator::emitInstructions(
+    MachineBasicBlock &MBB, MachineBasicBlock::iterator At, const DebugLoc &DL,
+    ArrayRef<EmittedInstruction> Instructions, MachineInstr *MI) {
+  for (const EmittedInstruction &Instruction : Instructions) {
+    if (const auto *Copy = std::get_if<RegisterCopy>(&Instruction)) {
+      BuildMI(MBB, At, DL, TII.get(Copy->Opcode), Copy->Dst).addReg(Copy->Src);
+      ++NumTransfers;
+    } else if (const auto *Remat =
+                   std::get_if<Rematerialization>(&Instruction)) {
+      TII.reMaterialize(MBB, At, Remat->Dst, 0, *Remat->Definition);
+      ++NumTransfers;
+    } else {
+      const auto &Assignment = std::get<OperandAssignment>(Instruction);
+      assert(MI && "operand assignments need an original instruction");
+      for (unsigned I = 0; I < MI->getNumOperands(); ++I) {
+        MachineOperand &MO = MI->getOperand(I);
+        if (MO.isReg() && MO.getReg().isVirtual()) {
+          if (MO.isUse() && ValueNumbers.getValueNumber(MO).isUndef())
+            MO.setIsUndef();
+          MO.setReg(Assignment.Registers[I]);
+          MO.setIsRenamable(false);
+        }
+      }
+      At = std::next(MI->getIterator());
+    }
+  }
 }
 
 // The input opcode is fixed, but some pseudos expand differently depending on
@@ -1242,6 +1304,26 @@ unsigned FunctionAllocator::instructionCost(const MachineInstr &MI,
   }
 }
 
+bool FunctionAllocator::isRematerialized(const MachineInstr &MI) const {
+  return (TII.isTriviallyReMaterializable(MI) &&
+          MI.getOperand(0).getReg().isVirtual()) ||
+         ((MI.isCopy() || MI.isRegSequence()) &&
+          MI.getOperand(0).getReg().isVirtual() &&
+          llvm::all_of(ValueNumbers.subRegIndices(MI.getOperand(0).getReg()),
+                       [&](unsigned SubReg) {
+                         ValueNumber V = ValueNumbers.getValueNumber(
+                             MI.getOperand(0).getReg(), SubReg);
+                         return V.isUndef() || rematerialization(V);
+                       }));
+}
+
+const MachineInstr *FunctionAllocator::rematerialization(ValueNumber V) const {
+  if (!V || V.isUndef())
+    return nullptr;
+  const MachineInstr *Def = MRI.getVRegDef(ValueNumbers.source(V).Reg);
+  return Def && TII.isTriviallyReMaterializable(*Def) ? Def : nullptr;
+}
+
 SmallVector<MCPhysReg> FunctionAllocator::destinations(Register R) const {
   SmallVector<MCPhysReg> Result;
   if (ValueNumbers.subRegIndices(R).size() == 1) {
@@ -1253,6 +1335,22 @@ SmallVector<MCPhysReg> FunctionAllocator::destinations(Register R) const {
   if (MCPhysReg ImagReg = VRM.getPhys(R))
     Result.push_back(ImagReg);
   return Result;
+}
+
+SmallVector<MCPhysReg, 2> FunctionAllocator::registerParts(MCPhysReg R) const {
+  if (MOS::Imag16RegClass.contains(R))
+    return {MCPhysReg(TRI.getSubReg(R, MOS::sublo)),
+            MCPhysReg(TRI.getSubReg(R, MOS::subhi))};
+  if (MOS::Imag8RegClass.contains(R) || llvm::is_contained(HardwareRegs, R))
+    return {R};
+  return {};
+}
+
+MCPhysReg FunctionAllocator::imagReg(Register R, unsigned SubReg) const {
+  MCPhysReg ImagReg = VRM.getPhys(R);
+  if (ImagReg && SubReg)
+    return TRI.getSubReg(ImagReg, SubReg);
+  return ImagReg;
 }
 
 bool FunctionAllocator::hasLiveValues(const RegisterContents &S,
@@ -1303,111 +1401,16 @@ SparseBitVector<> FunctionAllocator::liveOuts(MachineBasicBlock &MBB) const {
   return LiveRegs;
 }
 
-SmallVector<MCPhysReg, 2> FunctionAllocator::registerParts(MCPhysReg R) const {
-  if (MOS::Imag16RegClass.contains(R))
-    return {MCPhysReg(TRI.getSubReg(R, MOS::sublo)),
-            MCPhysReg(TRI.getSubReg(R, MOS::subhi))};
-  if (MOS::Imag8RegClass.contains(R) || llvm::is_contained(HardwareRegs, R))
-    return {R};
-  return {};
-}
-
-MCPhysReg FunctionAllocator::imagReg(Register R, unsigned SubReg) const {
-  MCPhysReg ImagReg = VRM.getPhys(R);
-  if (ImagReg && SubReg)
-    return TRI.getSubReg(ImagReg, SubReg);
-  return ImagReg;
-}
-
-const MachineInstr *FunctionAllocator::rematerialization(ValueNumber V) const {
-  if (!V || V.isUndef())
-    return nullptr;
-  const MachineInstr *Def = MRI.getVRegDef(ValueNumbers.source(V).Reg);
-  return Def && TII.isTriviallyReMaterializable(*Def) ? Def : nullptr;
-}
-
-void FunctionAllocator::emitInstructions(
-    MachineBasicBlock &MBB, MachineBasicBlock::iterator At, const DebugLoc &DL,
-    ArrayRef<EmittedInstruction> Instructions, MachineInstr *MI) {
-  for (const EmittedInstruction &Instruction : Instructions) {
-    if (const auto *Copy = std::get_if<RegisterCopy>(&Instruction)) {
-      BuildMI(MBB, At, DL, TII.get(Copy->Opcode), Copy->Dst).addReg(Copy->Src);
-      ++NumTransfers;
-    } else if (const auto *Remat =
-                   std::get_if<Rematerialization>(&Instruction)) {
-      TII.reMaterialize(MBB, At, Remat->Dst, 0, *Remat->Definition);
-      ++NumTransfers;
-    } else {
-      const auto &Assignment = std::get<OperandAssignment>(Instruction);
-      assert(MI && "operand assignments need an original instruction");
-      for (unsigned I = 0; I < MI->getNumOperands(); ++I) {
-        MachineOperand &MO = MI->getOperand(I);
-        if (MO.isReg() && MO.getReg().isVirtual()) {
-          if (MO.isUse() && ValueNumbers.getValueNumber(MO).isUndef())
-            MO.setIsUndef();
-          MO.setReg(Assignment.Registers[I]);
-          MO.setIsRenamable(false);
-        }
-      }
-      At = std::next(MI->getIterator());
-    }
-  }
-}
-
-void FunctionAllocator::emitSolution(MachineBasicBlock &MBB,
-                                     const BlockPlan &Block) {
-  const AllocationTable &Final = Block.Points.back().Allocations;
-  auto Best = llvm::min_element(Final, [](const auto &A, const auto &B) {
-    return A.second.Cost < B.second.Cost;
-  });
-  unsigned Index = std::distance(Final.begin(), Best);
-  SmallVector<const DPEntry *> Selected(Block.Points.size());
-  for (unsigned I = Block.Points.size(); I-- > 0;) {
-    const DPEntry &Entry =
-        std::next(Block.Points[I].Allocations.begin(), Index)->second;
-    Selected[I] = &Entry;
-    Index = Entry.Previous;
-  }
-  for (auto [Point, Entry] : llvm::zip_equal(Block.Points, Selected)) {
-    MachineInstr *MI = Point.MI;
-    auto At = MI ? MI->getIterator() : MBB.getFirstTerminator();
-    emitInstructions(MBB, At, MI ? MI->getDebugLoc() : DebugLoc(),
-                     Entry->Instructions, MI);
-  }
-}
-
-void FunctionAllocator::eraseVirtualInstructions() {
-  for (auto &[MBB, B] : Blocks)
-    for (const ProgramPoint &Point : B.Points) {
-      MachineInstr *MI = Point.MI;
-      if (!MI)
-        continue;
-      if (MI->isPHI() || MI->getOpcode() == MOS::PCOPY ||
-          (MI->isCopy() && (MI->getOperand(0).getReg().isVirtual() ||
-                            MI->getOperand(1).getReg().isVirtual())) ||
-          (TII.isTriviallyReMaterializable(*MI) &&
-           MI->getOperand(0).getReg().isVirtual()) ||
-          MI->getOpcode() == TargetOpcode::REG_SEQUENCE)
-        MI->eraseFromParent();
-    }
-  for (MachineBasicBlock &MBB : MF)
-    for (MachineInstr &MI : MBB)
-      if (MI.isDebugInstr())
-        for (MachineOperand &MO : MI.operands())
-          if (MO.isReg() && MO.getReg().isVirtual())
-            MO.setReg(0);
-  MRI.clearVirtRegs();
-}
-
-void FunctionAllocator::recomputePhysicalLiveness() {
-  SmallVector<MachineBasicBlock *> BlocksToUpdate;
-  for (MachineBasicBlock &MBB : reverse(MF)) {
-    MBB.clearLiveIns();
-    BlocksToUpdate.push_back(&MBB);
-  }
-  fullyRecomputeLiveIns(BlocksToUpdate);
-  for (MachineBasicBlock &MBB : MF)
-    recomputeLivenessFlags(MBB);
+BitVector
+FunctionAllocator::fixedRegisters(const LivePhysRegs &LiveRegs) const {
+  // Compare/branch pseudos keep N/Z internal until late optimization.
+  assert(!LiveRegs.contains(MOS::N) && !LiveRegs.contains(MOS::Z) &&
+         "N/Z must not be live during MOS register allocation");
+  BitVector FixedRegs(MOS::NUM_TARGET_REGS);
+  for (MCPhysReg R : LiveRegs)
+    for (MCPhysReg Part : registerParts(R))
+      FixedRegs.set(Part);
+  return FixedRegs;
 }
 
 void FunctionAllocator::fail(const Twine &Reason,

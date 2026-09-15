@@ -54,9 +54,6 @@ public:
 
   explicit MOSValueNumbering(MachineFunction &MF);
 
-  // Both bytes of an Imag16, or index zero for an Imag8 or flag. Physical
-  // registers are accepted here only to describe their width.
-  ArrayRef<unsigned> subRegIndices(Register R) const;
   // Physical registers have no static identity and return unknown. Their
   // contents must be tracked separately over their lifetimes.
   ValueNumber getValueNumber(Register R, unsigned SubReg = 0) const;
@@ -75,14 +72,18 @@ public:
   // An SSA definition (or component of it) representing V. This supplies the
   // recipe for rematerialization, not a register guaranteed to dominate a use.
   TargetInstrInfo::RegSubRegPair source(ValueNumber V) const;
+  // Both bytes of an Imag16, or index zero for an Imag8 or flag. Physical
+  // registers are accepted here only to describe their width.
+  ArrayRef<unsigned> subRegIndices(Register R) const;
 
 private:
   ValueNumber numberRegister(Register R);
   // Number a use's source on demand, including undef and subregister semantics.
   ValueNumber numberOperand(const MachineOperand &MO);
-  ValueNumber newValue(TargetInstrInfo::RegSubRegPair Source);
-  ValueNumber numberRegSequence(Register R, ValueNumber Lo, ValueNumber Hi);
   const MachineOperand *copySource(Register R) const;
+
+  ValueNumber numberRegSequence(Register R, ValueNumber Lo, ValueNumber Hi);
+  ValueNumber newValue(TargetInstrInfo::RegSubRegPair Source);
 
   const MachineRegisterInfo &MRI;
   const TargetRegisterInfo &TRI;
@@ -113,11 +114,12 @@ class MOSValueNumberingWrapperPass : public MachineFunctionPass {
 public:
   static char ID;
   MOSValueNumberingWrapperPass();
-  MOSValueNumbering &valueNumbers() { return *ValueNumbers; }
   bool runOnMachineFunction(MachineFunction &MF) override;
+  MOSValueNumbering &valueNumbers() { return *ValueNumbers; }
   void releaseMemory() override { ValueNumbers.reset(); }
-  void getAnalysisUsage(AnalysisUsage &AU) const override;
+
   MachineFunctionProperties getRequiredProperties() const override;
+  void getAnalysisUsage(AnalysisUsage &AU) const override;
 
 private:
   std::optional<MOSValueNumbering> ValueNumbers;
