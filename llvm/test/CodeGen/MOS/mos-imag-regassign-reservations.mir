@@ -1,7 +1,7 @@
 # RUN: split-file %s %t
-# RUN: llc -mtriple=mos -run-pass=mos-conventional-ssa,mos-imag-regalloc -stress-regalloc=2 -verify-machineinstrs %t/loop_reservation.mir -o /dev/null
-# RUN: llc -mtriple=mos -run-pass=mos-conventional-ssa,mos-imag-regalloc -verify-machineinstrs %t/valid.mir -o - | FileCheck %s
-# RUN: not llc -mtriple=mos -run-pass=mos-conventional-ssa,mos-imag-regalloc -verify-machineinstrs %t/overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=OVERFLOW
+# RUN: llc -mtriple=mos -run-pass=mos-conventional-ssa,mos-spill,mos-imag-regassign -stress-regalloc=2 -verify-machineinstrs %t/loop_reservation.mir -o /dev/null
+# RUN: llc -mtriple=mos -run-pass=mos-conventional-ssa,mos-spill,mos-imag-regassign -verify-machineinstrs %t/valid.mir -o - | FileCheck %s
+# RUN: not llc -mtriple=mos -run-pass=mos-conventional-ssa,mos-spill -verify-machineinstrs %t/overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=OVERFLOW
 
 # VirtRegMap assignments, rather than unchanged instructions, are the output
 # under test. update_mir_test_checks.py does not generate register-map checks.
@@ -247,9 +247,9 @@ body: |
 #--- overflow.mir
 # Only the final pair now survives across the PCOPY. It conflicts with the
 # reservation, so its definition needs fifteen potentially occupied pairs.
-# OVERFLOW: MOSImagRegAlloc: cannot prove imaginary register assignability in reservation_overflow, bb.0 for Imag16: requires 15, 14 available locations
+# OVERFLOW: MOSSpill: cannot prove imaginary register assignability in reservation_overflow, bb.0 for Imag16: requires 15, 14 available locations
 # OVERFLOW: %13:imag16 = COPY $rs0
-# OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+# OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
 name: reservation_overflow
 tracksRegLiveness: true

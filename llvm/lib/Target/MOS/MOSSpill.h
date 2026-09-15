@@ -7,19 +7,19 @@
 //===----------------------------------------------------------------------===//
 ///
 /// \file
-/// This file declares the MOS imaginary register allocation pass.
+/// This file declares the MOS imaginary register spilling pass.
 ///
 //===----------------------------------------------------------------------===//
 
-#ifndef LLVM_LIB_TARGET_MOS_MOSIMAGREGALLOC_H
-#define LLVM_LIB_TARGET_MOS_MOSIMAGREGALLOC_H
+#ifndef LLVM_LIB_TARGET_MOS_MOSSPILL_H
+#define LLVM_LIB_TARGET_MOS_MOSSPILL_H
 
 namespace llvm {
 
 class MachineFunctionPass;
 
-MachineFunctionPass *createMOSImagRegAllocPass();
+MachineFunctionPass *createMOSSpillPass();
 
 } // namespace llvm
 
-#endif // LLVM_LIB_TARGET_MOS_MOSIMAGREGALLOC_H
+#endif // LLVM_LIB_TARGET_MOS_MOSSPILL_H

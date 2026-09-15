@@ -1,4 +1,4 @@
-# RUN: llc -mtriple=mos -run-pass=mos-conventional-ssa,mos-imag-regalloc,mos-regalloc -verify-machineinstrs -o - %s | FileCheck %s
+# RUN: llc -mtriple=mos -run-pass=mos-conventional-ssa,mos-spill,mos-imag-regassign,mos-regalloc -verify-machineinstrs -o - %s | FileCheck %s
 
 # rs0 contains the address of bb.1 or bb.2. CSSA copies must preserve those
 # targets; imaginary and hardware allocation must not insert edge blocks that

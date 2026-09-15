@@ -8,7 +8,7 @@
 ///
 /// \file
 /// Choose hardware registers for SSA instructions using dynamic
-/// programming at instruction boundaries. MOSImagRegAlloc supplies complete
+/// programming at instruction boundaries. MOSImagRegAssign supplies complete
 /// imaginary assignments through VirtRegMap. This pass may defer or eliminate
 /// their materialization while retaining the corresponding values in A/X/Y/C/V.
 /// An established copy in an imaginary register remains valid until its SSA

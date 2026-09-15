@@ -1,12 +1,11 @@
 # RUN: split-file %s %t
-# RUN: llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/valid.mir -o %t/valid.out
+# RUN: llc -mtriple=mos -run-pass=mos-spill,mos-imag-regassign -verify-machineinstrs %t/valid.mir -o %t/valid.out
 # RUN: FileCheck %s --input-file=%t/valid.out
-# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/imag8-overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=IMAG8-OVERFLOW
-# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/imag16-overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=IMAG16-OVERFLOW
-# RUN: llc -mtriple=mos -start-before=mos-imag-regalloc -stop-after=mos-imag-regalloc -verify-machineinstrs %t/debug.mir -o %t/debug.out
+# RUN: llc -mtriple=mos -start-before=mos-spill -stop-after=mos-imag-regassign -verify-machineinstrs %t/debug.mir -o %t/debug.out
 # RUN: FileCheck %s --check-prefix=DEBUG --input-file=%t/debug.out
 
-# Check the pass in isolation: assignments are serialized from VirtRegMap, while the instruction stream remains in SSA form.
+# Spilling precedes assignment; assignments are serialized from VirtRegMap,
+# while the instruction stream remains in SSA form.
 
 #--- valid.mir
 # Whole COPYs share value origins and may share imaginary registers even while
@@ -279,90 +278,6 @@ body: |
     RTS implicit $c
 ...
 
-#--- imag8-overflow.mir
-# Thirteen live bytes and sixteen call clobbers require spilling.
-# IMAG8-OVERFLOW: MOSImagRegAlloc: cannot prove imaginary register assignability in imag8_overflow, bb.0 for Imag8: requires 29, 28 available locations
-# IMAG8-OVERFLOW: JSR &callee
-# IMAG8-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
----
-name: imag8_overflow
-tracksRegLiveness: true
-body: |
-  bb.0:
-    %0:gpr = LDAbs 1000
-    %1:gpr = LDAbs 1001
-    %2:gpr = LDAbs 1002
-    %3:gpr = LDAbs 1003
-    %4:gpr = LDAbs 1004
-    %5:gpr = LDAbs 1005
-    %6:gpr = LDAbs 1006
-    %7:gpr = LDAbs 1007
-    %8:gpr = LDAbs 1008
-    %9:gpr = LDAbs 1009
-    %10:gpr = LDAbs 1010
-    %11:gpr = LDAbs 1011
-    %12:gpr = LDAbs 1012
-    JSR &callee, mos_csr
-    STAbs %0, 2000
-    STAbs %1, 2001
-    STAbs %2, 2002
-    STAbs %3, 2003
-    STAbs %4, 2004
-    STAbs %5, 2005
-    STAbs %6, 2006
-    STAbs %7, 2007
-    STAbs %8, 2008
-    STAbs %9, 2009
-    STAbs %10, 2010
-    STAbs %11, 2011
-    STAbs %12, 2012
-    RTS
-...
-
-#--- imag16-overflow.mir
-# Fourteen live bytes could occupy all fourteen pairs. The conservative bound
-# therefore rejects a new Imag16, even though the total byte demand fits.
-# IMAG16-OVERFLOW: MOSImagRegAlloc: cannot prove imaginary register assignability in imag16_overflow, bb.0 for Imag16: requires 15, 14 available locations
-# IMAG16-OVERFLOW: %14:imag16 = COPY $rs0
-# IMAG16-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
----
-name: imag16_overflow
-tracksRegLiveness: true
-body: |
-  bb.0:
-    %0:gpr = LDAbs 1000
-    %1:gpr = LDAbs 1001
-    %2:gpr = LDAbs 1002
-    %3:gpr = LDAbs 1003
-    %4:gpr = LDAbs 1004
-    %5:gpr = LDAbs 1005
-    %6:gpr = LDAbs 1006
-    %7:gpr = LDAbs 1007
-    %8:gpr = LDAbs 1008
-    %9:gpr = LDAbs 1009
-    %10:gpr = LDAbs 1010
-    %11:gpr = LDAbs 1011
-    %12:gpr = LDAbs 1012
-    %13:gpr = LDAbs 1013
-    %14:imag16 = COPY $rs0
-    STAbs %0, 2000
-    STAbs %1, 2001
-    STAbs %2, 2002
-    STAbs %3, 2003
-    STAbs %4, 2004
-    STAbs %5, 2005
-    STAbs %6, 2006
-    STAbs %7, 2007
-    STAbs %8, 2008
-    STAbs %9, 2009
-    STAbs %10, 2010
-    STAbs %11, 2011
-    STAbs %12, 2012
-    STAbs %13, 2013
-    $rs1 = COPY %14
-    RTS
-...
-
 #--- debug.mir
 # Debug-only uses need no imaginary register; debug instructions do not affect
 # pressure. Also exercise the pass through the target pipeline rather than
@@ -374,7 +289,7 @@ body: |
   !llvm.dbg.cu = !{!0}
   !llvm.module.flags = !{!6}
   !0 = distinct !DICompileUnit(language: DW_LANG_C99, file: !1, producer: "test", isOptimized: true, runtimeVersion: 0, emissionKind: FullDebug)
-  !1 = !DIFile(filename: "mos-imag-regalloc.c", directory: "")
+  !1 = !DIFile(filename: "mos-imag-regassign.c", directory: "")
   !2 = !DISubroutineType(types: !{})
   !3 = distinct !DISubprogram(name: "debug_info", scope: !1, file: !1, line: 7, type: !2, scopeLine: 7, spFlags: DISPFlagDefinition, unit: !0)
   !4 = !DILocalVariable(name: "x", scope: !3, file: !1, line: 8, type: !5)

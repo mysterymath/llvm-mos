@@ -1,11 +1,13 @@
 # RUN: split-file %s %t
-# RUN: llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/valid.mir -o /dev/null
-# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/intact_pair_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=INTACT-PAIR-OVERFLOW
-# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/partial_kill_lo_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PARTIAL-KILL-LO-OVERFLOW
-# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/partial_kill_hi_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PARTIAL-KILL-HI-OVERFLOW
-# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/partial_overwrite_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PARTIAL-OVERWRITE-OVERFLOW
-# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/partial_unused_lo_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PARTIAL-UNUSED-LO-OVERFLOW
-# RUN: not llc -mtriple=mos -run-pass=mos-imag-regalloc -verify-machineinstrs %t/physical_early_clobber_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PHYSICAL-EARLY-CLOBBER-OVERFLOW
+# RUN: llc -mtriple=mos -run-pass=mos-spill -verify-machineinstrs %t/valid.mir -o /dev/null
+# RUN: not llc -mtriple=mos -run-pass=mos-spill -verify-machineinstrs %t/intact_pair_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=INTACT-PAIR-OVERFLOW
+# RUN: not llc -mtriple=mos -run-pass=mos-spill -verify-machineinstrs %t/partial_kill_lo_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PARTIAL-KILL-LO-OVERFLOW
+# RUN: not llc -mtriple=mos -run-pass=mos-spill -verify-machineinstrs %t/partial_kill_hi_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PARTIAL-KILL-HI-OVERFLOW
+# RUN: not llc -mtriple=mos -run-pass=mos-spill -verify-machineinstrs %t/partial_overwrite_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PARTIAL-OVERWRITE-OVERFLOW
+# RUN: not llc -mtriple=mos -run-pass=mos-spill -verify-machineinstrs %t/partial_unused_lo_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PARTIAL-UNUSED-LO-OVERFLOW
+# RUN: not llc -mtriple=mos -run-pass=mos-spill -verify-machineinstrs %t/physical_early_clobber_overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=PHYSICAL-EARLY-CLOBBER-OVERFLOW
+# RUN: not llc -mtriple=mos -run-pass=mos-spill -verify-machineinstrs %t/imag8-overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=IMAG8-OVERFLOW
+# RUN: not llc -mtriple=mos -run-pass=mos-spill -verify-machineinstrs %t/imag16-overflow.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=IMAG16-OVERFLOW
 
 # Physical pressure does not constrain imaginary register selection, so test its
 # accounting at the capacity boundary: correct demand fits and one extra value
@@ -400,8 +402,8 @@ body: |
 
 #--- intact_pair_overflow.mir
 # The same physical pair must prevent a fourteenth virtual pair.
-# INTACT-PAIR-OVERFLOW: MOSImagRegAlloc: cannot prove imaginary register assignability in intact_pair_overflow, bb.0 for Imag16: requires 15, 14 available locations
-# INTACT-PAIR-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+# INTACT-PAIR-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in intact_pair_overflow, bb.0 for Imag16: requires 15, 14 available locations
+# INTACT-PAIR-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
 name: intact_pair_overflow
 tracksRegLiveness: true
@@ -444,8 +446,8 @@ body: |
 #--- partial_kill_lo_overflow.mir
 # Adding a second temporary byte must exceed capacity; losing the surviving
 # physical byte would incorrectly allow this.
-# PARTIAL-KILL-LO-OVERFLOW: MOSImagRegAlloc: cannot prove imaginary register assignability in partial_kill_lo_overflow, bb.0 for Imag8: requires 29, 28 available locations
-# PARTIAL-KILL-LO-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+# PARTIAL-KILL-LO-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in partial_kill_lo_overflow, bb.0 for Imag8: requires 29, 28 available locations
+# PARTIAL-KILL-LO-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
 name: partial_kill_lo_overflow
 tracksRegLiveness: true
@@ -490,8 +492,8 @@ body: |
 #--- partial_kill_hi_overflow.mir
 # Adding a second temporary byte must exceed capacity; losing the surviving
 # physical byte would incorrectly allow this.
-# PARTIAL-KILL-HI-OVERFLOW: MOSImagRegAlloc: cannot prove imaginary register assignability in partial_kill_hi_overflow, bb.0 for Imag8: requires 29, 28 available locations
-# PARTIAL-KILL-HI-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+# PARTIAL-KILL-HI-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in partial_kill_hi_overflow, bb.0 for Imag8: requires 29, 28 available locations
+# PARTIAL-KILL-HI-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
 name: partial_kill_hi_overflow
 tracksRegLiveness: true
@@ -536,8 +538,8 @@ body: |
 #--- partial_overwrite_overflow.mir
 # Adding a second temporary byte must exceed capacity; losing the surviving
 # physical byte would incorrectly allow this.
-# PARTIAL-OVERWRITE-OVERFLOW: MOSImagRegAlloc: cannot prove imaginary register assignability in partial_overwrite_overflow, bb.0 for Imag8: requires 29, 28 available locations
-# PARTIAL-OVERWRITE-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+# PARTIAL-OVERWRITE-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in partial_overwrite_overflow, bb.0 for Imag8: requires 29, 28 available locations
+# PARTIAL-OVERWRITE-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
 name: partial_overwrite_overflow
 tracksRegLiveness: true
@@ -582,8 +584,8 @@ body: |
 #--- partial_unused_lo_overflow.mir
 # Adding a second temporary byte must exceed capacity; losing the surviving
 # physical byte would incorrectly allow this.
-# PARTIAL-UNUSED-LO-OVERFLOW: MOSImagRegAlloc: cannot prove imaginary register assignability in partial_unused_lo_overflow, bb.0 for Imag8: requires 29, 28 available locations
-# PARTIAL-UNUSED-LO-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+# PARTIAL-UNUSED-LO-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in partial_unused_lo_overflow, bb.0 for Imag8: requires 29, 28 available locations
+# PARTIAL-UNUSED-LO-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
 name: partial_unused_lo_overflow
 tracksRegLiveness: true
@@ -627,8 +629,8 @@ body: |
 #--- physical_early_clobber_overflow.mir
 # With thirteen virtual pairs, the early-clobber pair cannot fit until the
 # byte input dies. Releasing that input early would incorrectly allow this.
-# PHYSICAL-EARLY-CLOBBER-OVERFLOW: MOSImagRegAlloc: cannot prove imaginary register assignability in physical_early_clobber_overflow, bb.0 for Imag16: requires 15, 14 available locations
-# PHYSICAL-EARLY-CLOBBER-OVERFLOW: LLVM ERROR: MOSImagRegAlloc spill insertion is not implemented
+# PHYSICAL-EARLY-CLOBBER-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in physical_early_clobber_overflow, bb.0 for Imag16: requires 15, 14 available locations
+# PHYSICAL-EARLY-CLOBBER-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
 name: physical_early_clobber_overflow
 tracksRegLiveness: true
@@ -662,5 +664,89 @@ body: |
     $rs0 = COPY %10
     $rs0 = COPY %11
     $rs0 = COPY %12
+    RTS
+...
+
+#--- imag8-overflow.mir
+# Thirteen live bytes and sixteen call clobbers require spilling.
+# IMAG8-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in imag8_overflow, bb.0 for Imag8: requires 29, 28 available locations
+# IMAG8-OVERFLOW: JSR &callee
+# IMAG8-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
+---
+name: imag8_overflow
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    %2:gpr = LDAbs 1002
+    %3:gpr = LDAbs 1003
+    %4:gpr = LDAbs 1004
+    %5:gpr = LDAbs 1005
+    %6:gpr = LDAbs 1006
+    %7:gpr = LDAbs 1007
+    %8:gpr = LDAbs 1008
+    %9:gpr = LDAbs 1009
+    %10:gpr = LDAbs 1010
+    %11:gpr = LDAbs 1011
+    %12:gpr = LDAbs 1012
+    JSR &callee, mos_csr
+    STAbs %0, 2000
+    STAbs %1, 2001
+    STAbs %2, 2002
+    STAbs %3, 2003
+    STAbs %4, 2004
+    STAbs %5, 2005
+    STAbs %6, 2006
+    STAbs %7, 2007
+    STAbs %8, 2008
+    STAbs %9, 2009
+    STAbs %10, 2010
+    STAbs %11, 2011
+    STAbs %12, 2012
+    RTS
+...
+
+#--- imag16-overflow.mir
+# Fourteen live bytes could occupy all fourteen pairs. The conservative bound
+# therefore rejects a new Imag16, even though the total byte demand fits.
+# IMAG16-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in imag16_overflow, bb.0 for Imag16: requires 15, 14 available locations
+# IMAG16-OVERFLOW: %14:imag16 = COPY $rs0
+# IMAG16-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
+---
+name: imag16_overflow
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    %2:gpr = LDAbs 1002
+    %3:gpr = LDAbs 1003
+    %4:gpr = LDAbs 1004
+    %5:gpr = LDAbs 1005
+    %6:gpr = LDAbs 1006
+    %7:gpr = LDAbs 1007
+    %8:gpr = LDAbs 1008
+    %9:gpr = LDAbs 1009
+    %10:gpr = LDAbs 1010
+    %11:gpr = LDAbs 1011
+    %12:gpr = LDAbs 1012
+    %13:gpr = LDAbs 1013
+    %14:imag16 = COPY $rs0
+    STAbs %0, 2000
+    STAbs %1, 2001
+    STAbs %2, 2002
+    STAbs %3, 2003
+    STAbs %4, 2004
+    STAbs %5, 2005
+    STAbs %6, 2006
+    STAbs %7, 2007
+    STAbs %8, 2008
+    STAbs %9, 2009
+    STAbs %10, 2010
+    STAbs %11, 2011
+    STAbs %12, 2012
+    STAbs %13, 2013
+    $rs1 = COPY %14
     RTS
 ...
