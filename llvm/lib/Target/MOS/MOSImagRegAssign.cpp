@@ -21,7 +21,7 @@
 /// 3.2. Global locations respect interference; temporary local locations
 /// satisfy instruction constraints. Parallel copies restore global locations at
 /// block boundaries, and fresh SSA names represent every change of location.
-/// Physical definitions establish fixed-location constraints lasting through
+/// Physical definitions establish register constraints lasting through
 /// their physical live ranges. A COPY to a physical imaginary register records
 /// the source value there; its virtual source need not be assigned to that
 /// location. Physical liveness protects the location even after the virtual
@@ -50,9 +50,10 @@
 /// instruction.
 ///
 /// This implementation handles Imag8 and Imag16 registers, with Imag8
-/// registers for flags. Local repairing handles fixed physical locations and
-/// whole-register ties. It omits optimized restore placement, does not move
-/// repairs across terminators, and diagnoses repairs requiring extra spills.
+/// registers for flags. Local repairing handles physical register constraints
+/// and whole-register ties. It omits optimized restore placement. Global
+/// assignments avoid physical imaginary register constraints at restoration
+/// points, so repairs stay inside blocks.
 ///
 //===----------------------------------------------------------------------===//
 
@@ -60,7 +61,8 @@
 #include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
 #include "MOSImagRegAllocUtils.h"
-#include "MOSRegisterContents.h"
+#include "MOSInstructionInterferenceGraph.h"
+#include "MOSLiveRegisters.h"
 #include "MOSRegisterInfo.h"
 #include "MOSSubtarget.h"
 #include "MOSValueNumbering.h"
@@ -70,7 +72,6 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SparseBitVector.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
-#include "llvm/CodeGen/LiveRegUnits.h"
 #include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -84,8 +85,6 @@
 #include "llvm/CodeGen/VirtRegMap.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Support/ErrorHandling.h"
-
-#include <optional>
 
 #define DEBUG_TYPE "mos-imag-regassign"
 
@@ -107,83 +106,6 @@ struct Copy {
   Register Use;
 };
 
-// Live assignments and the contents they must preserve. Virtual ranges have
-// concrete imaginary locations in VRM; physical ranges retain their explicit
-// locations. Placement queries account for both and permit equal values to
-// share.
-class LiveRegisters {
-public:
-  using ValueNumber = MOSValueNumbering::ValueNumber;
-
-  void init(const MachineFunction &MF, const MOSValueNumbering &ValueNumbers,
-            const VirtRegMap &VRM) {
-    MRI = &MF.getRegInfo();
-    TRI = MF.getSubtarget().getRegisterInfo();
-    this->ValueNumbers = &ValueNumbers;
-    this->VRM = &VRM;
-    PhysRegs.init(*TRI);
-    PhysContents.emplace(*TRI, ValueNumbers);
-    clear();
-  }
-
-  // The caller has chosen and recorded this virtual range's assignment in VRM.
-  void insert(Register R) {
-    assert(R.isVirtual() && VRM->hasPhys(R));
-    LiveVirtRegs.set(R);
-  }
-  void erase(Register R);
-  void clear() {
-    LiveVirtRegs.clear();
-    PhysRegs.clear();
-    PhysContents->clear();
-  }
-
-  // Physical lifetimes are block-local. Keep the virtual live-ins inherited
-  // from the dominance walk and initialize this block's physical registers.
-  void beginBlock(const MachineBasicBlock &MBB);
-  void definePhysical(const MachineOperand &Def);
-  // A COPY from a physical register can identify its previously unknown value
-  // through the virtual result, without starting another physical lifetime.
-  void recordPhysicalValue(MCPhysReg R, ValueNumber Value);
-  void releaseKilledUses(const MachineInstr &MI);
-  void clobber(const MachineOperand &RegMask);
-  void releaseDeadDefs(const MachineInstr &MI);
-
-  // Compare two placements independently of liveness and reservations.
-  // Overlapping bytes must hold equal values; undef imposes no requirement,
-  // and unknown contents cannot establish compatibility.
-  bool haveCompatibleContents(MCPhysReg Reg, ValueNumber Value,
-                              MCPhysReg OtherReg, ValueNumber OtherValue) const;
-
-  // Writing Value must preserve all surviving virtual and physical contents.
-  bool canPlace(MCPhysReg Phys, ValueNumber Value) const;
-  // Input is a dying virtual range; its location may hold the new value once
-  // all other surviving contents have been accounted for.
-  bool canReuse(Register Input, ValueNumber Value) const;
-  // Check one register's contents, including overlapping byte identities.
-  // Existing undef bytes impose no preservation requirement. Reservation
-  // conflicts at future boundaries are handled by global assignment instead.
-  bool preservesValue(Register R, MCPhysReg Phys, ValueNumber Value) const;
-  // Parallel restoration moves virtual ranges together; only physical
-  // lifetimes must retain their existing locations throughout that shuffle.
-  bool preservesPhysicalValues(MCPhysReg Phys, ValueNumber Value) const;
-  // Snapshot for repair copies inserted before the current instruction.
-  LiveRegUnits physicalUnits() const;
-
-  // Only virtual ranges cross block boundaries; physical lifetimes stay local.
-  const SparseBitVector<> &liveVirtRegs() const { return LiveVirtRegs; }
-  void inherit(const SparseBitVector<> &LiveOuts) { LiveVirtRegs = LiveOuts; }
-
-private:
-  const MachineRegisterInfo *MRI = nullptr;
-  const TargetRegisterInfo *TRI = nullptr;
-  const MOSValueNumbering *ValueNumbers = nullptr;
-  const VirtRegMap *VRM = nullptr;
-  SparseBitVector<> LiveVirtRegs;
-  LivePhysRegs PhysRegs;
-  std::optional<MOSRegisterContents> PhysContents;
-};
-
 class MOSImagRegAssign : public MachineFunctionPass {
 public:
   using ValueNumber = MOSValueNumbering::ValueNumber;
@@ -201,22 +123,26 @@ private:
   void assignMBB(MachineBasicBlock &MBB);
   void assignMI(MachineInstr &MI);
 
-  void assignUses(MachineInstr &MI);
-  void assignDefs(MachineInstr &MI, bool Early);
-  void releaseInputsAndClobbers(MachineInstr &MI);
-
-  MCPhysReg chooseGlobalRegister(const MachineInstr &MI, Register R) const;
-  // Check Candidate against existing global assignments, including their
-  // reservation regions. Current local placements are checked separately.
-  bool isGlobalAssignmentAvailable(Register Def, MCPhysReg Candidate) const;
-  MCPhysReg chooseRepairRegister(const MachineInstr &MI, Register R) const;
-  MCPhysReg chooseResultRegister(const MachineInstr &MI, Register R) const;
-  void assignDefinition(Register R, MCPhysReg Local, MCPhysReg Global);
-
-  void displace(MachineInstr &MI, MCPhysReg Phys, ValueNumber Value = {},
-                bool BeforeUses = false);
-  Register moveBeforeInstruction(MachineInstr &MI, Register R, MCPhysReg Phys,
-                                 bool ReplaceUses);
+  using Assignments = MapVector<Register, MCPhysReg>;
+  MCPhysReg
+  chooseGlobalRegister(const MachineInstr &MI, Register Reg,
+                       const Assignments &Globals,
+                       const MOSInstructionInterferenceGraph &Graph) const;
+  bool isGlobalAssignmentAvailable(const MachineInstr &MI, Register Def,
+                                   MCPhysReg Candidate,
+                                   const Assignments &Globals) const;
+  bool globalAssignmentsConflict(Register Def, MCPhysReg Candidate,
+                                 Register Other, MCPhysReg Assigned) const;
+  bool conflictsAtRestorePoints(Register Reg, MCPhysReg Phys) const;
+  Assignments assignInstruction(const MachineInstr &MI,
+                                const MOSInstructionInterferenceGraph &Graph,
+                                const Assignments &Globals) const;
+  bool assignmentConflicts(const MOSInstructionInterferenceGraph &Graph,
+                           Register Reg, MCPhysReg Phys,
+                           const Assignments &Assigned) const;
+  void repairInstruction(MachineInstr &MI, const Assignments &Locals,
+                         const Assignments &Globals);
+  void assignDefinition(Register Reg, MCPhysReg Local, MCPhysReg Global);
   Register split(Register R, MCPhysReg Phys);
   void insertCopies(MachineBasicBlock &MBB,
                     MachineBasicBlock::iterator InsertPt,
@@ -230,23 +156,11 @@ private:
   void updateLiveness(MachineBasicBlock &MBB);
   bool isLiveOut(Register R, const MachineBasicBlock &MBB) const;
 
-  bool isPhysicalInput(const MachineInstr &MI, MCPhysReg Phys) const;
-  bool isPhysicalOutput(const MachineInstr &MI, MCPhysReg Phys) const;
-  // Reuse the dying input's assignment if writing the tied result preserves
-  // the contents required by other virtual and physical lifetimes.
-  bool canReuseTiedInput(const MachineOperand &Use) const;
-  bool isRepairRegisterAvailable(const MachineInstr &MI, MCPhysReg Phys) const;
-  bool isResultRegisterAvailable(const MachineInstr &MI, MCPhysReg Phys,
-                                 ValueNumber Value) const;
-
-  bool hasImaginaryOption(Register R) const {
-    return TRI->getCommonSubClass(MRI->getRegClass(R),
-                                  TRI->getImagRegClass(R, *MRI));
-  }
   MCPhysReg globalImagReg(Register R) const {
     auto I = Restorations.find(R);
-    return I == Restorations.end() ? MCPhysReg(VRM->getPhys(R))
-                                   : I->second.Phys;
+    return I != Restorations.end() ? I->second.Phys
+           : VRM->hasPhys(R)       ? MCPhysReg(VRM->getPhys(R))
+                                   : MCPhysReg();
   }
   // LiveVariables still describes this unsplit range until block-end repair.
   Register originalRange(Register R) const {
@@ -264,7 +178,8 @@ private:
   const MachineDominatorTree *MDT = nullptr;
 
   MOSValueNumbering *ValueNumbers = nullptr;
-  LiveRegisters LiveRegs;
+  MOSLiveRegisters LiveRegs;
+  DenseMap<Register, BitVector> RestoreExclusions;
 
   // Maps local SSA names to their pending restorations. Records follow local
   // splits and remain until block-end SSA repair, even if the physical
@@ -280,12 +195,6 @@ private:
   // PHIs in these blocks; update their snapshots along with LiveVariables.
   SmallVector<std::pair<const MachineDomTreeNode *, SparseBitVector<>>>
       DomLiveRegs;
-
-  // Physical liveness at instruction entry, captured by assignMI.
-  // Repair copies are emitted before the instruction, even when we discover
-  // the need for one while processing its clobbers or definitions. They must
-  // preserve these incoming values.
-  LiveRegUnits IncomingPhysRegs;
 };
 
 MOSImagRegAssign::MOSImagRegAssign() : MachineFunctionPass(ID) {
@@ -303,8 +212,10 @@ bool MOSImagRegAssign::runOnMachineFunction(MachineFunction &F) {
   LV = &getAnalysis<LiveVariablesWrapperPass>().getLV();
   MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   ValueNumbers = &getAnalysis<MOSValueNumberingWrapperPass>().valueNumbers();
-  LiveRegs.init(F, *ValueNumbers, *VRM);
+  LiveRegs.init(F, *ValueNumbers);
   Changed = recomputeLiveIns(F.front());
+  RestoreExclusions =
+      mos::computeRestoreExclusions(F, *LV, *MDT, *ValueNumbers);
 
   assign();
   return Changed;
@@ -355,9 +266,11 @@ void MOSImagRegAssign::assign() {
     }
 
     assignMBB(MBB);
-    assert(llvm::all_of(LiveRegs.liveVirtRegs(),
-                        [](Register R) { return R.isVirtual(); }) &&
-           "physical register live out of basic block");
+    assert(llvm::none_of(LiveRegs.livePhysRegs(),
+                         [&](MCPhysReg Phys) {
+                           return mos::needsImagReg(Phys, *MF, *ValueNumbers);
+                         }) &&
+           "physical imaginary register live out of basic block");
     DomLiveRegs.emplace_back(Node, LiveRegs.liveVirtRegs());
   }
 }
@@ -390,240 +303,258 @@ void MOSImagRegAssign::assignMBB(MachineBasicBlock &MBB) {
 }
 
 void MOSImagRegAssign::assignMI(MachineInstr &MI) {
-  IncomingPhysRegs = LiveRegs.physicalUnits();
-
-  assignUses(MI);
-  assignDefs(MI, true);
-  releaseInputsAndClobbers(MI);
-  assignDefs(MI, false);
-  LiveRegs.releaseDeadDefs(MI);
-}
-
-void MOSImagRegAssign::assignUses(MachineInstr &MI) {
-  for (MachineOperand &Use : MI.all_uses()) {
-    if (!Use.isTied() || !Use.getReg().isVirtual() || Use.isUndef())
-      continue;
-    const MachineOperand &Def =
-        MI.getOperand(MI.findTiedOperandIdx(Use.getOperandNo()));
-    Register R = Use.getReg(), D = Def.getReg();
-    // Destructive ties need a separate occurrence if either another virtual
-    // copy or a physical constraint still needs the old value.
-    if (!D.isVirtual() || !hasImaginaryOption(R) || !hasImaginaryOption(D))
-      continue;
-    assert(!Use.getSubReg() && !Def.getSubReg() &&
-           "MOSConventionalSSA must extract tied subregister uses");
-    if (canReuseTiedInput(Use))
-      continue;
-
-    MCPhysReg Phys = chooseRepairRegister(MI, R);
-    bool Killed = MI.killsRegister(R, nullptr);
-    Register New = moveBeforeInstruction(MI, R, Phys, false);
-    Use.setReg(New);
-    Use.setIsKill(true);
-    LiveRegs.insert(New);
-    if (Killed) {
-      if (MI.readsVirtualRegister(R))
-        MI.addRegisterKilled(R, nullptr);
-      else
-        LiveRegs.erase(R);
-    }
-  }
-}
-
-void MOSImagRegAssign::assignDefs(MachineInstr &MI, bool Early) {
-  for (MachineOperand &MO : MI.all_defs()) {
-    if (MO.isEarlyClobber() != Early || !MO.getReg().isPhysical())
-      continue;
-    // Implicit alias defs describe the same COPY write, so they preserve the
-    // source value just as the explicit whole-register definition does.
-    if (mos::needsImagReg(MO.getReg(), *MF, *ValueNumbers))
-      displace(MI, MO.getReg(), ValueNumbers->getValueNumber(MO), Early);
-    LiveRegs.definePhysical(MO);
-  }
-  // Fixed destinations are now clear. Assign the paired domain before bytes.
-  for (const TargetRegisterClass *RC :
-       {&MOS::Imag16RegClass, &MOS::Imag8RegClass}) {
-    for (MachineOperand &MO : MI.all_defs()) {
-      Register R = MO.getReg();
-      if (MO.isEarlyClobber() != Early || !R.isVirtual() ||
-          TRI->getImagRegClass(R, *MRI) != RC)
+  MOSInstructionInterferenceGraph Graph(MI, LiveRegs, *ValueNumbers, *RCI);
+  Assignments Globals;
+  // This is the same definition order used by MOSSpill's global bound.
+  for (bool Early : {true, false})
+    for (const MachineOperand &Def : MI.all_defs()) {
+      Register Reg = Def.getReg();
+      if (!Reg.isVirtual() || Def.isEarlyClobber() != Early ||
+          MRI->use_nodbg_empty(Reg) ||
+          !mos::needsImagReg(Reg, *MF, *ValueNumbers))
         continue;
-      const MachineOperand *CopySource =
-          MI.isCopy() && MO.getOperandNo() == 0 ? &MI.getOperand(1) : nullptr;
-      bool CopiesPhysicalReg = CopySource &&
-                               CopySource->getReg().isPhysical() &&
-                               !CopySource->isUndef();
-      // The definition in %v = COPY $phys names the source's unknown contents.
-      // Record that identity before choosing %v's assignment, so it can share
-      // the source location even while the physical constraint remains live.
-      if (CopiesPhysicalReg)
-        LiveRegs.recordPhysicalValue(CopySource->getReg(),
-                                     ValueNumbers->getValueNumber(MO));
-      const MachineOperand *TiedUse =
-          MO.isTied() ? &MI.getOperand(MI.findTiedOperandIdx(MO.getOperandNo()))
-                      : nullptr;
-      bool InheritImagReg = TiedUse && TiedUse->getReg().isVirtual() &&
-                            !TiedUse->isUndef() && hasImaginaryOption(R) &&
-                            hasImaginaryOption(TiedUse->getReg());
-      bool NeedsImagReg = mos::needsImagReg(R, *MF, *ValueNumbers);
-      if (!NeedsImagReg && !InheritImagReg)
-        continue;
-      ValueNumber Value = ValueNumbers->getValueNumber(MO);
-      MCPhysReg Global = !NeedsImagReg     ? MCPhysReg()
-                         : VRM->hasPhys(R) ? MCPhysReg(VRM->getPhys(R))
-                                           : chooseGlobalRegister(MI, R);
-      MCPhysReg Local = Global;
-      if (InheritImagReg)
-        Local = VRM->getPhys(TiedUse->getReg());
-      else if (CopiesPhysicalReg &&
-               mos::needsImagReg(CopySource->getReg(), *MF, *ValueNumbers) &&
-               isResultRegisterAvailable(MI, CopySource->getReg(), Value))
-        // Keep a captured value where it already exists, including when the
-        // physical constraint remains live and holds this same value.
-        Local = CopySource->getReg();
-      else if (!isResultRegisterAvailable(MI, Local, Value))
-        Local = chooseResultRegister(MI, R);
-      assignDefinition(R, Local, Global);
-      LiveRegs.insert(R);
+      Globals[Reg] = VRM->hasPhys(Reg)
+                         ? globalImagReg(Reg)
+                         : chooseGlobalRegister(MI, Reg, Globals, Graph);
     }
+  // CSSA transfers already describe their parallel reads and writes. Their
+  // reserved destinations use global assignments, without another local repair.
+  if (MI.isPHI() || MI.getOpcode() == MOS::PCOPY || MI.isImplicitDef()) {
+    for (auto [Reg, Phys] : Globals)
+      assignDefinition(Reg, Phys, Phys);
+    LiveRegs.stepForward(MI);
+    return;
   }
+  Assignments Locals = assignInstruction(MI, Graph, Globals);
+  repairInstruction(MI, Locals, Globals);
 }
 
-void MOSImagRegAssign::releaseInputsAndClobbers(MachineInstr &MI) {
-  LiveRegs.releaseKilledUses(MI);
-
-  // Inputs are consumed before register-mask clobbers take effect. Preserve
-  // surviving virtual values before releasing the clobbered physical ranges.
-  for (const MachineOperand &MO : MI.operands()) {
-    if (!MO.isRegMask())
-      continue;
-    for (MCPhysReg R : RCI->getOrder(&MOS::Imag8RegClass))
-      if (MO.clobbersPhysReg(R))
-        displace(MI, R);
-    LiveRegs.clobber(MO);
-  }
-
-  // Kills of tied inputs can erase aliases of early results, and explicit
-  // early results survive register masks. Reestablish those new definitions.
-  for (const MachineOperand &MO : MI.all_defs())
-    if (MO.getReg().isPhysical() && MO.isEarlyClobber())
-      LiveRegs.definePhysical(MO);
-}
-
-MCPhysReg MOSImagRegAssign::chooseGlobalRegister(const MachineInstr &MI,
-                                                 Register R) const {
-  Register Root = mos::getImagReservationRoot(R, *MRI);
-  if (Root && Root != R) {
+MCPhysReg MOSImagRegAssign::chooseGlobalRegister(
+    const MachineInstr &MI, Register Reg, const Assignments &Globals,
+    const MOSInstructionInterferenceGraph &Graph) const {
+  Register Root = mos::getImagReservationRoot(Reg, *MRI);
+  if (Root && Root != Reg) {
     assert(globalImagReg(Root) && "reservation must be assigned first");
     return globalImagReg(Root);
   }
-  auto Order = RCI->getOrder(TRI->getImagRegClass(R, *MRI));
-  ValueNumber Value = ValueNumbers->getValueNumber(R);
-  auto Chosen = llvm::find_if(Order, [&](MCPhysReg Candidate) {
-    return isGlobalAssignmentAvailable(R, Candidate) &&
-           (Root == R || isResultRegisterAvailable(MI, Candidate, Value));
-  });
-  if (Chosen == Order.end())
-    Chosen = llvm::find_if(Order, [&](MCPhysReg Candidate) {
-      return isGlobalAssignmentAvailable(R, Candidate);
-    });
-  assert(Chosen != Order.end() &&
-         "pressure check guaranteed an imaginary register");
-  return *Chosen;
+  auto Order = RCI->getOrder(TRI->getImagRegClass(Reg, *MRI));
+  // Prefer a global assignment that is also usable at the definition. The
+  // global colorability guarantee itself is independent of local repairing.
+  if (llvm::is_contained(Graph.regs(), Reg)) {
+    Assignments Existing;
+    for (Register Other : Graph.regs())
+      if (Other != Reg && VRM->hasPhys(Other))
+        Existing[Other] = VRM->getPhys(Other);
+    for (MCPhysReg Phys : Order)
+      if (isGlobalAssignmentAvailable(MI, Reg, Phys, Globals) &&
+          llvm::is_contained(Graph.candidatePhysRegs(Reg), Phys) &&
+          !assignmentConflicts(Graph, Reg, Phys, Existing))
+        return Phys;
+  }
+  for (MCPhysReg Phys : Order)
+    if (isGlobalAssignmentAvailable(MI, Reg, Phys, Globals))
+      return Phys;
+  llvm_unreachable("MOSSpill guaranteed a global imaginary assignment");
 }
 
-bool MOSImagRegAssign::isGlobalAssignmentAvailable(Register Def,
-                                                   MCPhysReg Candidate) const {
-  Register Root = mos::getImagReservationRoot(Def, *MRI);
-  if (Root && Root != Def)
-    return Candidate == globalImagReg(Root);
-  ValueNumber Value = ValueNumbers->getValueNumber(Def);
-  for (Register LiveReg : LiveRegs.liveVirtRegs()) {
-    if (LiveReg == Def)
+bool MOSImagRegAssign::isGlobalAssignmentAvailable(
+    const MachineInstr &MI, Register Def, MCPhysReg Candidate,
+    const Assignments &Globals) const {
+  if (conflictsAtRestorePoints(Def, Candidate))
+    return false;
+  for (Register Other : LiveRegs.liveVirtRegs()) {
+    if (Other == Def || !VRM->hasPhys(Other))
       continue;
-    MCPhysReg Assigned = globalImagReg(LiveReg);
-    if (!Assigned || !TRI->regsOverlap(Candidate, Assigned))
+    if (!MRI->def_begin(Def)->isEarlyClobber() && !MI.isPHI() &&
+        MI.killsRegister(Other, nullptr))
       continue;
-    // Local splits retain the original range's lifetime for future reservation
-    // queries until block-end SSA repair updates LiveVariables.
-    Register Original = originalRange(LiveReg);
-    if (Root == Def) {
-      if (mos::overlapsImagReservation(Root, Original, *MRI, *LV))
-        return false;
-    } else if (Original == mos::getImagReservationRoot(Original, *MRI)) {
-      if (mos::overlapsImagReservation(Original, Def, *MRI, *LV))
-        return false;
-    } else if (!LiveRegs.haveCompatibleContents(
-                   Candidate, Value, Assigned,
-                   ValueNumbers->getValueNumber(LiveReg))) {
+    if (globalAssignmentsConflict(Def, Candidate, originalRange(Other),
+                                  globalImagReg(Other)))
       return false;
-    }
   }
+  for (auto [Other, Phys] : Globals)
+    if (globalAssignmentsConflict(Def, Candidate, Other, Phys))
+      return false;
   return true;
 }
 
-MCPhysReg MOSImagRegAssign::chooseRepairRegister(const MachineInstr &MI,
-                                                 Register R) const {
-  for (MCPhysReg Phys : RCI->getOrder(TRI->getImagRegClass(R, *MRI)))
-    if (isRepairRegisterAvailable(MI, Phys))
-      return Phys;
-  report_fatal_error("MOS imaginary repairing requires spill insertion",
-                     /*gen_crash_diag=*/false);
+bool MOSImagRegAssign::globalAssignmentsConflict(Register Def,
+                                                 MCPhysReg Candidate,
+                                                 Register Other,
+                                                 MCPhysReg Assigned) const {
+  if (!Assigned || !TRI->regsOverlap(Candidate, Assigned))
+    return false;
+  Register Root = mos::getImagReservationRoot(Def, *MRI);
+  if (Root == Def)
+    return mos::overlapsImagReservation(Root, Other, *MRI, *LV);
+  if (Other == mos::getImagReservationRoot(Other, *MRI))
+    return mos::overlapsImagReservation(Other, Def, *MRI, *LV);
+  return !mos::haveCompatibleContents(
+      Candidate, ValueNumbers->getValueNumber(Def), Assigned,
+      ValueNumbers->getValueNumber(Other), *TRI, *ValueNumbers);
 }
 
-MCPhysReg MOSImagRegAssign::chooseResultRegister(const MachineInstr &MI,
-                                                 Register R) const {
-  ValueNumber Value = ValueNumbers->getValueNumber(R);
-  for (MCPhysReg Phys : RCI->getOrder(TRI->getImagRegClass(R, *MRI)))
-    if (isResultRegisterAvailable(MI, Phys, Value))
-      return Phys;
-  report_fatal_error("MOS imaginary repairing requires spill insertion",
-                     /*gen_crash_diag=*/false);
+bool MOSImagRegAssign::conflictsAtRestorePoints(Register Reg,
+                                                MCPhysReg Phys) const {
+  auto I = RestoreExclusions.find(Reg);
+  return I != RestoreExclusions.end() &&
+         llvm::any_of(I->second.set_bits(), [&](unsigned OtherPhys) {
+           return TRI->regsOverlap(Phys, OtherPhys);
+         });
 }
 
-void MOSImagRegAssign::assignDefinition(Register R, MCPhysReg Local,
-                                        MCPhysReg Global) {
-  if (!VRM->hasPhys(R))
-    VRM->assignVirt2Phys(R, Local);
-  else
-    assert(VRM->getPhys(R) == Local && "changed an existing assignment");
-  if (Global && Local != Global)
-    Restorations[R] = {R, Global};
+MOSImagRegAssign::Assignments MOSImagRegAssign::assignInstruction(
+    const MachineInstr &MI, const MOSInstructionInterferenceGraph &Graph,
+    const Assignments &Globals) const {
+  SmallVector<Register> SelectStack;
+  if (Graph.simplify(SelectStack))
+    report_fatal_error(
+        "MOS instruction interference graph requires spill insertion", false);
+  Assignments Assigned;
+  while (!SelectStack.empty()) {
+    Register Reg = SelectStack.pop_back_val();
+    auto Candidates = Graph.candidatePhysRegs(Reg);
+    const MachineInstr *Def = MRI->getVRegDef(Reg);
+    Register Source = Reg;
+    if (Def == &MI) {
+      Source = Register();
+      unsigned UseIdx;
+      if (mos::canUseImagReg(Reg, *MRI) &&
+          MI.isRegTiedToUseOperand(MRI->def_begin(Reg)->getOperandNo(),
+                                   &UseIdx)) {
+        const MachineOperand &Use = MI.getOperand(UseIdx);
+        if (!Use.isUndef() && mos::canUseImagReg(Use.getReg(), *MRI))
+          Source = Use.getReg();
+      }
+    }
+    MCPhysReg Existing = Source && VRM->hasPhys(Source)
+                             ? MCPhysReg(VRM->getPhys(Source))
+                             : MCPhysReg();
+    MCPhysReg Captured =
+        Def->isCopy() && Def->getOperand(1).getReg().isPhysical()
+            ? MCPhysReg(Def->getOperand(1).getReg())
+            : MCPhysReg();
+    MCPhysReg Chosen = 0;
+    // Prefer an existing location, then take the first legal color. Successful
+    // simplification guarantees a color regardless of these preferences.
+    SmallVector<MCPhysReg, 32> Order = {Existing, Captured,
+                                        Globals.lookup(Reg)};
+    llvm::append_range(Order, Candidates);
+    for (MCPhysReg Phys : Order) {
+      if (!Phys || !llvm::is_contained(Candidates, Phys) ||
+          assignmentConflicts(Graph, Reg, Phys, Assigned))
+        continue;
+      Chosen = Phys;
+      break;
+    }
+    assert(Chosen && "graph simplification guaranteed a color");
+    Assigned[Reg] = Chosen;
+  }
+  return Assigned;
 }
 
-void MOSImagRegAssign::displace(MachineInstr &MI, MCPhysReg Phys,
-                                ValueNumber Value, bool BeforeUses) {
-  SmallVector<Register, 2> Occupants;
-  // Preserve incoming values, not results produced by MI itself. In
-  // particular, a regmask does not invalidate a new early-clobber result.
-  for (Register R : LiveRegs.liveVirtRegs())
-    if (MRI->getVRegDef(R) != &MI && !LiveRegs.preservesValue(R, Phys, Value))
-      Occupants.push_back(R);
-  for (Register R : Occupants) {
-    bool Pinned = isPhysicalInput(MI, VRM->getPhys(R));
-    if (Pinned && BeforeUses)
-      report_fatal_error("MOS imaginary constraints overlap a live fixed use",
-                         /*gen_crash_diag=*/false);
-    if (MI.isTerminator() && !MI.killsRegister(R, nullptr))
-      report_fatal_error("MOS imaginary repairing cannot split a live-through "
-                         "value at a terminator",
-                         /*gen_crash_diag=*/false);
-    Register New =
-        moveBeforeInstruction(MI, R, chooseRepairRegister(MI, R), !Pinned);
-    if (Pinned)
-      replaceLocalUses(R, New, std::next(MI.getIterator()));
+bool MOSImagRegAssign::assignmentConflicts(
+    const MOSInstructionInterferenceGraph &Graph, Register Reg, MCPhysReg Phys,
+    const Assignments &Assigned) const {
+  return llvm::any_of(Assigned, [&](const auto &Other) {
+    return Graph.assignmentsConflict(Reg, Phys, Other.first, Other.second);
+  });
+}
+
+void MOSImagRegAssign::repairInstruction(MachineInstr &MI,
+                                         const Assignments &Locals,
+                                         const Assignments &Globals) {
+  SmallVector<Copy> Copies;
+  SmallVector<Copy> MovedRegs;
+  SmallVector<std::pair<unsigned, Register>> TiedUses;
+  SmallVector<Register> KilledRegs;
+  SparseBitVector<> Survivors;
+  // PHIs are handled separately. For an ordinary SSA instruction, an incoming
+  // register survives precisely when the instruction does not kill it.
+  for (Register Reg : LiveRegs.liveVirtRegs()) {
+    if (!MI.killsRegister(Reg, /*TRI=*/nullptr))
+      Survivors.set(Reg);
+    else
+      KilledRegs.push_back(Reg);
+  }
+
+  // Determine the complete parallel shuffle while the instruction and incoming
+  // state are unchanged. Sources continue to name their original locations,
+  // including when two occupied registers exchange values.
+  for (auto [Reg, Phys] : Locals) {
+    if (MRI->getVRegDef(Reg) == &MI || VRM->getPhys(Reg) == Phys)
+      continue;
+    Register New = split(Reg, Phys);
+    Copies.push_back({New, Reg});
+    MovedRegs.push_back({New, Reg});
+    if (Survivors.test(Reg)) {
+      Survivors.reset(Reg);
+      Survivors.set(New);
+    }
+  }
+  for (auto [Reg, Phys] : Locals) {
+    if (MRI->getVRegDef(Reg) != &MI)
+      continue;
+    const MachineOperand &Def = *MRI->def_begin(Reg);
+    unsigned UseIdx;
+    if (!mos::canUseImagReg(Reg, *MRI) ||
+        !MI.isRegTiedToUseOperand(Def.getOperandNo(), &UseIdx))
+      continue;
+    const MachineOperand &Use = MI.getOperand(UseIdx);
+    if (Use.isUndef() || !mos::canUseImagReg(Use.getReg(), *MRI))
+      continue;
+    assert(!Def.getSubReg() && !Use.getSubReg() &&
+           "CSSA must extract tied subregister uses");
+    Register Input = Use.getReg();
+    Register Chosen;
+    for (const Copy &Copy : MovedRegs)
+      if (Copy.Use == Input && VRM->getPhys(Copy.Def) == Phys)
+        Chosen = Copy.Def;
+    if (!Chosen && VRM->hasPhys(Input) && VRM->getPhys(Input) == Phys)
+      Chosen = Input;
+    if (!Chosen) {
+      Chosen = split(Input, Phys);
+      Copies.push_back({Chosen, Input});
+    }
+    TiedUses.emplace_back(UseIdx, Chosen);
+  }
+  // All constraint queries are complete before any MIR or live-set mutation.
+  for (const MachineOperand &Def : MI.all_defs()) {
+    Register Reg = Def.getReg();
+    if (!Reg.isVirtual())
+      continue;
+    MCPhysReg Global = Globals.lookup(Reg);
+    MCPhysReg Local = Locals.lookup(Reg);
+    if (Global || Local)
+      assignDefinition(Reg, Local ? Local : Global, Global);
+  }
+  insertCopies(*MI.getParent(), MI.getIterator(), Copies);
+  for (const Copy &Copy : MovedRegs)
+    replaceLocalUses(Copy.Use, Copy.Def, MI.getIterator());
+  for (auto [Operand, Input] : TiedUses) {
+    MachineOperand &Use = MI.getOperand(Operand);
+    Use.setReg(Input);
+    Use.setIsKill(!Survivors.test(Input));
+  }
+  LiveRegs.stepForward(MI);
+  // Splitting a dying tied input can move its last use into the preceding
+  // PCOPY. Its original kill flag is consequently no longer on MI.
+  for (Register Reg : KilledRegs) {
+    LiveRegs.erase(Reg);
+    for (const Copy &Copy : MovedRegs)
+      if (Copy.Use == Reg)
+        LiveRegs.erase(Copy.Def);
   }
 }
 
-Register MOSImagRegAssign::moveBeforeInstruction(MachineInstr &MI, Register R,
-                                                 MCPhysReg Phys,
-                                                 bool ReplaceUses) {
-  Register New = split(R, Phys);
-  Copy C{New, R};
-  insertCopies(*MI.getParent(), MI.getIterator(), C);
-  if (ReplaceUses)
-    replaceLocalUses(R, New, MI.getIterator());
-  return New;
+void MOSImagRegAssign::assignDefinition(Register Reg, MCPhysReg Local,
+                                        MCPhysReg Global) {
+  if (!VRM->hasPhys(Reg))
+    VRM->assignVirt2Phys(Reg, Local);
+  else
+    assert(VRM->getPhys(Reg) == Local && "changed an existing assignment");
+  if (Global && Local != Global)
+    Restorations[Reg] = {Reg, Global};
 }
 
 Register MOSImagRegAssign::split(Register R, MCPhysReg Phys) {
@@ -675,13 +606,14 @@ void MOSImagRegAssign::restoreRegisters(MachineBasicBlock &MBB,
   SmallVector<Copy> Copies;
   for (Register R : LiveRegs.liveVirtRegs()) {
     MCPhysReg Phys = globalImagReg(R);
-    if (VRM->getPhys(R) == Phys)
+    if (!Phys || VRM->getPhys(R) == Phys)
       continue;
-    if (!LiveRegs.preservesPhysicalValues(Phys,
-                                          ValueNumbers->getValueNumber(R)))
-      report_fatal_error("MOS imaginary repairing cannot restore an imaginary "
-                         "register across a fixed physical lifetime",
-                         /*gen_crash_diag=*/false);
+    for (MCPhysReg OtherPhys : MOS::Imag8RegClass)
+      assert((LiveRegs.livePhysRegs().available(*MRI, OtherPhys) ||
+              mos::haveCompatibleContents(
+                  Phys, ValueNumbers->getValueNumber(R), OtherPhys,
+                  LiveRegs.contents(OtherPhys), *TRI, *ValueNumbers)) &&
+             "global assignment conflicts at its restoration point");
     Copies.push_back({split(R, Phys), R});
   }
   insertCopies(MBB, InsertPt, Copies);
@@ -727,7 +659,7 @@ void MOSImagRegAssign::updateLiveness(MachineBasicBlock &MBB) {
     LV->recomputeForSingleDefVirtReg(R);
   for (Register R : ChangedRegs) {
     LiveRegs.erase(R);
-    if (VRM->hasPhys(R) && isLiveOut(R, MBB))
+    if (isLiveOut(R, MBB))
       LiveRegs.insert(R);
     for (auto &[Node, Regs] : DomLiveRegs) {
       Regs.reset(R);
@@ -751,202 +683,6 @@ bool MOSImagRegAssign::isLiveOut(Register R,
         return MI.isPHI() &&
                MI.getOperand(MO.getOperandNo() + 1).getMBB() == &MBB;
       });
-}
-
-bool MOSImagRegAssign::isPhysicalInput(const MachineInstr &MI,
-                                       MCPhysReg Phys) const {
-  return llvm::any_of(MI.all_uses(), [&](const MachineOperand &MO) {
-    return MO.getReg().isPhysical() && MO.readsReg() &&
-           TRI->regsOverlap(Phys, MO.getReg());
-  });
-}
-
-bool MOSImagRegAssign::isPhysicalOutput(const MachineInstr &MI,
-                                        MCPhysReg Phys) const {
-  return llvm::any_of(MI.all_defs(), [&](const MachineOperand &MO) {
-    return MO.getReg().isPhysical() && TRI->regsOverlap(Phys, MO.getReg());
-  });
-}
-
-bool MOSImagRegAssign::canReuseTiedInput(const MachineOperand &Use) const {
-  Register Input = Use.getReg();
-  // Rematerializable inputs may have no imaginary assignment to reuse. Repair
-  // gives the tied occurrence an assigned temporary; hardware allocation can
-  // rematerialize the input there.
-  if (!Use.isKill() || !VRM->hasPhys(Input))
-    return false;
-  const MachineInstr &MI = *Use.getParent();
-  ValueNumber Value = ValueNumbers->getValueNumber(
-      MI.getOperand(MI.findTiedOperandIdx(Use.getOperandNo())));
-  MCPhysReg Phys = VRM->getPhys(Input);
-  return !isPhysicalOutput(MI, Phys) && LiveRegs.canReuse(Input, Value);
-}
-
-bool MOSImagRegAssign::isRepairRegisterAvailable(const MachineInstr &MI,
-                                                 MCPhysReg Phys) const {
-  if (!IncomingPhysRegs.available(Phys) || isPhysicalInput(MI, Phys) ||
-      isPhysicalOutput(MI, Phys))
-    return false;
-  if (!LiveRegs.canPlace(Phys, {}))
-    return false;
-  for (const MachineOperand &MO : MI.operands()) {
-    if (MO.isRegMask() && MO.clobbersPhysReg(Phys))
-      return false;
-    // Inputs already removed from LiveRegs must still survive repair copies
-    // placed before this instruction, including inputs to tied definitions.
-    if (MO.isReg() && MO.isUse() && MO.readsReg() && MO.getReg().isVirtual() &&
-        VRM->hasPhys(MO.getReg()) &&
-        TRI->regsOverlap(Phys, VRM->getPhys(MO.getReg())))
-      return false;
-  }
-  return true;
-}
-
-bool MOSImagRegAssign::isResultRegisterAvailable(const MachineInstr &MI,
-                                                 MCPhysReg Phys,
-                                                 ValueNumber Value) const {
-  // Account for fixed outputs not yet visited, including ordinary physical
-  // definitions when choosing an early-clobber result's location.
-  return !isPhysicalOutput(MI, Phys) && LiveRegs.canPlace(Phys, Value);
-}
-
-void LiveRegisters::erase(Register R) {
-  if (R.isPhysical()) {
-    PhysRegs.removeReg(R);
-    PhysContents->clobber(R);
-  } else {
-    LiveVirtRegs.reset(R);
-  }
-}
-
-void LiveRegisters::beginBlock(const MachineBasicBlock &MBB) {
-  PhysRegs.clear();
-  PhysContents->clear();
-  if (MBB.isEntryBlock())
-    PhysRegs.addLiveInsNoPristines(MBB);
-}
-
-void LiveRegisters::definePhysical(const MachineOperand &Def) {
-  MCPhysReg R = Def.getReg();
-  PhysRegs.removeReg(R);
-  PhysRegs.addReg(R);
-  PhysContents->define(R, ValueNumbers->getValueNumber(Def));
-}
-
-void LiveRegisters::recordPhysicalValue(MCPhysReg R, ValueNumber Value) {
-  if (!PhysContents->read(R))
-    PhysContents->define(R, Value);
-}
-
-void LiveRegisters::releaseKilledUses(const MachineInstr &MI) {
-  // LiveVariables accounts for PHI edge uses in its kill flags.
-  if (MI.isPHI())
-    return;
-  for (const MachineOperand &MO : MI.all_uses())
-    if (MO.isKill())
-      erase(MO.getReg());
-}
-
-void LiveRegisters::clobber(const MachineOperand &RegMask) {
-  PhysRegs.removeRegsInMask(RegMask);
-  PhysContents->clobber(RegMask.getRegMask());
-}
-
-void LiveRegisters::releaseDeadDefs(const MachineInstr &MI) {
-  for (const MachineOperand &MO : MI.all_defs()) {
-    if (!MO.isDead())
-      continue;
-    if (MO.getReg().isPhysical())
-      PhysRegs.removeReg(MO.getReg());
-    else
-      erase(MO.getReg());
-  }
-  // LiveVariables can mark a whole result dead and describe its surviving
-  // bytes with implicit defs. Keep both their lifetimes and known contents.
-  for (const MachineOperand &MO : MI.all_defs())
-    if (MO.getReg().isPhysical() && !MO.isDead())
-      PhysRegs.addReg(MO.getReg());
-  PhysContents->forgetIf(
-      [&](MCPhysReg R, ValueNumber) { return PhysRegs.available(*MRI, R); });
-}
-
-bool LiveRegisters::haveCompatibleContents(MCPhysReg Reg, ValueNumber Value,
-                                           MCPhysReg OtherReg,
-                                           ValueNumber OtherValue) const {
-  if (!TRI->regsOverlap(Reg, OtherReg))
-    return true;
-  for (unsigned SubReg : ValueNumbers->subRegIndices(Reg)) {
-    MCPhysReg Part = Reg;
-    if (SubReg)
-      Part = TRI->getSubReg(Reg, SubReg);
-    auto PartValue = ValueNumbers->getSubValue(Value, SubReg);
-    for (unsigned OtherSubReg : ValueNumbers->subRegIndices(OtherReg)) {
-      MCPhysReg OtherPart = OtherReg;
-      if (OtherSubReg)
-        OtherPart = TRI->getSubReg(OtherReg, OtherSubReg);
-      if (!TRI->regsOverlap(Part, OtherPart))
-        continue;
-      auto OtherPartValue = ValueNumbers->getSubValue(OtherValue, OtherSubReg);
-      if (PartValue.isUndef() || OtherPartValue.isUndef())
-        continue;
-      // Distinct overlapping subregister views may require a projection not
-      // represented by value numbering (for example, a byte and its LSB).
-      if (Part != OtherPart || !PartValue || PartValue != OtherPartValue)
-        return false;
-    }
-  }
-  return true;
-}
-
-bool LiveRegisters::canPlace(MCPhysReg Phys, ValueNumber Value) const {
-  return preservesPhysicalValues(Phys, Value) &&
-         llvm::all_of(LiveVirtRegs, [&](Register R) {
-           return preservesValue(R, Phys, Value);
-         });
-}
-
-bool LiveRegisters::canReuse(Register Input, ValueNumber Value) const {
-  MCPhysReg Phys = VRM->getPhys(Input);
-  return preservesPhysicalValues(Phys, Value) &&
-         llvm::all_of(LiveVirtRegs, [&](Register R) {
-           return R == Input || preservesValue(R, Phys, Value);
-         });
-}
-
-bool LiveRegisters::preservesValue(Register R, MCPhysReg Phys,
-                                   ValueNumber Value) const {
-  if (R.isVirtual())
-    return haveCompatibleContents(Phys, Value, VRM->getPhys(R),
-                                  ValueNumbers->getValueNumber(R));
-  // A physical pair may have known byte contents without a whole-value name.
-  for (unsigned SubReg : ValueNumbers->subRegIndices(R)) {
-    MCPhysReg Part = R;
-    if (SubReg)
-      Part = TRI->getSubReg(R, SubReg);
-    if (!haveCompatibleContents(Phys, Value, Part, PhysContents->read(Part)))
-      return false;
-  }
-  return true;
-}
-
-bool LiveRegisters::preservesPhysicalValues(MCPhysReg Phys,
-                                            ValueNumber Value) const {
-  return llvm::all_of(PhysRegs, [&](MCPhysReg R) {
-    // LivePhysRegs includes every subregister, including the Imag8 LSB aliases.
-    // The live super-register already accounts for their contents; their bit
-    // projections need not have separate value numbers.
-    if (llvm::any_of(TRI->superregs(R),
-                     [&](MCPhysReg Super) { return PhysRegs.contains(Super); }))
-      return true;
-    return preservesValue(R, Phys, Value);
-  });
-}
-
-LiveRegUnits LiveRegisters::physicalUnits() const {
-  LiveRegUnits Units(*TRI);
-  for (MCPhysReg R : PhysRegs)
-    Units.addReg(R);
-  return Units;
 }
 
 } // namespace

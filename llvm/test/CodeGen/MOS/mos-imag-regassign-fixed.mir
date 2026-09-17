@@ -180,9 +180,8 @@ body: |
     ; CHECK-LABEL: name: swap_arguments
     ; CHECK: [[LDAbs:%[0-9]+]]:gpr = LDAbs 1000
     ; CHECK-NEXT: [[LDAbs1:%[0-9]+]]:gpr = LDAbs 1001
-    ; CHECK-NEXT: [[PCOPY:%[0-9]+]]:gpr = PCOPY killed [[LDAbs]]
-    ; CHECK-NEXT: $rc2 = COPY [[LDAbs1]]
-    ; CHECK-NEXT: [[PCOPY1:%[0-9]+]]:gpr = PCOPY killed [[LDAbs1]]
+    ; CHECK-NEXT: [[PCOPY:%[0-9]+]]:gpr, [[PCOPY1:%[0-9]+]]:gpr = PCOPY killed [[LDAbs]], killed [[LDAbs1]]
+    ; CHECK-NEXT: $rc2 = COPY [[PCOPY1]]
     ; CHECK-NEXT: $rc3 = COPY [[PCOPY]]
     ; CHECK-NEXT: JSR &callee, implicit killed $rc2, implicit killed $rc3
     ; CHECK-NEXT: STAbs killed [[PCOPY]], 2000
@@ -190,13 +189,13 @@ body: |
     ; CHECK-NEXT: RTS
     ;
     ; HW-LABEL: name: swap_arguments
-    ; HW: $x = LDAbs 1000
-    ; HW-NEXT: $y = LDAbs 1001
-    ; HW-NEXT: $rc2 = STImag8 $y
-    ; HW-NEXT: $rc3 = STImag8 $x
+    ; HW: $a = LDAbs 1000
+    ; HW-NEXT: $x = LDAbs 1001
+    ; HW-NEXT: $rc2 = STImag8 $x
+    ; HW-NEXT: $rc3 = STImag8 $a
     ; HW-NEXT: JSR &callee, implicit killed $rc2, implicit killed $rc3
-    ; HW-NEXT: STAbs killed $x, 2000
-    ; HW-NEXT: STAbs killed $y, 2001
+    ; HW-NEXT: STAbs killed $a, 2000
+    ; HW-NEXT: STAbs killed $x, 2001
     ; HW-NEXT: RTS
     %0:gpr = LDAbs 1000
     %1:gpr = LDAbs 1001
@@ -467,8 +466,7 @@ body: |
     ; CHECK: [[COPY:%[0-9]+]]:imag16 = COPY $rs0
     ; CHECK-NEXT: dead $rs1 = COPY [[COPY]], implicit-def $rc3
     ; CHECK-NEXT: [[COPY1:%[0-9]+]]:imag16 = COPY [[COPY]]
-    ; CHECK-NEXT: [[PCOPY:%[0-9]+]]:imag16 = PCOPY killed [[COPY]]
-    ; CHECK-NEXT: [[PCOPY1:%[0-9]+]]:imag16 = PCOPY killed [[COPY1]]
+    ; CHECK-NEXT: [[PCOPY:%[0-9]+]]:imag16, [[PCOPY1:%[0-9]+]]:imag16 = PCOPY killed [[COPY]], killed [[COPY1]]
     ; CHECK-NEXT: JSR &overwrite_low, implicit-def $rc2
     ; CHECK-NEXT: [[COPY2:%[0-9]+]]:imag16 = COPY [[PCOPY]]
     ; CHECK-NEXT: JSR &callee, implicit killed $rc2, implicit killed $rc3

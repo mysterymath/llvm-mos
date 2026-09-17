@@ -157,7 +157,7 @@ struct ProgramPoint {
   // Virtual register indices, including PHI edge uses.
   SparseBitVector<> LiveRegs;
   // Physical registers; Imag16s use their Imag8s.
-  BitVector FixedRegs;
+  BitVector PhysRegs;
   AllocationTable Allocations;
 };
 
@@ -248,7 +248,7 @@ private:
                      const SparseBitVector<> &LiveRegs) const;
   bool isLiveValue(ValueNumber V, const SparseBitVector<> &LiveRegs) const;
   SparseBitVector<> liveOuts(MachineBasicBlock &MBB) const;
-  BitVector fixedRegisters(const LivePhysRegs &LiveRegs) const;
+  BitVector physRegs(const LivePhysRegs &LiveRegs) const;
 
   [[noreturn]] void fail(const Twine &Reason,
                          const MachineInstr *MI = nullptr) const;
@@ -422,7 +422,7 @@ void FunctionAllocator::analyzeLiveness() {
     Phys.addLiveOutsNoPristines(MBB);
     for (ProgramPoint &Point : reverse(Points)) {
       Point.LiveRegs = LiveRegs;
-      Point.FixedRegs = fixedRegisters(Phys);
+      Point.PhysRegs = physRegs(Phys);
       if (!Point.MI)
         continue;
       MachineInstr &MI = *Point.MI;
@@ -514,7 +514,7 @@ void FunctionAllocator::BlockSearch::initialize() {
   ProgramPoint &Entry = Block.Points.front();
   RegisterContents Registers(Allocator.TRI, Allocator.ValueNumbers);
   Allocator.forEachImagReg(Entry.LiveRegs, [&](MCPhysReg R, ValueNumber V) {
-    if (Entry.FixedRegs[R])
+    if (Entry.PhysRegs[R])
       Allocator.fail("pinned physical live-in overlaps an imaginary register");
     assert((!Registers.read(R) || Registers.read(R) == V) &&
            "imaginary assignments interfere");
@@ -562,9 +562,9 @@ void FunctionAllocator::BlockSearch::advance(const ProgramPoint &Before,
 bool FunctionAllocator::BlockSearch::restoreLiveOuts(
     Implementation &Plan, const ProgramPoint &Before) {
   return Allocator.restoreImagRegs(Plan, Block.Points.back().LiveRegs,
-                                   Before.LiveRegs, Before.FixedRegs) &&
+                                   Before.LiveRegs, Before.PhysRegs) &&
          Allocator.materializeUnheldValues(Plan, Before.LiveRegs,
-                                           Before.FixedRegs, true);
+                                           Before.PhysRegs, true);
 }
 
 FunctionAllocator::InstructionSearch::InstructionSearch(
@@ -617,7 +617,7 @@ void FunctionAllocator::InstructionSearch::define(
 }
 
 void FunctionAllocator::InstructionSearch::finish(Implementation Plan) {
-  if (Allocator.materializeUnheldValues(Plan, After.LiveRegs, After.FixedRegs,
+  if (Allocator.materializeUnheldValues(Plan, After.LiveRegs, After.PhysRegs,
                                         !MI.isTerminator()))
     Accept(std::move(Plan));
 }
@@ -656,7 +656,7 @@ void FunctionAllocator::OperandChoices::buildDomain(unsigned I) {
   if (MO.getSubReg())
     Allocator.fail("subregister operands are not implemented", &MI);
   Domains[I] = Allocator.destinations(R);
-  // A fixed hardware input may also be the destination of a capture. Imaginary
+  // A physical input may also be the destination of a capture. Imaginary
   // inputs use the destination's assigned imaginary register.
   if (MI.isCopy() && MI.getOperand(1).getReg().isPhysical() &&
       llvm::is_contained(HardwareRegs, MI.getOperand(1).getReg()) &&
@@ -730,9 +730,8 @@ bool FunctionAllocator::OperandChoices::isLegal(unsigned I, MCPhysReg R) const {
     if (MO.isUndef() || Other.isUndef())
       continue;
     if (MO.isUse() && Other.isUse() &&
-        (R != OtherReg ||
-         Allocator.ValueNumbers.getValueNumber(MO) !=
-             Allocator.ValueNumbers.getValueNumber(Other)))
+        (R != OtherReg || Allocator.ValueNumbers.getValueNumber(MO) !=
+                              Allocator.ValueNumbers.getValueNumber(Other)))
       return false;
   }
   return true;
@@ -756,7 +755,7 @@ FunctionAllocator::InstructionPlacement::InstructionPlacement(
     const ProgramPoint &After, Implementation &Plan,
     ArrayRef<MCPhysReg> Operands)
     : Allocator(Allocator), MI(*After.MI), Plan(Plan), Operands(Operands),
-      Before(Before), After(After), Locked(Before.FixedRegs) {}
+      Before(Before), After(After), Locked(Before.PhysRegs) {}
 
 bool FunctionAllocator::InstructionPlacement::prepareInputs() {
   // COPY and REG_SEQUENCE are realized after their destination is selected.
@@ -860,8 +859,8 @@ bool FunctionAllocator::InstructionPlacement::define(const MachineOperand &MO) {
                            .getReg()
                            .isPhysical();
     for (MCPhysReg Reg : Parts)
-      if (After.FixedRegs[Reg] ||
-          (MO.isEarlyClobber() && Before.FixedRegs[Reg] && !TiedPhysicalUse))
+      if (After.PhysRegs[Reg] ||
+          (MO.isEarlyClobber() && Before.PhysRegs[Reg] && !TiedPhysicalUse))
         return false;
   }
   Plan.Registers.define(Phys, Allocator.ValueNumbers.getValueNumber(MO));
@@ -878,7 +877,7 @@ bool FunctionAllocator::InstructionPlacement::planCopy() {
     if (Src.size() != Dst.size() || !D.isVirtual())
       return false;
     // Capture the existing physical bits without emitting a transfer when the
-    // chosen destination is the source. The fixed live range protects them.
+    // chosen destination is the source. The physical live range protects them.
     for (auto [SubReg, Reg] :
          llvm::zip_equal(Allocator.ValueNumbers.subRegIndices(D), Src)) {
       ValueNumber V = Allocator.ValueNumbers.getValueNumber(D, SubReg);
@@ -1404,16 +1403,15 @@ SparseBitVector<> FunctionAllocator::liveOuts(MachineBasicBlock &MBB) const {
   return LiveRegs;
 }
 
-BitVector
-FunctionAllocator::fixedRegisters(const LivePhysRegs &LiveRegs) const {
+BitVector FunctionAllocator::physRegs(const LivePhysRegs &LiveRegs) const {
   // Compare/branch pseudos keep N/Z internal until late optimization.
   assert(!LiveRegs.contains(MOS::N) && !LiveRegs.contains(MOS::Z) &&
          "N/Z must not be live during MOS register allocation");
-  BitVector FixedRegs(MOS::NUM_TARGET_REGS);
+  BitVector PhysRegs(MOS::NUM_TARGET_REGS);
   for (MCPhysReg R : LiveRegs)
     for (MCPhysReg Part : registerParts(R))
-      FixedRegs.set(Part);
-  return FixedRegs;
+      PhysRegs.set(Part);
+  return PhysRegs;
 }
 
 void FunctionAllocator::fail(const Twine &Reason,

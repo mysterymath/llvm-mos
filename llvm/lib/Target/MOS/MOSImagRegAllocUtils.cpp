@@ -13,9 +13,13 @@
 
 #include "MOSImagRegAllocUtils.h"
 #include "MCTargetDesc/MOSMCTargetDesc.h"
+#include "MOSLiveRegisters.h"
 #include "MOSRegisterInfo.h"
+#include "MOSSubtarget.h"
 #include "MOSValueNumbering.h"
+#include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/CodeGen/LiveVariables.h"
+#include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/TargetInstrInfo.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
@@ -23,8 +27,134 @@
 
 using namespace llvm;
 
+using ValueNumber = MOSValueNumbering::ValueNumber;
+
+bool mos::haveCompatibleContents(MCPhysReg Reg, ValueNumber Value,
+                                 MCPhysReg OtherReg, ValueNumber OtherValue,
+                                 const TargetRegisterInfo &TRI,
+                                 const MOSValueNumbering &ValueNumbers) {
+  if (!TRI.regsOverlap(Reg, OtherReg))
+    return true;
+  for (unsigned SubReg : ValueNumbers.subRegIndices(Reg)) {
+    MCPhysReg Part = Reg;
+    if (SubReg)
+      Part = TRI.getSubReg(Reg, SubReg);
+    auto PartValue = ValueNumbers.getSubValue(Value, SubReg);
+    for (unsigned OtherSubReg : ValueNumbers.subRegIndices(OtherReg)) {
+      MCPhysReg OtherPart = OtherReg;
+      if (OtherSubReg)
+        OtherPart = TRI.getSubReg(OtherReg, OtherSubReg);
+      if (!TRI.regsOverlap(Part, OtherPart))
+        continue;
+      auto OtherPartValue = ValueNumbers.getSubValue(OtherValue, OtherSubReg);
+      if (PartValue.isUndef() || OtherPartValue.isUndef())
+        continue;
+      // Distinct overlapping subregister views may require a projection not
+      // represented by value numbering (for example, a byte and its LSB).
+      if (Part != OtherPart || !PartValue || PartValue != OtherPartValue)
+        return false;
+    }
+  }
+  return true;
+}
+
+bool mos::canUseImagReg(Register Reg, const MachineRegisterInfo &MRI) {
+  if (!Reg.isVirtual())
+    return false;
+  const auto &TRI = *MRI.getMF().getSubtarget<MOSSubtarget>().getRegisterInfo();
+  return TRI.getCommonSubClass(MRI.getRegClass(Reg),
+                               TRI.getImagRegClass(Reg, MRI));
+}
+
 static bool overlapsExit(Register R, const MachineInstr &Copy,
                          const MachineRegisterInfo &MRI, LiveVariables &LV);
+
+// Locations that cannot be overwritten when global assignments are restored.
+// A terminator suffix is indivisible: copies cannot be inserted after a branch.
+static BitVector physRegsAtRestore(const MachineInstr &MI,
+                                   const MOSLiveRegisters &Live,
+                                   const MOSValueNumbering &ValueNumbers) {
+  const MachineFunction &MF = *MI.getMF();
+  const auto &MRI = MF.getRegInfo();
+  const auto &TRI = *MF.getSubtarget().getRegisterInfo();
+  BitVector PhysRegs(TRI.getNumRegs());
+  for (MCPhysReg Phys : Live.livePhysRegs())
+    if (mos::needsImagReg(Phys, MF, ValueNumbers))
+      PhysRegs.set(Phys);
+  if (!MI.isTerminator())
+    return PhysRegs;
+  for (const MachineInstr &Term : MI.getParent()->terminators()) {
+    for (const MachineOperand &MO : Term.operands()) {
+      if (MO.isReg() && MO.getReg().isVirtual() && MO.isDef())
+        report_fatal_error("MOS imaginary allocation does not support "
+                           "virtual definitions in terminators",
+                           false);
+      if (MO.isReg() && MO.getReg().isPhysical() &&
+          mos::needsImagReg(MO.getReg(), MF, ValueNumbers))
+        PhysRegs.set(MO.getReg());
+      if (MO.isRegMask())
+        for (MCPhysReg Phys : MOS::Imag8RegClass)
+          if (!MRI.isReserved(Phys) && MO.clobbersPhysReg(Phys))
+            PhysRegs.set(Phys);
+    }
+  }
+  return PhysRegs;
+}
+
+DenseMap<Register, BitVector>
+mos::computeRestoreExclusions(MachineFunction &MF, LiveVariables &LV,
+                              const MachineDominatorTree &MDT,
+                              const MOSValueNumbering &ValueNumbers) {
+  const auto &MRI = MF.getRegInfo();
+  const auto &TRI = *MF.getSubtarget().getRegisterInfo();
+  DenseMap<Register, BitVector> Exclusions;
+  MOSLiveRegisters Live;
+  Live.init(MF, ValueNumbers);
+  SmallVector<std::pair<const MachineDomTreeNode *, SparseBitVector<>>>
+      DomLiveRegs;
+  for (const MachineDomTreeNode *Node : depth_first(MDT.getRootNode())) {
+    auto &MBB = *Node->getBlock();
+    while (!DomLiveRegs.empty() && DomLiveRegs.back().first != Node->getIDom())
+      DomLiveRegs.pop_back();
+    if (!DomLiveRegs.empty()) {
+      Live.inherit(DomLiveRegs.back().second);
+      for (auto I = Live.liveVirtRegs().begin(), E = Live.liveVirtRegs().end();
+           I != E;) {
+        Register Reg = *I++;
+        if (!LV.isLiveIn(Reg, MBB))
+          Live.erase(Reg);
+      }
+    }
+    Live.beginBlock(MBB);
+    for (MachineInstr &MI : MBB) {
+      bool AtTerminators = MI.getIterator() == MBB.getFirstTerminator();
+      if (AtTerminators || MI.getOpcode() == MOS::PCOPY) {
+        BitVector PhysRegs = physRegsAtRestore(MI, Live, ValueNumbers);
+        if (PhysRegs.any()) {
+          SmallVector<Register> Regs;
+          for (Register Reg : Live.liveVirtRegs())
+            Regs.push_back(Reg);
+          if (MI.getOpcode() == MOS::PCOPY)
+            for (const MachineOperand &Def : MI.all_defs())
+              if (Def.getReg().isVirtual())
+                Regs.push_back(Def.getReg());
+          for (Register Reg : Regs) {
+            for (Register Name : {Reg, mos::getImagReservationRoot(Reg, MRI)}) {
+              if (!Name)
+                continue;
+              auto &Excluded = Exclusions[Name];
+              Excluded.resize(TRI.getNumRegs());
+              Excluded |= PhysRegs;
+            }
+          }
+        }
+      }
+      Live.stepForward(MI);
+    }
+    DomLiveRegs.emplace_back(Node, Live.liveVirtRegs());
+  }
+  return Exclusions;
+}
 
 bool mos::needsImagReg(Register R, const MachineFunction &MF,
                        const MOSValueNumbering &ValueNumbers) {
@@ -34,8 +164,6 @@ bool mos::needsImagReg(Register R, const MachineFunction &MF,
            (MOS::Imag8RegClass.contains(R) ||
             MOS::Imag16RegClass.contains(R)) &&
            !MRI.isReserved(R);
-  if (MRI.use_nodbg_empty(R))
-    return false;
   // A reservation's IMPLICIT_DEF is rematerializable, but reserves an imaginary
   // register for its PHI. Its incoming copies must also inherit that register
   // even when their sources are rematerializable.

@@ -52,7 +52,7 @@ public:
   void clobber(MCPhysReg R);
   void clobber(const uint32_t *RegMask);
   // Callers decide when knowledge ceases to be useful. A dead copy may remain
-  // useful to hardware allocation even after its location is no longer fixed.
+  // useful to hardware allocation even after its physical live range ends.
   void forgetIf(function_ref<bool(MCPhysReg, ValueNumber)> Predicate);
   void clear() { Contents.clear(); }
 

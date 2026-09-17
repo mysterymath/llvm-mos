@@ -36,10 +36,12 @@ add_llvm_target(MOSCodeGen
   MOSInsertCopies.cpp
   MOSInstrCost.cpp
   MOSInstrInfo.cpp
+  MOSInstructionInterferenceGraph.cpp
   MOSInstructionSelector.cpp
   MOSInternalize.cpp
   MOSLateOptimization.cpp
   MOSLegalizerInfo.cpp
+  MOSLiveRegisters.cpp
   MOSLowerSelect.cpp
   MOSMCInstLower.cpp
   MOSMachineScheduler.cpp
@@ -88,6 +90,7 @@ add_llvm_target(MOSCodeGen
 )
 
 set_property(SOURCE MOSConventionalSSA.cpp MOSSpill.cpp MOSImagRegAssign.cpp
+  MOSLiveRegisters.cpp MOSInstructionInterferenceGraph.cpp
   APPEND PROPERTY COMPILE_OPTIONS
   -fprofile-instr-generate
   -fcoverage-mapping

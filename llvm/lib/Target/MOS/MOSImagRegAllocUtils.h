@@ -16,19 +16,44 @@
 #ifndef LLVM_LIB_TARGET_MOS_MOSIMAGREGALLOCUTILS_H
 #define LLVM_LIB_TARGET_MOS_MOSIMAGREGALLOCUTILS_H
 
+#include "MOSValueNumbering.h"
+#include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/CodeGen/Register.h"
 
 namespace llvm {
 class LiveVariables;
 class MachineFunction;
 class MachineRegisterInfo;
+class MachineDominatorTree;
 class MOSValueNumbering;
 
 namespace mos {
 
-// Whether R needs imaginary storage, accounting for rematerialization, undef,
-// and CSSA reservations. Physical imaginary registers contribute demand unless
-// reserved; their fixed locations are handled during assignment and repair.
+// Whether overlapping storage can hold both values. Undef imposes no contents
+// requirement; unknown values do not establish equality.
+bool haveCompatibleContents(MCPhysReg Reg, MOSValueNumbering::ValueNumber Value,
+                            MCPhysReg OtherReg,
+                            MOSValueNumbering::ValueNumber OtherValue,
+                            const TargetRegisterInfo &TRI,
+                            const MOSValueNumbering &ValueNumbers);
+
+// Whether Reg is virtual and its class admits imaginary register operands.
+// Unlike needsImagReg, this tests operand eligibility, not storage needs.
+bool canUseImagReg(Register Reg, const MachineRegisterInfo &MRI);
+
+// Physical registers that a global assignment must avoid at restoration
+// points. Reservation roots inherit the exclusions of their isolated members.
+DenseMap<Register, BitVector>
+computeRestoreExclusions(MachineFunction &MF, LiveVariables &LV,
+                         const MachineDominatorTree &MDT,
+                         const MOSValueNumbering &ValueNumbers);
+
+// Whether a live R needs imaginary storage, accounting for rematerialization,
+// undef, and CSSA reservations. Physical imaginary registers contribute demand
+// unless reserved; their location constraints are handled during assignment and
+// repair. Callers determine liveness: a block-local split can temporarily have
+// no uses until its restoration and outgoing SSA repair have been emitted.
 bool needsImagReg(Register R, const MachineFunction &MF,
                   const MOSValueNumbering &ValueNumbers);
 

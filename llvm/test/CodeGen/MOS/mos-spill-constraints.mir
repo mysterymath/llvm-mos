@@ -1,0 +1,288 @@
+# RUN: split-file %s %t
+# RUN: not llc -mtriple=mos -run-pass=mos-spill -verify-machineinstrs %t/early_clobber_result.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=EARLY-CLOBBER-RESULT
+# RUN: not llc -mtriple=mos -run-pass=mos-spill -verify-machineinstrs %t/live_subregister_result.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=LIVE-SUBREGISTER-RESULT
+# RUN: not llc -mtriple=mos -run-pass=mos-spill -verify-machineinstrs %t/destructive_physical_definition.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=DESTRUCTIVE-PHYSICAL-DEFINITION
+# RUN: not llc -mtriple=mos -run-pass=mos-spill -verify-machineinstrs %t/instruction_pair_transition.mir -o /dev/null 2>&1 | FileCheck %s --check-prefix=INSTRUCTION-PAIR-TRANSITION
+
+# The physical lifetimes below leave too little space for a simultaneous
+# imaginary assignment. Reject them during spilling, before choosing locations.
+
+#--- early_clobber_result.mir
+# A killed tied input must not erase the live early-clobber result.
+# EARLY-CLOBBER-RESULT: MOSSpill: cannot prove imaginary register assignability in early_clobber_result
+# EARLY-CLOBBER-RESULT: LLVM ERROR: MOSSpill spill insertion is not implemented
+---
+name: early_clobber_result
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rc2
+    early-clobber $rc2 = IncMB $rc2(tied-def 0), implicit-def $c, implicit-def $v
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    %2:gpr = LDAbs 1002
+    %3:gpr = LDAbs 1003
+    %4:gpr = LDAbs 1004
+    %5:gpr = LDAbs 1005
+    %6:gpr = LDAbs 1006
+    %7:gpr = LDAbs 1007
+    %8:gpr = LDAbs 1008
+    %9:gpr = LDAbs 1009
+    %10:gpr = LDAbs 1010
+    %11:gpr = LDAbs 1011
+    %12:gpr = LDAbs 1012
+    %13:gpr = LDAbs 1013
+    %14:gpr = LDAbs 1014
+    %15:gpr = LDAbs 1015
+    %16:gpr = LDAbs 1016
+    %17:gpr = LDAbs 1017
+    %18:gpr = LDAbs 1018
+    %19:gpr = LDAbs 1019
+    %20:gpr = LDAbs 1020
+    %21:gpr = LDAbs 1021
+    %22:gpr = LDAbs 1022
+    %23:gpr = LDAbs 1023
+    %24:gpr = LDAbs 1024
+    %25:gpr = LDAbs 1025
+    %26:gpr = LDAbs 1026
+    %27:gpr = LDAbs 1027
+    $rc0 = COPY $rc2
+    STAbs %0, 2000
+    STAbs %1, 2001
+    STAbs %2, 2002
+    STAbs %3, 2003
+    STAbs %4, 2004
+    STAbs %5, 2005
+    STAbs %6, 2006
+    STAbs %7, 2007
+    STAbs %8, 2008
+    STAbs %9, 2009
+    STAbs %10, 2010
+    STAbs %11, 2011
+    STAbs %12, 2012
+    STAbs %13, 2013
+    STAbs %14, 2014
+    STAbs %15, 2015
+    STAbs %16, 2016
+    STAbs %17, 2017
+    STAbs %18, 2018
+    STAbs %19, 2019
+    STAbs %20, 2020
+    STAbs %21, 2021
+    STAbs %22, 2022
+    STAbs %23, 2023
+    STAbs %24, 2024
+    STAbs %25, 2025
+    STAbs %26, 2026
+    STAbs %27, 2027
+    RTS
+...
+
+#--- live_subregister_result.mir
+# A dead pair definition does not make its live high-byte result free.
+# LIVE-SUBREGISTER-RESULT: MOSSpill: cannot prove imaginary register assignability in live_subregister_result
+# LIVE-SUBREGISTER-RESULT: LLVM ERROR: MOSSpill spill insertion is not implemented
+---
+name: live_subregister_result
+tracksRegLiveness: true
+body: |
+  bb.0:
+    $rs1 = COPY $rs0
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    %2:gpr = LDAbs 1002
+    %3:gpr = LDAbs 1003
+    %4:gpr = LDAbs 1004
+    %5:gpr = LDAbs 1005
+    %6:gpr = LDAbs 1006
+    %7:gpr = LDAbs 1007
+    %8:gpr = LDAbs 1008
+    %9:gpr = LDAbs 1009
+    %10:gpr = LDAbs 1010
+    %11:gpr = LDAbs 1011
+    %12:gpr = LDAbs 1012
+    %13:gpr = LDAbs 1013
+    %14:gpr = LDAbs 1014
+    %15:gpr = LDAbs 1015
+    %16:gpr = LDAbs 1016
+    %17:gpr = LDAbs 1017
+    %18:gpr = LDAbs 1018
+    %19:gpr = LDAbs 1019
+    %20:gpr = LDAbs 1020
+    %21:gpr = LDAbs 1021
+    %22:gpr = LDAbs 1022
+    %23:gpr = LDAbs 1023
+    %24:gpr = LDAbs 1024
+    %25:gpr = LDAbs 1025
+    %26:gpr = LDAbs 1026
+    %27:gpr = LDAbs 1027
+    $rc0 = COPY $rc3
+    STAbs %0, 2000
+    STAbs %1, 2001
+    STAbs %2, 2002
+    STAbs %3, 2003
+    STAbs %4, 2004
+    STAbs %5, 2005
+    STAbs %6, 2006
+    STAbs %7, 2007
+    STAbs %8, 2008
+    STAbs %9, 2009
+    STAbs %10, 2010
+    STAbs %11, 2011
+    STAbs %12, 2012
+    STAbs %13, 2013
+    STAbs %14, 2014
+    STAbs %15, 2015
+    STAbs %16, 2016
+    STAbs %17, 2017
+    STAbs %18, 2018
+    STAbs %19, 2019
+    STAbs %20, 2020
+    STAbs %21, 2021
+    STAbs %22, 2022
+    STAbs %23, 2023
+    STAbs %24, 2024
+    STAbs %25, 2025
+    STAbs %26, 2026
+    STAbs %27, 2027
+    RTS
+...
+
+#--- destructive_physical_definition.mir
+# Overwriting a physical copy must preserve the original SSA value.
+# DESTRUCTIVE-PHYSICAL-DEFINITION: MOSSpill: cannot prove imaginary register assignability in destructive_physical_definition
+# DESTRUCTIVE-PHYSICAL-DEFINITION: LLVM ERROR: MOSSpill spill insertion is not implemented
+---
+name: destructive_physical_definition
+tracksRegLiveness: true
+body: |
+  bb.0:
+    %0:gpr = LDAbs 1000
+    %1:gpr = LDAbs 1001
+    %2:gpr = LDAbs 1002
+    %3:gpr = LDAbs 1003
+    %4:gpr = LDAbs 1004
+    %5:gpr = LDAbs 1005
+    %6:gpr = LDAbs 1006
+    %7:gpr = LDAbs 1007
+    %8:gpr = LDAbs 1008
+    %9:gpr = LDAbs 1009
+    %10:gpr = LDAbs 1010
+    %11:gpr = LDAbs 1011
+    %12:gpr = LDAbs 1012
+    %13:gpr = LDAbs 1013
+    %14:gpr = LDAbs 1014
+    %15:gpr = LDAbs 1015
+    %16:gpr = LDAbs 1016
+    %17:gpr = LDAbs 1017
+    %18:gpr = LDAbs 1018
+    %19:gpr = LDAbs 1019
+    %20:gpr = LDAbs 1020
+    %21:gpr = LDAbs 1021
+    %22:gpr = LDAbs 1022
+    %23:gpr = LDAbs 1023
+    %24:gpr = LDAbs 1024
+    %25:gpr = LDAbs 1025
+    %26:gpr = LDAbs 1026
+    %27:gpr = LDAbs 1027
+    $rc2 = COPY %0
+    early-clobber $rc2 = IncMB $rc2(tied-def 0), implicit-def $c, implicit-def $v
+    $rc0 = COPY $rc2
+    STAbs %0, 2000
+    STAbs %1, 2001
+    STAbs %2, 2002
+    STAbs %3, 2003
+    STAbs %4, 2004
+    STAbs %5, 2005
+    STAbs %6, 2006
+    STAbs %7, 2007
+    STAbs %8, 2008
+    STAbs %9, 2009
+    STAbs %10, 2010
+    STAbs %11, 2011
+    STAbs %12, 2012
+    STAbs %13, 2013
+    STAbs %14, 2014
+    STAbs %15, 2015
+    STAbs %16, 2016
+    STAbs %17, 2017
+    STAbs %18, 2018
+    STAbs %19, 2019
+    STAbs %20, 2020
+    STAbs %21, 2021
+    STAbs %22, 2022
+    STAbs %23, 2023
+    STAbs %24, 2024
+    STAbs %25, 2025
+    STAbs %26, 2026
+    STAbs %27, 2027
+    RTS
+...
+
+#--- instruction_pair_transition.mir
+# Thirteen pairs fit before and after the call separately, but only twelve
+# pair locations avoid both the input in RC2 and the result in RC4.
+# INSTRUCTION-PAIR-TRANSITION: MOSSpill: cannot prove imaginary register assignability in instruction_pair_transition
+# INSTRUCTION-PAIR-TRANSITION: LLVM ERROR: MOSSpill spill insertion is not implemented
+---
+name: instruction_pair_transition
+tracksRegLiveness: true
+body: |
+  bb.0:
+    liveins: $rc2
+    %100:gpr = LDAbs 1000
+    %101:gpr = LDAbs 1001
+    %0:imag16 = REG_SEQUENCE %100, %subreg.sublo, %101, %subreg.subhi
+    %102:gpr = LDAbs 1002
+    %103:gpr = LDAbs 1003
+    %1:imag16 = REG_SEQUENCE %102, %subreg.sublo, %103, %subreg.subhi
+    %104:gpr = LDAbs 1004
+    %105:gpr = LDAbs 1005
+    %2:imag16 = REG_SEQUENCE %104, %subreg.sublo, %105, %subreg.subhi
+    %106:gpr = LDAbs 1006
+    %107:gpr = LDAbs 1007
+    %3:imag16 = REG_SEQUENCE %106, %subreg.sublo, %107, %subreg.subhi
+    %108:gpr = LDAbs 1008
+    %109:gpr = LDAbs 1009
+    %4:imag16 = REG_SEQUENCE %108, %subreg.sublo, %109, %subreg.subhi
+    %110:gpr = LDAbs 1010
+    %111:gpr = LDAbs 1011
+    %5:imag16 = REG_SEQUENCE %110, %subreg.sublo, %111, %subreg.subhi
+    %112:gpr = LDAbs 1012
+    %113:gpr = LDAbs 1013
+    %6:imag16 = REG_SEQUENCE %112, %subreg.sublo, %113, %subreg.subhi
+    %114:gpr = LDAbs 1014
+    %115:gpr = LDAbs 1015
+    %7:imag16 = REG_SEQUENCE %114, %subreg.sublo, %115, %subreg.subhi
+    %116:gpr = LDAbs 1016
+    %117:gpr = LDAbs 1017
+    %8:imag16 = REG_SEQUENCE %116, %subreg.sublo, %117, %subreg.subhi
+    %118:gpr = LDAbs 1018
+    %119:gpr = LDAbs 1019
+    %9:imag16 = REG_SEQUENCE %118, %subreg.sublo, %119, %subreg.subhi
+    %120:gpr = LDAbs 1020
+    %121:gpr = LDAbs 1021
+    %10:imag16 = REG_SEQUENCE %120, %subreg.sublo, %121, %subreg.subhi
+    %122:gpr = LDAbs 1022
+    %123:gpr = LDAbs 1023
+    %11:imag16 = REG_SEQUENCE %122, %subreg.sublo, %123, %subreg.subhi
+    %124:gpr = LDAbs 1024
+    %125:gpr = LDAbs 1025
+    %12:imag16 = REG_SEQUENCE %124, %subreg.sublo, %125, %subreg.subhi
+    JSR &callee, implicit $rc2, implicit-def $rc4
+    $rc0 = COPY $rc4
+    $rs0 = COPY %0
+    $rs0 = COPY %1
+    $rs0 = COPY %2
+    $rs0 = COPY %3
+    $rs0 = COPY %4
+    $rs0 = COPY %5
+    $rs0 = COPY %6
+    $rs0 = COPY %7
+    $rs0 = COPY %8
+    $rs0 = COPY %9
+    $rs0 = COPY %10
+    $rs0 = COPY %11
+    $rs0 = COPY %12
+    RTS
+...

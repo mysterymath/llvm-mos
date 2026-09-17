@@ -747,7 +747,7 @@ body: |
 #--- physical_early_clobber_overflow.mir
 # With thirteen virtual pairs, the early-clobber pair cannot fit until the
 # byte input dies. Releasing that input early would incorrectly allow this.
-# PHYSICAL-EARLY-CLOBBER-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in physical_early_clobber_overflow, bb.0 for Imag16
+# PHYSICAL-EARLY-CLOBBER-OVERFLOW: MOSSpill: cannot prove imaginary register assignability in physical_early_clobber_overflow, bb.0 for Imag8
 # PHYSICAL-EARLY-CLOBBER-OVERFLOW: LLVM ERROR: MOSSpill spill insertion is not implemented
 ---
 name: physical_early_clobber_overflow

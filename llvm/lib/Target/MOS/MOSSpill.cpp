@@ -10,16 +10,17 @@
 /// Prepare conventional SSA live ranges for imaginary register assignment.
 ///
 /// MOSSpill is responsible for splitting and spilling ranges until conservative
-/// imaginary demand permits treescan assignment. Demand counts known physical
-/// occupancy exactly and conservatively bounds earlier virtual assignments.
-/// MOSImagRegAssign repairs fixed-location constraints locally. Both passes
-/// use the same value and reservation interference rules. The boundary between
-/// them is SSA MIR; this pass does not assign locations in VirtRegMap.
+/// imaginary demand permits treescan assignment. Demand accounts for physical
+/// register constraints and conservatively bounds interference from earlier
+/// virtual assignments. MOSImagRegAssign repairs physical-register constraints
+/// locally. Both passes use the same value and reservation interference rules.
+/// The boundary between them is SSA MIR; this pass does not assign locations in
+/// VirtRegMap.
 ///
 /// Currently this pass validates demand and diagnoses cases requiring spills.
-/// It does not insert spills or guarantee scratch space for every local repair;
-/// MOSImagRegAssign still diagnoses unsupported repairs requiring extra
-/// storage.
+/// It does not insert spills. The local bound guarantees a simultaneous
+/// imaginary assignment, not scratch registers for expanding parallel copies
+/// into hardware instructions.
 ///
 //===----------------------------------------------------------------------===//
 
@@ -27,6 +28,8 @@
 #include "MCTargetDesc/MOSMCTargetDesc.h"
 #include "MOS.h"
 #include "MOSImagRegAllocUtils.h"
+#include "MOSInstructionInterferenceGraph.h"
+#include "MOSLiveRegisters.h"
 #include "MOSRegisterInfo.h"
 #include "MOSSubtarget.h"
 #include "MOSValueNumbering.h"
@@ -34,7 +37,6 @@
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/SparseBitVector.h"
 #include "llvm/CodeGen/LivePhysRegs.h"
-#include "llvm/CodeGen/LiveRegUnits.h"
 #include "llvm/CodeGen/LiveVariables.h"
 #include "llvm/CodeGen/MachineDominators.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
@@ -64,21 +66,12 @@ private:
   void computeMaxBlockedLocations();
   void checkPressure();
   void checkMIPressure(MachineInstr &MI);
-  void checkDefPressure(const MachineOperand &Def);
-  void checkClobbers(MachineInstr &MI);
+
   [[noreturn]] void reportSpillRequired(const MachineInstr &MI,
                                         Register R) const;
 
-  // Test demand before inserting R. Failure leaves the live set unchanged.
-  // Reservation members inherit the capacity guaranteed at their root.
-  [[nodiscard]] bool tryAddLiveReg(Register R, ValueNumber Value);
-  void removeLiveReg(Register R);
-  void releaseKilledUses(const MachineInstr &MI);
-  void removeClobbers(const MachineOperand &RegMask);
-  void releaseDeadDefs(const MachineInstr &MI);
-  // Whether R can coexist with the live ranges. Physical occupancy is known;
-  // earlier virtual assignments conservatively reduce the available locations.
-  bool canFit(Register R, ValueNumber Value) const;
+  bool canFit(Register Reg, const SparseBitVector<> &LiveGlobals) const;
+  bool conflictsAtRestorePoints(Register Reg, MCPhysReg Phys) const;
 
   MachineFunction *MF = nullptr;
   const MachineRegisterInfo *MRI = nullptr;
@@ -108,10 +101,8 @@ private:
       unsigned, 4>
       MaxBlockedLocations;
 
-  // Live SSA ranges needing imaginary storage; locations are not yet assigned.
-  SparseBitVector<> LiveVirtRegs;
-  // Occupied physical imaginary storage. Partial kills remove only their units.
-  LiveRegUnits LivePhysUnits;
+  MOSLiveRegisters LiveRegs;
+  DenseMap<Register, BitVector> RestoreExclusions;
 };
 
 MOSSpill::MOSSpill() : MachineFunctionPass(ID) {
@@ -128,6 +119,9 @@ bool MOSSpill::runOnMachineFunction(MachineFunction &F) {
   MDT = &getAnalysis<MachineDominatorTreeWrapperPass>().getDomTree();
   ValueNumbers = &getAnalysis<MOSValueNumberingWrapperPass>().valueNumbers();
   bool Changed = recomputeLiveIns(F.front());
+  LiveRegs.init(F, *ValueNumbers);
+  RestoreExclusions =
+      mos::computeRestoreExclusions(F, *LV, *MDT, *ValueNumbers);
   computeMaxBlockedLocations();
   checkPressure();
   return Changed;
@@ -166,13 +160,7 @@ void MOSSpill::computeMaxBlockedLocations() {
 }
 
 void MOSSpill::checkPressure() {
-  LiveVirtRegs.clear();
-  LivePhysUnits.init(*TRI);
-  // Physical live-ins are confined to the entry block. Their locations already
-  // exist; initializing occupancy requires no assignment or pressure check.
-  for (const auto &LiveIn : MF->front().liveins())
-    if (mos::needsImagReg(LiveIn.PhysReg, *MF, *ValueNumbers))
-      LivePhysUnits.addRegMasked(LiveIn.PhysReg, LiveIn.LaneMask);
+  LiveRegs.clear();
   // Completed ancestors' live-outs for the dominance walk.
   SmallVector<std::pair<const MachineDomTreeNode *, SparseBitVector<>>>
       DomLiveRegs;
@@ -181,59 +169,60 @@ void MOSSpill::checkPressure() {
     while (!DomLiveRegs.empty() && DomLiveRegs.back().first != Node->getIDom())
       DomLiveRegs.pop_back();
     if (!DomLiveRegs.empty()) {
-      LiveVirtRegs = DomLiveRegs.back().second;
-      // Trim the inherited virtual live ranges to this block's live-ins.
-      for (auto I = LiveVirtRegs.begin(), E = LiveVirtRegs.end(); I != E;) {
-        Register R = *I++;
-        if (!LV->isLiveIn(R, MBB))
-          LiveVirtRegs.reset(R);
+      LiveRegs.inherit(DomLiveRegs.back().second);
+      for (auto I = LiveRegs.liveVirtRegs().begin(),
+                E = LiveRegs.liveVirtRegs().end();
+           I != E;) {
+        Register Reg = *I++;
+        if (!LV->isLiveIn(Reg, MBB))
+          LiveRegs.erase(Reg);
       }
     }
+    LiveRegs.beginBlock(MBB);
     for (MachineInstr &MI : MBB)
       checkMIPressure(MI);
-    assert(LivePhysUnits.empty() &&
-           "physical register live out of basic block");
-    DomLiveRegs.emplace_back(Node, LiveVirtRegs);
+    assert(llvm::none_of(LiveRegs.livePhysRegs(),
+                         [&](MCPhysReg Phys) {
+                           return mos::needsImagReg(Phys, *MF, *ValueNumbers);
+                         }) &&
+           "physical imaginary register live out of basic block");
+    DomLiveRegs.emplace_back(Node, LiveRegs.liveVirtRegs());
   }
 }
 
 void MOSSpill::checkMIPressure(MachineInstr &MI) {
   if (MI.isDebugInstr())
     return;
-  for (const MachineOperand &MO : MI.all_defs())
-    if (MO.isEarlyClobber())
-      checkDefPressure(MO);
-  releaseKilledUses(MI);
-
-  checkClobbers(MI);
-  for (const MachineOperand &MO : MI.operands())
-    if (MO.isRegMask())
-      removeClobbers(MO);
-
-  for (const MachineOperand &MO : MI.all_defs())
-    if (!MO.isEarlyClobber())
-      checkDefPressure(MO);
-
-  releaseDeadDefs(MI);
-}
-
-void MOSSpill::checkDefPressure(const MachineOperand &Def) {
-  Register R = Def.getReg();
-  if (!mos::needsImagReg(R, *MF, *ValueNumbers))
-    return;
-  if (!tryAddLiveReg(R, ValueNumbers->getValueNumber(Def)))
-    reportSpillRequired(*Def.getParent(), R);
-}
-
-void MOSSpill::checkClobbers(MachineInstr &MI) {
-  for (const MachineOperand &MO : MI.operands()) {
-    if (!MO.isRegMask())
-      continue;
-    // Clobbers occupy storage without establishing a known value.
-    for (MCPhysReg R : RCI->getOrder(&MOS::Imag8RegClass))
-      if (MO.clobbersPhysReg(R) && !tryAddLiveReg(R, {}))
-        reportSpillRequired(MI, R);
+  // Global assignments survive local repairs. Only virtual ranges and future
+  // restoration constraints restrict this treescan colorability check.
+  auto Globals = LiveRegs.liveVirtRegs();
+  for (bool Early : {true, false}) {
+    if (!Early && !MI.isPHI())
+      for (const MachineOperand &Use : MI.all_uses())
+        if (Use.getReg().isVirtual() && Use.isKill())
+          Globals.reset(Use.getReg());
+    for (const MachineOperand &Def : MI.all_defs()) {
+      Register Reg = Def.getReg();
+      if (Def.isEarlyClobber() != Early || !Reg.isVirtual() ||
+          MRI->use_nodbg_empty(Reg) ||
+          !mos::needsImagReg(Reg, *MF, *ValueNumbers))
+        continue;
+      if (!canFit(Reg, Globals))
+        reportSpillRequired(MI, Reg);
+      Globals.set(Reg);
+    }
   }
+
+  // PHIs and CSSA parallel copies use the global assignments guaranteed by
+  // their reservations. Ordinary instructions additionally need a legal local
+  // assignment, including somewhere to preserve their live-through values.
+  if (!MI.isPHI() && MI.getOpcode() != MOS::PCOPY) {
+    MOSInstructionInterferenceGraph Graph(MI, LiveRegs, *ValueNumbers, *RCI);
+    SmallVector<Register> SelectStack;
+    if (Register Reg = Graph.simplify(SelectStack))
+      reportSpillRequired(MI, Reg);
+  }
+  LiveRegs.stepForward(MI);
 }
 
 void MOSSpill::reportSpillRequired(const MachineInstr &MI, Register R) const {
@@ -245,93 +234,40 @@ void MOSSpill::reportSpillRequired(const MachineInstr &MI, Register R) const {
                      /*GenCrashDiag=*/false);
 }
 
-bool MOSSpill::tryAddLiveReg(Register R, ValueNumber Value) {
-  if (R.isVirtual() && LiveVirtRegs.test(R))
+bool MOSSpill::canFit(Register Reg,
+                      const SparseBitVector<> &LiveGlobals) const {
+  Register Root = mos::getImagReservationRoot(Reg, *MRI);
+  if (Root && Root != Reg)
     return true;
-  if (!canFit(R, Value))
-    return false;
-  if (R.isPhysical())
-    LivePhysUnits.addReg(R);
-  else
-    LiveVirtRegs.set(R);
-  return true;
-}
-
-void MOSSpill::removeLiveReg(Register R) {
-  if (R.isVirtual())
-    LiveVirtRegs.reset(R);
-  else if (R)
-    LivePhysUnits.removeReg(R);
-}
-
-void MOSSpill::releaseKilledUses(const MachineInstr &MI) {
-  // LiveVariables accounts for PHI edge uses in its kill flags.
-  if (MI.isPHI())
-    return;
-  for (const MachineOperand &MO : MI.all_uses())
-    if (MO.isKill())
-      removeLiveReg(MO.getReg());
-}
-
-void MOSSpill::removeClobbers(const MachineOperand &RegMask) {
-  LivePhysUnits.removeRegsNotPreserved(RegMask.getRegMask());
-}
-
-void MOSSpill::releaseDeadDefs(const MachineInstr &MI) {
-  for (const MachineOperand &MO : MI.all_defs())
-    if (MO.isDead())
-      removeLiveReg(MO.getReg());
-}
-
-bool MOSSpill::canFit(Register R, ValueNumber Value) const {
-  // Overwriting entirely occupied storage does not increase pressure.
-  if (R.isPhysical() && llvm::all_of(TRI->regunits(R), [&](MCRegUnit Unit) {
-        return LivePhysUnits.getBitVector().test(static_cast<unsigned>(Unit));
-      }))
-    return true;
-  // PHI inputs and results inherit the assignment guaranteed at their root's
-  // definition; they introduce no new imaginary assignment to check.
-  Register Root = mos::getImagReservationRoot(R, *MRI);
-  if (Root && Root != R)
-    return true;
-
-  const TargetRegisterClass *RC = TRI->getImagRegClass(R, *MRI);
-  auto Order = RCI->getOrder(RC);
-  int Available = Order.size();
-  // Summing single-neighbor displacements gives an upper bound on squeeze:
-  // the number of locations earlier assignments could deny to R. We use the
-  // paper's additive approximation without its class-tree saturation bounds.
-  for (Register LiveReg : LiveVirtRegs) {
-    if (R == LiveReg)
+  const TargetRegisterClass *RC = TRI->getImagRegClass(Reg, *MRI);
+  auto Value = ValueNumbers->getValueNumber(Reg);
+  int Available = llvm::count_if(RCI->getOrder(RC), [&](MCPhysReg Phys) {
+    return !conflictsAtRestorePoints(Reg, Phys);
+  });
+  for (Register Other : LiveGlobals) {
+    if (Other == Reg || !mos::needsImagReg(Other, *MF, *ValueNumbers))
       continue;
-    // Reservation roots promise future storage, irrespective of their current
-    // undef value. Only virtual ranges have the SSA lifetime used by this
-    // query.
-    if (R == Root) {
-      if (!mos::overlapsImagReservation(R, LiveReg, *MRI, *LV))
+    if (Root == Reg) {
+      if (!mos::overlapsImagReservation(Root, Other, *MRI, *LV))
         continue;
-    } else if (LiveReg == mos::getImagReservationRoot(LiveReg, *MRI)) {
-      if (R.isVirtual() && !mos::overlapsImagReservation(LiveReg, R, *MRI, *LV))
+    } else if (Other == mos::getImagReservationRoot(Other, *MRI)) {
+      if (!mos::overlapsImagReservation(Other, Reg, *MRI, *LV))
         continue;
-    } else if (Value && (R.isVirtual() || !Value.isUndef()) &&
-               Value == ValueNumbers->getValueNumber(LiveReg)) {
-      // A known physical COPY result can share storage with its still-live
-      // virtual source, just as equal virtual definitions can share.
+    } else if (Value && Value == ValueNumbers->getValueNumber(Other)) {
       continue;
     }
     Available -=
-        MaxBlockedLocations.lookup({RC, TRI->getImagRegClass(LiveReg, *MRI)});
+        MaxBlockedLocations.lookup({RC, TRI->getImagRegClass(Other, *MRI)});
   }
-  // Count locations in the queried domain, not physical live ranges: two
-  // separately defined bytes may occupy the same pair. Including a physical
-  // definition in the union also accounts for overwrites without extra demand.
-  Available -= llvm::count_if(Order, [&](MCPhysReg Phys) {
-    return !LivePhysUnits.available(Phys) ||
-           (R.isPhysical() && TRI->regsOverlap(R, Phys));
-  });
-  // A virtual definition needs one free byte or pair. A physical definition
-  // is already included in the occupied locations above.
-  return Available >= (R.isVirtual() ? 1 : 0);
+  return Available > 0;
+}
+
+bool MOSSpill::conflictsAtRestorePoints(Register Reg, MCPhysReg Phys) const {
+  auto I = RestoreExclusions.find(Reg);
+  return I != RestoreExclusions.end() &&
+         llvm::any_of(I->second.set_bits(), [&](unsigned OtherPhys) {
+           return TRI->regsOverlap(Phys, OtherPhys);
+         });
 }
 
 } // namespace

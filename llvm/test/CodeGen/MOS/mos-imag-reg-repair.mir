@@ -67,9 +67,10 @@ name: live_through_tie
 # ASSIGN-LABEL: name: live_through_tie
 # ASSIGN: isSSA: true
 # ASSIGN: id: 0, {{.*}}assigned-phys: '$rc2'
-# ASSIGN: id: 2, {{.*}}assigned-phys: '$rc4'
-# ASSIGN: id: 3, {{.*}}assigned-phys: '$rc3'
-# ASSIGN: id: 4, {{.*}}assigned-phys: '$rc4'
+# ASSIGN: id: 2, {{.*}}assigned-phys: '$rc3'
+# ASSIGN: id: 3, {{.*}}assigned-phys: '$rc4'
+# ASSIGN: id: 4, {{.*}}assigned-phys: '$rc3'
+# ASSIGN: id: 5, {{.*}}assigned-phys: '$rc4'
 tracksRegLiveness: true
 registers:
   - { id: 0, class: anyi8 }
@@ -81,8 +82,8 @@ body: |
     ; CHECK-LABEL: name: live_through_tie
     ; CHECK: [[COPY:%[0-9]+]]:anyi8 = COPY $rc0
     ; CHECK-NEXT: [[COPY1:%[0-9]+]]:anyi8 = COPY $rc1
-    ; CHECK-NEXT: [[PCOPY:%[0-9]+]]:anyi8 = PCOPY [[COPY]]
-    ; CHECK-NEXT: [[IncMB:%[0-9]+]]:anyi8, [[IncMB1:%[0-9]+]]:anyi8 = IncMB killed [[PCOPY]](tied-def 0), killed [[COPY1]](tied-def 1), implicit-def dead $c, implicit-def dead $v
+    ; CHECK-NEXT: [[PCOPY:%[0-9]+]]:anyi8, [[PCOPY1:%[0-9]+]]:anyi8 = PCOPY [[COPY]], killed [[COPY1]]
+    ; CHECK-NEXT: [[IncMB:%[0-9]+]]:anyi8, [[IncMB1:%[0-9]+]]:anyi8 = IncMB killed [[PCOPY]](tied-def 0), killed [[PCOPY1]](tied-def 1), implicit-def dead $c, implicit-def dead $v
     ; CHECK-NEXT: $rc0 = COPY killed [[COPY]]
     ; CHECK-NEXT: $rc0 = COPY killed [[IncMB]]
     ; CHECK-NEXT: $rc1 = COPY killed [[IncMB1]]
